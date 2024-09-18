@@ -7,7 +7,8 @@ import * as cacheHttpClient from "./backend";
 import {
     createTar,
     extractTar,
-    listTar
+    listTar,
+    getTarPath
 } from "@actions/cache/lib/internal/tar";
 import { DownloadOptions, UploadOptions } from "@actions/cache/lib/options";
 import { execSync } from "child_process";
@@ -278,10 +279,19 @@ export async function saveCache(
     core.info(`Archive Path: ${archivePath}`);
 
     try {
-        if (customCompression) {
-            const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
+        const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
+        if (customCompression && process.platform !== "win32") {
             const compressionArgs = customCompression === "none" ? "" : `--use-compress-program=${customCompression}`;
             const command = `tar --posix -cf ${archivePath} --exclude ${archivePath} -P -C ${baseDir} ${cachePaths.join(' ')} ${compressionArgs}`;
+            const output = execSync(command);
+            if (output && output.length > 0) {
+                core.debug(output.toString());
+            }
+        } else if (customCompression && process.platform === "win32") {
+            const tarPath = await getTarPath();
+            const lz4Path = 'C:\\Program Files\\LZ4\\lz4.exe'
+            const compressionArgs = customCompression === 'none' ? '' : `--use-compress-program="${lz4Path}"`;
+            const command = `${tarPath} --posix -cf ${archivePath} --exclude ${archivePath} -P -C ${baseDir} ${cachePaths.join(' ')} ${compressionArgs}`;
             const output = execSync(command);
             if (output && output.length > 0) {
                 core.debug(output.toString());
