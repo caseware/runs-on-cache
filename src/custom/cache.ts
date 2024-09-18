@@ -236,6 +236,10 @@ export async function restoreCacheSync(
     return undefined;
 }
 
+function toTarPath(p: string) {
+    return p.replace(/\\/g, '/');
+}
+
 /**
  * Saves a list of files with the specified key
  *
@@ -288,11 +292,36 @@ export async function saveCache(
                 core.debug(output.toString());
             }
         } else if (customCompression && process.platform === "win32") {
-            const tarPath = await getTarPath();
-            const lz4Path = 'C:\\Program Files\\LZ4\\lz4.exe'
-            const compressionArgs = customCompression === 'none' ? '' : `--use-compress-program="${lz4Path}"`;
-            const command = `${tarPath} --posix -cf ${archivePath} --exclude ${archivePath} -P -C ${baseDir} ${cachePaths.join(' ')} ${compressionArgs}`;
-            const output = execSync(command);
+            const tarPathObj = await getTarPath();
+            const tarPath = tarPathObj.path; // Access the 'path' property
+
+            // Use 'lz4' directly, assuming it's in the PATH
+            const lz4Path = 'lz4';
+
+            // Build the arguments array
+            let args: string[] = [];
+
+            args.push('--posix');
+
+            if (customCompression !== 'none') {
+                args.push(`--use-compress-program="${lz4Path}"`);
+            }
+
+            // Properly quote and convert path
+            args.push('-cf', `"${toTarPath(archivePath)}"`);
+            args.push('--exclude', `"${toTarPath(archivePath)}"`);
+            args.push('-P');
+            args.push('-C', `"${toTarPath(baseDir)}"`);
+
+            // Properly quote and convert cache paths
+            const quotedCachePaths = cachePaths.map(p => `"${toTarPath(p)}"`);
+
+            // Combine all arguments into the command
+            const command = `"${tarPath}" ${args.join(' ')} ${quotedCachePaths.join(' ')}`;
+
+            core.debug(`Executing command: ${command}`);
+
+            const output = execSync(command, { stdio: 'inherit' });
             if (output && output.length > 0) {
                 core.debug(output.toString());
             }
