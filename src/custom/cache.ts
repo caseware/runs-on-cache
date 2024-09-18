@@ -296,7 +296,7 @@ export async function saveCache(
             const tarPath = tarPathObj.path; // Access the 'path' property
 
             // Use 'lz4' directly, assuming it's in the PATH
-            const lz4Path = 'lz4';
+            const lz4Path = 'lz4.exe';
 
             // Build the arguments array
             let args: string[] = [];
