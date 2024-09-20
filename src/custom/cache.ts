@@ -144,8 +144,8 @@ export async function restoreCache(
             )} MB (${archiveFileSize} B)`
         );
 
-        if (customCompression) {
-            const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
+        const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
+        if (customCompression && process.platform !== "win32") {
             const compressionArgs = customCompression === "none" ? "" : `--use-compress-program=${customCompression}`;
             const command = `tar -xf ${archivePath} -P -C ${baseDir} ${compressionArgs}`;
             core.info(`Extracting ${archivePath} to ${baseDir}`);
@@ -153,8 +153,34 @@ export async function restoreCache(
             if (output && output.length > 0) {
                 core.info(output.toString());
             }
-        }
-        else {
+        } else if (customCompression && process.platform === "win32") {
+            const tarPathObj = await getTarPath();
+            const tarPath = tarPathObj.path; // Access the 'path' property
+
+            const lz4Path = 'lz4.exe';
+
+            // Build the arguments array
+            let args: string[] = [];
+
+            if (customCompression !== 'none') {
+                args.push(`--use-compress-program="${lz4Path}"`);
+            }
+
+            // Properly quote and convert paths
+            args.push('-xf', `"${toTarPath(archivePath)}"`);
+            args.push('-P');
+            args.push('-C', `"${toTarPath(baseDir)}"`);
+
+            // Combine all arguments into the command
+            const command = `"${tarPath}" ${args.join(' ')}`;
+
+            core.debug(`Executing command: ${command}`);
+
+            const output = execSync(command, { stdio: 'inherit' });
+            if (output && output.length > 0) {
+                core.debug(output.toString());
+            }
+        } else {
             await extractTar(archivePath, compressionMethod as CompressionMethod);
         }
         core.info("Cache restored successfully");
