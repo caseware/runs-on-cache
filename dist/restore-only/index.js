@@ -1327,7 +1327,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.createTar = exports.extractTar = exports.listTar = void 0;
+exports.createTar = exports.extractTar = exports.listTar = exports.getTarPath = void 0;
 const exec_1 = __nccwpck_require__(1514);
 const io = __importStar(__nccwpck_require__(7436));
 const fs_1 = __nccwpck_require__(7147);
@@ -1374,6 +1374,7 @@ function getTarPath() {
         };
     });
 }
+exports.getTarPath = getTarPath;
 // Return arguments for tar as per tarPath, compressionMethod, method type and os
 function getTarArgs(tarPath, compressionMethod, type, archivePath = '') {
     return __awaiter(this, void 0, void 0, function* () {
@@ -95218,12 +95219,12 @@ exports.getCacheVersion = getCacheVersion;
 function getS3Prefix(paths, { compressionMethod, enableCrossOsArchive }) {
     const repository = process.env.GITHUB_REPOSITORY;
     const version = getCacheVersion(paths, compressionMethod, enableCrossOsArchive);
-    return ["cache", repository, version].join("/");
+    return [repository, version].join("/");
 }
 function getS3PrefixSync(paths) {
     const repository = process.env.GITHUB_REPOSITORY;
     const version = getCacheVersion(paths);
-    return ["cache", repository, version].join("/");
+    return ["sync", repository, version].join("/");
 }
 function getCacheEntry(keys, paths, { compressionMethod, enableCrossOsArchive }) {
     return __awaiter(this, void 0, void 0, function* () {
@@ -95536,14 +95537,35 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             }
             const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
             core.info(`Cache Size: ~${Math.round(archiveFileSize / (1024 * 1024))} MB (${archiveFileSize} B)`);
-            if (customCompression) {
-                const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
+            const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
+            if (customCompression && process.platform !== "win32") {
                 const compressionArgs = customCompression === "none" ? "" : `--use-compress-program=${customCompression}`;
                 const command = `tar -xf ${archivePath} -P -C ${baseDir} ${compressionArgs}`;
                 core.info(`Extracting ${archivePath} to ${baseDir}`);
                 const output = (0, child_process_1.execSync)(command);
                 if (output && output.length > 0) {
                     core.info(output.toString());
+                }
+            }
+            else if (customCompression && process.platform === "win32") {
+                const tarPathObj = yield (0, tar_1.getTarPath)();
+                const tarPath = tarPathObj.path; // Access the 'path' property
+                const lz4Path = 'lz4.exe';
+                // Build the arguments array
+                let args = [];
+                if (customCompression !== 'none') {
+                    args.push(`--use-compress-program="${lz4Path}"`);
+                }
+                // Properly quote and convert paths
+                args.push('-xf', `"${toTarPath(archivePath)}"`);
+                args.push('-P');
+                args.push('-C', `"${toTarPath(baseDir)}"`);
+                // Combine all arguments into the command
+                const command = `"${tarPath}" ${args.join(' ')}`;
+                core.debug(`Executing command: ${command}`);
+                const output = (0, child_process_1.execSync)(command, { stdio: 'inherit' });
+                if (output && output.length > 0) {
+                    core.debug(output.toString());
                 }
             }
             else {
@@ -95620,6 +95642,9 @@ function restoreCacheSync(paths, primaryKey, options) {
     });
 }
 exports.restoreCacheSync = restoreCacheSync;
+function toTarPath(p) {
+    return p.replace(/\\/g, '/');
+}
 /**
  * Saves a list of files with the specified key
  *
@@ -95646,9 +95671,12 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
         const archiveFolder = yield utils.createTempDirectory();
         const archivePath = path.join(archiveFolder, (0, actionUtils_1.getCacheFileName)(compressionMethod));
         core.info(`Archive Path: ${archivePath}`);
+        core.info(`Archive Path2: ${archivePath}`);
         try {
-            if (customCompression) {
-                const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
+            core.info(`Archive Path3: ${archivePath}`);
+            const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
+            if (customCompression && process.platform !== "win32") {
+                core.info(`Archive Path4: ${archivePath}`);
                 const compressionArgs = customCompression === "none" ? "" : `--use-compress-program=${customCompression}`;
                 const command = `tar --posix -cf ${archivePath} --exclude ${archivePath} -P -C ${baseDir} ${cachePaths.join(' ')} ${compressionArgs}`;
                 const output = (0, child_process_1.execSync)(command);
@@ -95656,7 +95684,35 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
                     core.debug(output.toString());
                 }
             }
+            else if (customCompression && process.platform === "win32") {
+                core.info(`Archive Path5: ${archivePath}`);
+                const tarPathObj = yield (0, tar_1.getTarPath)();
+                const tarPath = tarPathObj.path; // Access the 'path' property
+                // Use 'lz4' directly, assuming it's in the PATH
+                const lz4Path = 'lz4.exe';
+                // Build the arguments array
+                let args = [];
+                args.push('--posix');
+                if (customCompression !== 'none') {
+                    args.push(`--use-compress-program="${lz4Path}"`);
+                }
+                // Properly quote and convert path
+                args.push('-cf', `"${toTarPath(archivePath)}"`);
+                args.push('--exclude', `"${toTarPath(archivePath)}"`);
+                args.push('-P');
+                args.push('-C', `"${toTarPath(baseDir)}"`);
+                // Properly quote and convert cache paths
+                const quotedCachePaths = cachePaths.map(p => `"${toTarPath(p)}"`);
+                // Combine all arguments into the command
+                const command = `"${tarPath}" ${args.join(' ')} ${quotedCachePaths.join(' ')}`;
+                core.info(`Executing command: ${command}`);
+                const output = (0, child_process_1.execSync)(command, { stdio: 'inherit' });
+                if (output && output.length > 0) {
+                    core.debug(output.toString());
+                }
+            }
             else {
+                core.info(`Archive Path6: ${archivePath}`);
                 yield (0, tar_1.createTar)(archiveFolder, cachePaths, compressionMethod);
                 if (core.isDebug()) {
                     yield (0, tar_1.listTar)(archivePath, compressionMethod);
