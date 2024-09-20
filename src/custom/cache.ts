@@ -318,6 +318,7 @@ export async function saveCache(
                 core.debug(output.toString());
             }
         } else if (customCompression && process.platform === "win32") {
+            core.info('Entering win path')
             const tarPathObj = await getTarPath();
             const tarPath = tarPathObj.path; // Access the 'path' property
 
@@ -345,7 +346,7 @@ export async function saveCache(
             // Combine all arguments into the command
             const command = `"${tarPath}" ${args.join(' ')} ${quotedCachePaths.join(' ')}`;
 
-            core.debug(`Executing command: ${command}`);
+            core.info(`Executing command: ${command}`);
 
             const output = execSync(command, { stdio: 'inherit' });
             if (output && output.length > 0) {
