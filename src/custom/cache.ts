@@ -307,10 +307,13 @@ export async function saveCache(
     );
 
     core.info(`Archive Path: ${archivePath}`);
+    core.info(`Archive Path2: ${archivePath}`);
 
     try {
+        core.info(`Archive Path3: ${archivePath}`);
         const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
         if (customCompression && process.platform !== "win32") {
+            core.info(`Archive Path4: ${archivePath}`);
             const compressionArgs = customCompression === "none" ? "" : `--use-compress-program=${customCompression}`;
             const command = `tar --posix -cf ${archivePath} --exclude ${archivePath} -P -C ${baseDir} ${cachePaths.join(' ')} ${compressionArgs}`;
             const output = execSync(command);
@@ -318,7 +321,7 @@ export async function saveCache(
                 core.debug(output.toString());
             }
         } else if (customCompression && process.platform === "win32") {
-            core.info('Entering win path')
+            core.info(`Archive Path5: ${archivePath}`);
             const tarPathObj = await getTarPath();
             const tarPath = tarPathObj.path; // Access the 'path' property
 
@@ -354,6 +357,7 @@ export async function saveCache(
             }
         }
         else {
+            core.info(`Archive Path6: ${archivePath}`);
             await createTar(archiveFolder, cachePaths, compressionMethod as CompressionMethod);
             if (core.isDebug()) {
                 await listTar(archivePath, compressionMethod as CompressionMethod);
