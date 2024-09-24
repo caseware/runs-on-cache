@@ -95693,6 +95693,7 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
                 // Build the arguments array
                 let args = [];
                 args.push('--posix');
+                args.push('--force-local');
                 if (customCompression !== 'none') {
                     args.push(`--use-compress-program="${lz4Path}"`);
                 }

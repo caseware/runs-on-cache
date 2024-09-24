@@ -332,6 +332,7 @@ export async function saveCache(
             let args: string[] = [];
 
             args.push('--posix');
+            args.push('--force-local');
 
             if (customCompression !== 'none') {
                 args.push(`--use-compress-program="${lz4Path}"`);
