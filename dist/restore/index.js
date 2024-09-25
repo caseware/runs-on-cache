@@ -95553,6 +95553,8 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
                 const lz4Path = 'lz4.exe';
                 // Build the arguments array
                 let args = [];
+                args.push('--force-local');
+                args.push('--posix');
                 if (customCompression !== 'none') {
                     args.push(`--use-compress-program="${lz4Path}"`);
                 }
