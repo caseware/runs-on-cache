@@ -100,12 +100,17 @@ export async function restoreCache(
         checkKey(key);
     }
 
+    core.debug(`Using compression method: ${customCompression}`);
     const compressionMethod = await getCompressionMethod(customCompression);
+    core.debug(`Using compression method: ${compressionMethod}`);
     let archivePath = "";
     const fsSize = core.getInput(Inputs.FsSize) || "50G";
+    core.debug(`Using fsSize: ${fsSize}`);
     const bufferMb = parseInt(core.getInput(Inputs.FsBufferMB) || "2048");
+    core.debug(`Using bufferMb: ${bufferMb}`);
     try {
         const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
+        core.debug(`Using baseDir: ${baseDir}`);
         archivePath = path.join(
             await utils.createTempDirectory(),
             getCacheFileName(compressionMethod)
@@ -117,8 +122,10 @@ export async function restoreCache(
             compressionMethod,
             enableCrossOsArchive
         });
+        core.debug(`Cache Entry: ${JSON.stringify(cacheEntry)}`);
         if (!cacheEntry?.archiveLocation) {
             // Cache not found
+            core.debug("Cache not found");
             if (isBtrfsCompressionMethod(customCompression)) {
                 // Create empty BTRFS cache
                 core.info("Cache not found, creating empty BTRFS cache");
@@ -126,9 +133,13 @@ export async function restoreCache(
                     fsSize,
                     bufferMb
                 });
+                core.debug("Creating empty BTRFS cache");
                 await btrfsCache.initialize();
+                core.debug("Initialized BTRFS cache");
                 await btrfsCache.createEmptyCache();
+                core.debug("Created empty BTRFS cache");
             }
+            core.debug("Cache not found after btrfs check");
             return undefined;
         }
 
