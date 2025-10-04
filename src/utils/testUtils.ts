@@ -16,6 +16,9 @@ interface CacheInput {
     enableCrossOsArchive?: boolean;
     failOnCacheMiss?: boolean;
     lookupOnly?: boolean;
+    customCompression?: string;
+    sync?: boolean;
+    fsSize?: string;
 }
 
 export function setInputs(input: CacheInput): void {
@@ -32,6 +35,10 @@ export function setInputs(input: CacheInput): void {
         setInput(Inputs.FailOnCacheMiss, input.failOnCacheMiss.toString());
     input.lookupOnly !== undefined &&
         setInput(Inputs.LookupOnly, input.lookupOnly.toString());
+    input.customCompression !== undefined &&
+        setInput(Inputs.CustomCompression, input.customCompression);
+    input.sync !== undefined && setInput(Inputs.Sync, input.sync.toString());
+    input.fsSize !== undefined && setInput(Inputs.FsSize, input.fsSize);
 }
 
 export function clearInputs(): void {
@@ -42,4 +49,7 @@ export function clearInputs(): void {
     delete process.env[getInputName(Inputs.EnableCrossOsArchive)];
     delete process.env[getInputName(Inputs.FailOnCacheMiss)];
     delete process.env[getInputName(Inputs.LookupOnly)];
+    delete process.env[getInputName(Inputs.CustomCompression)];
+    delete process.env[getInputName(Inputs.Sync)];
+    delete process.env[getInputName(Inputs.FsSize)];
 }

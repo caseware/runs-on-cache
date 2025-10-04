@@ -14,6 +14,8 @@ import { DownloadOptions, UploadOptions } from "@actions/cache/lib/options";
 import { execSync } from "child_process";
 import { getCacheFileName, getCompressionMethod } from "../utils/actionUtils";
 import { CompressionMethod } from "@actions/cache/lib/internal/constants";
+import { BtrfsCache, isBtrfsCompressionMethod } from "../utils/btrfsUtils";
+import { Inputs } from "../constants";
 
 export class ValidationError extends Error {
     constructor(message: string) {
@@ -100,7 +102,25 @@ export async function restoreCache(
 
     const compressionMethod = await getCompressionMethod(customCompression);
     let archivePath = "";
+    let btrfsCache: BtrfsCache;
     try {
+        const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
+        archivePath = path.join(
+            await utils.createTempDirectory(),
+            getCacheFileName(compressionMethod)
+        );
+        core.debug(`Archive Path: ${archivePath}`);
+
+        const fsSize = core.getInput(Inputs.FsSize) || "50G";
+        const bufferMb = parseInt(core.getInput(Inputs.FsBufferMB) || "2048");
+        btrfsCache = new BtrfsCache(archivePath, baseDir, paths, {
+            fsSize,
+            bufferMb
+        });
+        if (isBtrfsCompressionMethod(customCompression)) {
+            await btrfsCache.initialize();
+        }
+
         // path are needed to compute version
         const cacheEntry = await cacheHttpClient.getCacheEntry(keys, paths, {
             compressionMethod,
@@ -108,6 +128,11 @@ export async function restoreCache(
         });
         if (!cacheEntry?.archiveLocation) {
             // Cache not found
+            if (isBtrfsCompressionMethod(customCompression)) {
+                // Create empty BTRFS cache
+                core.info("Cache not found, creating empty BTRFS cache");
+                await btrfsCache.createEmptyCache();
+            }
             return undefined;
         }
 
@@ -115,12 +140,6 @@ export async function restoreCache(
             core.info("Lookup only - skipping download");
             return cacheEntry.cacheKey;
         }
-
-        archivePath = path.join(
-            await utils.createTempDirectory(),
-            getCacheFileName(compressionMethod)
-        );
-        core.debug(`Archive Path: ${archivePath}`);
 
         // Download the cache from the cache entry
         await cacheHttpClient.downloadCache(
@@ -144,8 +163,9 @@ export async function restoreCache(
             )} MB (${archiveFileSize} B)`
         );
 
-        const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
-        if (customCompression && process.platform !== "win32") {
+        if (isBtrfsCompressionMethod(customCompression)) {
+            await btrfsCache.restore();
+        } else if (customCompression && process.platform !== "win32") {
             const compressionArgs = customCompression === "none" ? "" : `--use-compress-program=${customCompression}`;
             const command = `tar -xf ${archivePath} -P -C ${baseDir} ${compressionArgs}`;
             core.info(`Extracting ${archivePath} to ${baseDir}`);
@@ -315,7 +335,20 @@ export async function saveCache(
     try {
         core.info(`Archive Path3: ${archivePath}`);
         const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
-        if (customCompression && process.platform !== "win32") {
+        if (isBtrfsCompressionMethod(customCompression)) {
+            const fsSize = core.getInput(Inputs.FsSize) || "50G";
+            const bufferMb = parseInt(
+                core.getInput(Inputs.FsBufferMB) || "2048"
+            );
+            const btrfsCache = new BtrfsCache(archivePath, baseDir, paths, {
+                fsSize,
+                bufferMb
+            });
+            await btrfsCache.initialize();
+
+            // Save and compress the mounted cache
+            await btrfsCache.save();
+        } else if (customCompression && process.platform !== "win32") {
             core.info(`Archive Path4: ${archivePath}`);
             const compressionArgs = customCompression === "none" ? "" : `--use-compress-program=${customCompression}`;
             const command = `tar --posix -cf ${archivePath} --exclude ${archivePath} -P -C ${baseDir} ${cachePaths.join(' ')} ${compressionArgs}`;

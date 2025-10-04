@@ -8,7 +8,9 @@ export enum Inputs {
     LookupOnly = "lookup-only", // Input for cache, restore action
 
     CustomCompression = "custom-compression", // Input for cache, save action
-    Sync = "sync" // Input for cache, save action
+    Sync = "sync", // Input for cache, save action
+    FsSize = "fs-size", // Input for btrfs-lz4 filesystem size
+    FsBufferMB = "fs-buffer-mb" // Input for btrfs-lz4 filesystem buffer size
 }
 
 export enum Outputs {
