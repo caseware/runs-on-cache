@@ -42,7 +42,7 @@ inputs:
     default: '50G'
     required: false
   fs-buffer-mb:
-    description: 'Additional buffer size for btrfs-lz4 format (e.g., 2G) after image resize.'
+    description: 'Additional buffer size for btrfs-lz4 format (e.g., 2048) after image resize.'
     default: '2048'
     required: false
 outputs:

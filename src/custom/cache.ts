@@ -102,7 +102,8 @@ export async function restoreCache(
 
     const compressionMethod = await getCompressionMethod(customCompression);
     let archivePath = "";
-    let btrfsCache: BtrfsCache;
+    const fsSize = core.getInput(Inputs.FsSize) || "50G";
+    const bufferMb = parseInt(core.getInput(Inputs.FsBufferMB) || "2048");
     try {
         const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
         archivePath = path.join(
@@ -110,16 +111,6 @@ export async function restoreCache(
             getCacheFileName(compressionMethod)
         );
         core.debug(`Archive Path: ${archivePath}`);
-
-        const fsSize = core.getInput(Inputs.FsSize) || "50G";
-        const bufferMb = parseInt(core.getInput(Inputs.FsBufferMB) || "2048");
-        btrfsCache = new BtrfsCache(archivePath, baseDir, paths, {
-            fsSize,
-            bufferMb
-        });
-        if (isBtrfsCompressionMethod(customCompression)) {
-            await btrfsCache.initialize();
-        }
 
         // path are needed to compute version
         const cacheEntry = await cacheHttpClient.getCacheEntry(keys, paths, {
@@ -131,6 +122,11 @@ export async function restoreCache(
             if (isBtrfsCompressionMethod(customCompression)) {
                 // Create empty BTRFS cache
                 core.info("Cache not found, creating empty BTRFS cache");
+                const btrfsCache = new BtrfsCache(archivePath, baseDir, paths, {
+                    fsSize,
+                    bufferMb
+                });
+                await btrfsCache.initialize();
                 await btrfsCache.createEmptyCache();
             }
             return undefined;
@@ -164,6 +160,11 @@ export async function restoreCache(
         );
 
         if (isBtrfsCompressionMethod(customCompression)) {
+            const btrfsCache = new BtrfsCache(archivePath, baseDir, paths, {
+                fsSize,
+                bufferMb
+            });
+            await btrfsCache.initialize();
             await btrfsCache.restore();
         } else if (customCompression && process.platform !== "win32") {
             const compressionArgs = customCompression === "none" ? "" : `--use-compress-program=${customCompression}`;

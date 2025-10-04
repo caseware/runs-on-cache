@@ -30,6 +30,19 @@ export class BtrfsCache {
         this.fsSize = options.fsSize;
         this.bufferBytes = (options.bufferMb || 512) * 1024 * 1024; // Convert MB to bytes
         this.imageFile = this.archivePath.replace(/\.lz4$/, "");
+
+        // Security input validations
+        this.checkPathTraversal(this.baseDir, this.archivePath);
+        this.pathsToCache.forEach(pathToCheck =>
+            this.checkPathTraversal(this.baseDir, pathToCheck)
+        );
+
+        // Validate fsSize format to prevent command injection
+        if (!/^[0-9]+[KMGT]?$/.test(this.fsSize)) {
+            throw new Error(
+                `Invalid filesystem size format: ${this.fsSize}. Must be a number followed by optional K, M, G, or T.`
+            );
+        }
     }
 
     async initialize(): Promise<void> {
@@ -84,7 +97,7 @@ export class BtrfsCache {
         }
 
         const targetSize = usedBytes + this.bufferBytes;
-        const targetMb = Math.ceil(targetSize / (1024 * 1024));
+        const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
 
         core.info(`→ Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
         await exec.exec("sudo", [
@@ -101,6 +114,17 @@ export class BtrfsCache {
         // Compress with LZ4
         core.info(`[BTRFS] Compressing image with LZ4 → ${this.archivePath}`);
         await exec.exec("lz4", ["--rm", this.imageFile, this.archivePath]);
+    }
+
+    private checkPathTraversal(base: string, pathToCheck: string): void {
+        // Validate that the resolved path is within the base directory
+        const absBase = path.resolve(base);
+        const absPathToCheck = path.resolve(path.join(base, pathToCheck));
+        if (!absPathToCheck.startsWith(absBase)) {
+            throw new Error(
+                `Path traversal detected: ${pathToCheck} resolves outside base directory`
+            );
+        }
     }
 
     private async checkPrerequisites(): Promise<void> {
