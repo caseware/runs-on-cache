@@ -96698,6 +96698,7 @@ class BtrfsCache {
     }
     findExistingMountPoint() {
         return __awaiter(this, void 0, void 0, function* () {
+            core.debug("Running mount to find existing mountpoint");
             let output = "";
             yield exec.exec("mount", [], {
                 listeners: {
@@ -96706,14 +96707,18 @@ class BtrfsCache {
                     }
                 }
             });
+            core.debug("Mount output: " + output);
             // Look for a line that contains our image file
             const lines = output.split("\n");
             for (const line of lines) {
+                core.debug("Line " + line);
                 // Mount output format: "device on mountpoint type filesystem (options)"
                 // e.g., "/tmp/cache.img on /tmp/mount_point type btrfs (rw,relatime)"
                 if (line.includes(this.imageFile)) {
+                    core.debug("Line " + line + " contained imageFile");
                     const match = line.match(/^.+ on (.+) type btrfs/);
                     if (match) {
+                        core.debug("Match: " + JSON.stringify(match));
                         return match[1];
                     }
                 }
