@@ -46,7 +46,12 @@ export class BtrfsCache {
     }
 
     async initialize(): Promise<void> {
-        await this.checkPrerequisites();
+        try {
+            await this.checkPrerequisites();
+        } catch (e) {
+            core.setFailed((e as Error).message);
+            process.exit(1);
+        }
 
         this.mountPoint = await utils.createTempDirectory();
     }
@@ -54,7 +59,7 @@ export class BtrfsCache {
     async createEmptyCache(): Promise<void> {
         // Create new empty cache image
         core.info(`[BTRFS] Creating sparse image: ${this.imageFile}`);
-        await exec.exec("fallocate", ["-l", this.fsSize, this.imageFile]);
+        await exec.exec("truncate", ["-s", this.fsSize, this.imageFile]);
 
         // Format with BTRFS
         core.info(`[BTRFS] Formatting image with BTRFS`);
@@ -137,7 +142,7 @@ export class BtrfsCache {
         }
 
         const requiredTools = [
-            { command: "fallocate", description: "creating sparse files" },
+            { command: "truncate", description: "creating sparse files" },
             {
                 command: "mkfs.btrfs",
                 description: "creating BTRFS filesystems (install btrfs-progs)"

@@ -41,7 +41,7 @@ The `btrfs-lz4` format creates a BTRFS filesystem image containing your cache da
 
 The BTRFS-LZ4 format requires the following tools to be available on the Linux runner:
 
-- `fallocate` - For creating sparse files
+- `truncate` - For creating sparse files
 - `mkfs.btrfs` - For creating BTRFS filesystems (part of btrfs-progs)
 - `btrfs` - For filesystem operations (part of btrfs-progs)
 - `lz4` - For compression

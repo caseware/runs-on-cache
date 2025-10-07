@@ -96554,7 +96554,13 @@ class BtrfsCache {
     }
     initialize() {
         return __awaiter(this, void 0, void 0, function* () {
-            yield this.checkPrerequisites();
+            try {
+                yield this.checkPrerequisites();
+            }
+            catch (e) {
+                core.setFailed(e.message);
+                process.exit(1);
+            }
             this.mountPoint = yield utils.createTempDirectory();
         });
     }
@@ -96562,7 +96568,7 @@ class BtrfsCache {
         return __awaiter(this, void 0, void 0, function* () {
             // Create new empty cache image
             core.info(`[BTRFS] Creating sparse image: ${this.imageFile}`);
-            yield exec.exec("fallocate", ["-l", this.fsSize, this.imageFile]);
+            yield exec.exec("truncate", ["-s", this.fsSize, this.imageFile]);
             // Format with BTRFS
             core.info(`[BTRFS] Formatting image with BTRFS`);
             yield exec.exec("mkfs.btrfs", ["-f", this.imageFile], {
@@ -96631,7 +96637,7 @@ class BtrfsCache {
                     `Please use a different compression method or switch to a Linux runner.`);
             }
             const requiredTools = [
-                { command: "fallocate", description: "creating sparse files" },
+                { command: "truncate", description: "creating sparse files" },
                 {
                     command: "mkfs.btrfs",
                     description: "creating BTRFS filesystems (install btrfs-progs)"
