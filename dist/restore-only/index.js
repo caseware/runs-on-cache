@@ -96699,8 +96699,8 @@ class BtrfsCache {
                 const targetPath = path_1.default.join(this.mountPoint, p);
                 core.info(`[BTRFS] Bind-mounting ${absPath} → ${targetPath}`);
                 yield Promise.all([
-                    fs.mkdir(path_1.default.dirname(targetPath), { recursive: true }),
-                    fs.mkdir(path_1.default.dirname(absPath), { recursive: true })
+                    fs.mkdir(targetPath, { recursive: true }),
+                    fs.mkdir(absPath, { recursive: true })
                 ]);
                 yield exec.exec("sudo", ["mount", "--bind", absPath, targetPath]);
             }));

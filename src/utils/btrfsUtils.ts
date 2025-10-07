@@ -235,8 +235,8 @@ export class BtrfsCache {
 
             core.info(`[BTRFS] Bind-mounting ${absPath} → ${targetPath}`);
             await Promise.all([
-                fs.mkdir(path.dirname(targetPath), { recursive: true }),
-                fs.mkdir(path.dirname(absPath), { recursive: true })
+                fs.mkdir(targetPath, { recursive: true }),
+                fs.mkdir(absPath, { recursive: true })
             ]);
             await exec.exec("sudo", ["mount", "--bind", absPath, targetPath]);
         });
