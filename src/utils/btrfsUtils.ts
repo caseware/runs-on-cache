@@ -58,30 +58,38 @@ export class BtrfsCache {
     }
 
     async createEmptyCache(): Promise<void> {
-        // Create new empty cache image
-        core.info(`[BTRFS] Creating sparse image: ${this.imageFile}`);
-        await exec.exec("truncate", ["-s", this.fsSize, this.imageFile]);
+        try {
+            // Create new empty cache image
+            core.info(`[BTRFS] Creating sparse image: ${this.imageFile}`);
+            await exec.exec("truncate", ["-s", this.fsSize, this.imageFile]);
 
-        // Format with BTRFS
-        core.info(`[BTRFS] Formatting image with BTRFS`);
-        await exec.exec("mkfs.btrfs", ["-f", this.imageFile], {
-            silent: true
-        });
+            // Format with BTRFS
+            core.info(`[BTRFS] Formatting image with BTRFS`);
+            await exec.exec("mkfs.btrfs", ["-f", this.imageFile], {
+                silent: true
+            });
 
-        return this.mountForSave();
+            return this.mountForSave();
+        } catch (error) {
+            throw new Error(`Failed to create empty BTRFS cache: ${error instanceof Error ? error.message : error}`);
+        }
     }
 
     async restore(): Promise<void> {
-        // Decompress existing cache (silently to avoid spam)
-        core.debug(`[BTRFS] Decompressing ${this.archivePath} → ${this.imageFile}`);
-        await exec.exec("lz4", [
-            "-d",
-            "--rm",
-            this.archivePath,
-            this.imageFile
-        ], { silent: true });
+        try {
+            // Decompress existing cache (silently to avoid spam)
+            core.debug(`[BTRFS] Decompressing ${this.archivePath} → ${this.imageFile}`);
+            await exec.exec("lz4", [
+                "-d",
+                "--rm",
+                this.archivePath,
+                this.imageFile
+            ], { silent: true });
 
-        return this.mount();
+            return this.mount();
+        } catch (error) {
+            throw new Error(`Failed to restore BTRFS cache: ${error instanceof Error ? error.message : error}`);
+        }
     }
 
     async save(): Promise<void> {
@@ -261,69 +269,85 @@ export class BtrfsCache {
     }
 
     private async mount(): Promise<void> {
-        this.mountPoint = await this.createCacheKeySpecificTempDirectory();
-        
-        // Create mount point and mount the image
-        await fs.mkdir(this.mountPoint, { recursive: true });
-        core.debug(`[BTRFS] Mounting image to ${this.mountPoint}`);
-        await exec.exec("sudo", [
-            "mount",
-            "-o",
-            "loop,rw",
-            this.imageFile,
-            this.mountPoint
-        ], { silent: true });
+        try {
+            this.mountPoint = await this.createCacheKeySpecificTempDirectory();
+            
+            // Create mount point and mount the image
+            await fs.mkdir(this.mountPoint, { recursive: true });
+            core.debug(`[BTRFS] Mounting image to ${this.mountPoint}`);
+            await exec.exec("sudo", [
+                "mount",
+                "-o",
+                "loop,rw",
+                this.imageFile,
+                this.mountPoint
+            ], { silent: true });
 
-        // Bind-mount each cached path from the BTRFS mount to the workspace
-        const promises = this.pathsToCache.map(async p => {
-            if (!this.mountPoint) {
-                throw new Error("Mount point is not set");
-            }
+            // Bind-mount each cached path from the BTRFS mount to the workspace
+            const promises = this.pathsToCache.map(async p => {
+                if (!this.mountPoint) {
+                    throw new Error("Mount point is not set");
+                }
 
-            const absPath = path.join(this.baseDir, p);
-            const sourcePath = path.join(this.mountPoint, p);
+                const absPath = path.join(this.baseDir, p);
+                const sourcePath = path.join(this.mountPoint, p);
 
-            core.debug(`[BTRFS] Bind-mounting ${sourcePath} → ${absPath} (restore mode)`);
-            await Promise.all([
-                exec.exec("sudo", ["mkdir", "-p", sourcePath], { silent: true }),
-                fs.mkdir(path.dirname(absPath), { recursive: true })
-            ]);
-            await exec.exec("sudo", ["mount", "--bind", sourcePath, absPath], { silent: true });
-        });
-        await Promise.all(promises);
+                core.debug(`[BTRFS] Bind-mounting ${sourcePath} → ${absPath} (restore mode)`);
+                try {
+                    await Promise.all([
+                        exec.exec("sudo", ["mkdir", "-p", sourcePath], { silent: true }),
+                        fs.mkdir(path.dirname(absPath), { recursive: true })
+                    ]);
+                    await exec.exec("sudo", ["mount", "--bind", sourcePath, absPath], { silent: true });
+                } catch (error) {
+                    throw new Error(`Failed to bind-mount ${sourcePath} to ${absPath}: ${error instanceof Error ? error.message : error}`);
+                }
+            });
+            await Promise.all(promises);
+        } catch (error) {
+            throw new Error(`Failed to mount BTRFS filesystem: ${error instanceof Error ? error.message : error}`);
+        }
     }
 
     private async mountForSave(): Promise<void> {
-        this.mountPoint = await this.createCacheKeySpecificTempDirectory();
-        
-        // Create mount point and mount the image
-        await fs.mkdir(this.mountPoint, { recursive: true });
-        core.debug(`[BTRFS] Mounting image to ${this.mountPoint}`);
-        await exec.exec("sudo", [
-            "mount",
-            "-o",
-            "loop,rw",
-            this.imageFile,
-            this.mountPoint
-        ], { silent: true });
+        try {
+            this.mountPoint = await this.createCacheKeySpecificTempDirectory();
+            
+            // Create mount point and mount the image
+            await fs.mkdir(this.mountPoint, { recursive: true });
+            core.debug(`[BTRFS] Mounting image to ${this.mountPoint}`);
+            await exec.exec("sudo", [
+                "mount",
+                "-o",
+                "loop,rw",
+                this.imageFile,
+                this.mountPoint
+            ], { silent: true });
 
-        // Bind-mount each workspace path INTO the BTRFS mount (for saving/populating cache)
-        const promises = this.pathsToCache.map(async p => {
-            if (!this.mountPoint) {
-                throw new Error("Mount point is not set");
-            }
+            // Bind-mount each workspace path INTO the BTRFS mount (for saving/populating cache)
+            const promises = this.pathsToCache.map(async p => {
+                if (!this.mountPoint) {
+                    throw new Error("Mount point is not set");
+                }
 
-            const absPath = path.join(this.baseDir, p);
-            const targetPath = path.join(this.mountPoint, p);
+                const absPath = path.join(this.baseDir, p);
+                const targetPath = path.join(this.mountPoint, p);
 
-            core.debug(`[BTRFS] Bind-mounting ${absPath} → ${targetPath} (save mode)`);
-            await Promise.all([
-                exec.exec("sudo", ["mkdir", "-p", targetPath], { silent: true }),
-                fs.mkdir(absPath, { recursive: true })
-            ]);
-            await exec.exec("sudo", ["mount", "--bind", absPath, targetPath], { silent: true });
-        });
-        await Promise.all(promises);
+                core.debug(`[BTRFS] Bind-mounting ${absPath} → ${targetPath} (save mode)`);
+                try {
+                    await Promise.all([
+                        exec.exec("sudo", ["mkdir", "-p", targetPath], { silent: true }),
+                        fs.mkdir(absPath, { recursive: true })
+                    ]);
+                    await exec.exec("sudo", ["mount", "--bind", absPath, targetPath], { silent: true });
+                } catch (error) {
+                    throw new Error(`Failed to bind-mount ${absPath} to ${targetPath}: ${error instanceof Error ? error.message : error}`);
+                }
+            });
+            await Promise.all(promises);
+        } catch (error) {
+            throw new Error(`Failed to mount BTRFS filesystem for save: ${error instanceof Error ? error.message : error}`);
+        }
     }
 
     private async createCacheKeySpecificTempDirectory(): Promise<string> {
