@@ -15,7 +15,7 @@ export class BtrfsCache {
      *
      * This is a temporary directory where the BTRFS image will be mounted, the actual paths to cache will be bind-mounted.
      */
-    private mountPoint = "";
+    private mountPoint?: string;
 
     private fsSize: string;
     private bufferBytes: number;
@@ -52,8 +52,6 @@ export class BtrfsCache {
             core.setFailed((e as Error).message);
             process.exit(1);
         }
-
-        this.mountPoint = await utils.createTempDirectory();
     }
 
     async createEmptyCache(): Promise<void> {
@@ -86,6 +84,9 @@ export class BtrfsCache {
     }
 
     async save(): Promise<void> {
+        // Find the existing mount point for this image
+        this.mountPoint = await this.findExistingMountPoint();
+
         core.info(`[BTRFS] Syncing and calculating used space`);
         await exec.exec("sync");
 
@@ -190,6 +191,9 @@ export class BtrfsCache {
     }
 
     private async getBtrfsUsage(): Promise<string> {
+        if (!this.mountPoint) {
+            throw new Error("Mount point is not set");
+        }
         let output = "";
         await exec.exec(
             "sudo",
@@ -216,7 +220,38 @@ export class BtrfsCache {
         throw new Error("Could not parse BTRFS usage output");
     }
 
+    private async findExistingMountPoint(): Promise<string> {
+        let output = "";
+        await exec.exec("mount", [], {
+            listeners: {
+                stdout: (data: Buffer) => {
+                    output += data.toString();
+                }
+            }
+        });
+
+        // Look for a line that contains our image file
+        const lines = output.split("\n");
+        for (const line of lines) {
+            // Mount output format: "device on mountpoint type filesystem (options)"
+            // e.g., "/tmp/cache.img on /tmp/mount_point type btrfs (rw,relatime)"
+            if (line.includes(this.imageFile)) {
+                const match = line.match(/^.+ on (.+) type btrfs/);
+                if (match) {
+                    return match[1];
+                }
+            }
+        }
+
+        throw new Error(
+            `BTRFS image ${this.imageFile} is not currently mounted. ` +
+            `Make sure the cache was properly initialized and mounted first.`
+        );
+    }
+
     private async mount(): Promise<void> {
+        this.mountPoint = await utils.createTempDirectory();
+        
         // Create mount point and mount the image
         await fs.mkdir(this.mountPoint, { recursive: true });
         core.info(`[BTRFS] Mounting image to ${this.mountPoint}`);
@@ -230,6 +265,10 @@ export class BtrfsCache {
 
         // Bind-mount each path to cache into the BTRFS mount
         const promises = this.pathsToCache.map(async p => {
+            if (!this.mountPoint) {
+                throw new Error("Mount point is not set");
+            }
+
             const absPath = path.join(this.baseDir, p);
             const targetPath = path.join(this.mountPoint, p);
 
@@ -244,6 +283,10 @@ export class BtrfsCache {
     }
 
     private async unmount(): Promise<void> {
+        if (!this.mountPoint) {
+            throw new Error("Mount point is not set");
+        }
+        
         try {
             await exec.exec("sync");
 
