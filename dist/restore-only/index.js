@@ -1327,7 +1327,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.createTar = exports.extractTar = exports.listTar = exports.getTarPath = void 0;
+exports.createTar = exports.extractTar = exports.listTar = void 0;
 const exec_1 = __nccwpck_require__(1514);
 const io = __importStar(__nccwpck_require__(7436));
 const fs_1 = __nccwpck_require__(7147);
@@ -1374,7 +1374,6 @@ function getTarPath() {
         };
     });
 }
-exports.getTarPath = getTarPath;
 // Return arguments for tar as per tarPath, compressionMethod, method type and os
 function getTarArgs(tarPath, compressionMethod, type, archivePath = '') {
     return __awaiter(this, void 0, void 0, function* () {
@@ -95103,7 +95102,9 @@ var Inputs;
     Inputs["FailOnCacheMiss"] = "fail-on-cache-miss";
     Inputs["LookupOnly"] = "lookup-only";
     Inputs["CustomCompression"] = "custom-compression";
-    Inputs["Sync"] = "sync"; // Input for cache, save action
+    Inputs["Sync"] = "sync";
+    Inputs["FsSize"] = "fs-size";
+    Inputs["FsBufferMB"] = "fs-buffer-mb"; // Input for btrfs-lz4 filesystem buffer size
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {
@@ -95445,6 +95446,8 @@ const cacheHttpClient = __importStar(__nccwpck_require__(9268));
 const tar_1 = __nccwpck_require__(6490);
 const child_process_1 = __nccwpck_require__(2081);
 const actionUtils_1 = __nccwpck_require__(6850);
+const btrfsUtils_1 = __nccwpck_require__(9090);
+const constants_1 = __nccwpck_require__(9042);
 class ValidationError extends Error {
     constructor(message) {
         super(message);
@@ -95507,24 +95510,48 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
         for (const key of keys) {
             checkKey(key);
         }
+        core.debug(`Using compression method: ${customCompression}`);
         const compressionMethod = yield (0, actionUtils_1.getCompressionMethod)(customCompression);
+        core.debug(`Using compression method: ${compressionMethod}`);
         let archivePath = "";
+        const fsSize = core.getInput(constants_1.Inputs.FsSize) || "50G";
+        core.debug(`Using fsSize: ${fsSize}`);
+        const bufferMb = parseInt(core.getInput(constants_1.Inputs.FsBufferMB) || "2048");
+        core.debug(`Using bufferMb: ${bufferMb}`);
         try {
+            const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
+            core.debug(`Using baseDir: ${baseDir}`);
+            archivePath = path.join(yield utils.createTempDirectory(), (0, actionUtils_1.getCacheFileName)(compressionMethod));
+            core.debug(`Archive Path: ${archivePath}`);
             // path are needed to compute version
             const cacheEntry = yield cacheHttpClient.getCacheEntry(keys, paths, {
                 compressionMethod,
                 enableCrossOsArchive
             });
+            core.debug(`Cache Entry: ${JSON.stringify(cacheEntry)}`);
             if (!(cacheEntry === null || cacheEntry === void 0 ? void 0 : cacheEntry.archiveLocation)) {
                 // Cache not found
+                core.debug("Cache not found");
+                if ((0, btrfsUtils_1.isBtrfsCompressionMethod)(customCompression)) {
+                    // Create empty BTRFS cache
+                    core.info("Cache not found, creating empty BTRFS cache");
+                    const btrfsCache = new btrfsUtils_1.BtrfsCache(archivePath, baseDir, paths, {
+                        fsSize,
+                        bufferMb
+                    });
+                    core.debug("Creating empty BTRFS cache");
+                    yield btrfsCache.initialize();
+                    core.debug("Initialized BTRFS cache");
+                    yield btrfsCache.createEmptyCache();
+                    core.debug("Created empty BTRFS cache");
+                }
+                core.debug("Cache not found after btrfs check");
                 return undefined;
             }
             if (options === null || options === void 0 ? void 0 : options.lookupOnly) {
                 core.info("Lookup only - skipping download");
                 return cacheEntry.cacheKey;
             }
-            archivePath = path.join(yield utils.createTempDirectory(), (0, actionUtils_1.getCacheFileName)(compressionMethod));
-            core.debug(`Archive Path: ${archivePath}`);
             // Download the cache from the cache entry
             yield cacheHttpClient.downloadCache(cacheEntry.archiveLocation, archivePath, options);
             if (core.isDebug()) {
@@ -95537,8 +95564,15 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             }
             const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
             core.info(`Cache Size: ~${Math.round(archiveFileSize / (1024 * 1024))} MB (${archiveFileSize} B)`);
-            const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
-            if (customCompression && process.platform !== "win32") {
+            if ((0, btrfsUtils_1.isBtrfsCompressionMethod)(customCompression)) {
+                const btrfsCache = new btrfsUtils_1.BtrfsCache(archivePath, baseDir, paths, {
+                    fsSize,
+                    bufferMb
+                });
+                yield btrfsCache.initialize();
+                yield btrfsCache.restore();
+            }
+            else if (customCompression && process.platform !== "win32") {
                 const compressionArgs = customCompression === "none" ? "" : `--use-compress-program=${customCompression}`;
                 const command = `tar -xf ${archivePath} -P -C ${baseDir} ${compressionArgs}`;
                 core.info(`Extracting ${archivePath} to ${baseDir}`);
@@ -95677,7 +95711,18 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
         try {
             core.info(`Archive Path3: ${archivePath}`);
             const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
-            if (customCompression && process.platform !== "win32") {
+            if ((0, btrfsUtils_1.isBtrfsCompressionMethod)(customCompression)) {
+                const fsSize = core.getInput(constants_1.Inputs.FsSize) || "50G";
+                const bufferMb = parseInt(core.getInput(constants_1.Inputs.FsBufferMB) || "2048");
+                const btrfsCache = new btrfsUtils_1.BtrfsCache(archivePath, baseDir, paths, {
+                    fsSize,
+                    bufferMb
+                });
+                yield btrfsCache.initialize();
+                // Save and compress the mounted cache
+                yield btrfsCache.save();
+            }
+            else if (customCompression && process.platform !== "win32") {
                 core.info(`Archive Path4: ${archivePath}`);
                 const compressionArgs = customCompression === "none" ? "" : `--use-compress-program=${customCompression}`;
                 const command = `tar --posix -cf ${archivePath} --exclude ${archivePath} -P -C ${baseDir} ${cachePaths.join(' ')} ${compressionArgs}`;
@@ -96412,9 +96457,280 @@ function getCacheFileName(compressionMethod) {
     }
     if (compressionMethod === "none")
         return "cache";
+    if (compressionMethod === "btrfs-lz4")
+        return "cache.img.lz4";
     return `cache.${compressionMethod}`;
 }
 exports.getCacheFileName = getCacheFileName;
+
+
+/***/ }),
+
+/***/ 9090:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.isBtrfsCompressionMethod = exports.BtrfsCache = void 0;
+const utils = __importStar(__nccwpck_require__(1518));
+const core = __importStar(__nccwpck_require__(2186));
+const exec = __importStar(__nccwpck_require__(1514));
+const fs = __importStar(__nccwpck_require__(3292));
+const path_1 = __importDefault(__nccwpck_require__(1017));
+class BtrfsCache {
+    constructor(archivePath, baseDir, pathsToCache, options) {
+        this.archivePath = archivePath;
+        this.baseDir = baseDir;
+        this.pathsToCache = pathsToCache;
+        /**
+         * The mount point for the BTRFS filesystem
+         *
+         * This is a temporary directory where the BTRFS image will be mounted, the actual paths to cache will be bind-mounted.
+         */
+        this.mountPoint = "";
+        this.fsSize = options.fsSize;
+        this.bufferBytes = (options.bufferMb || 512) * 1024 * 1024; // Convert MB to bytes
+        this.imageFile = this.archivePath.replace(/\.lz4$/, "");
+        // Security input validations
+        this.checkPathTraversal(this.baseDir, this.archivePath);
+        this.pathsToCache.forEach(pathToCheck => this.checkPathTraversal(this.baseDir, pathToCheck));
+        // Validate fsSize format to prevent command injection
+        if (!/^[0-9]+[KMGT]?$/.test(this.fsSize)) {
+            throw new Error(`Invalid filesystem size format: ${this.fsSize}. Must be a number followed by optional K, M, G, or T.`);
+        }
+    }
+    initialize() {
+        return __awaiter(this, void 0, void 0, function* () {
+            yield this.checkPrerequisites();
+            this.mountPoint = yield utils.createTempDirectory();
+        });
+    }
+    createEmptyCache() {
+        return __awaiter(this, void 0, void 0, function* () {
+            // Create new empty cache image
+            core.info(`[BTRFS] Creating sparse image: ${this.imageFile}`);
+            yield exec.exec("fallocate", ["-l", this.fsSize, this.imageFile]);
+            // Format with BTRFS
+            core.info(`[BTRFS] Formatting image with BTRFS`);
+            yield exec.exec("mkfs.btrfs", ["-f", this.imageFile], {
+                silent: true
+            });
+            return this.mount();
+        });
+    }
+    restore() {
+        return __awaiter(this, void 0, void 0, function* () {
+            // Decompress existing cache
+            core.info(`[BTRFS] Decompressing ${this.archivePath} → ${this.imageFile}`);
+            yield exec.exec("lz4", [
+                "-d",
+                "--rm",
+                this.archivePath,
+                this.imageFile
+            ]);
+            return this.mount();
+        });
+    }
+    save() {
+        return __awaiter(this, void 0, void 0, function* () {
+            core.info(`[BTRFS] Syncing and calculating used space`);
+            yield exec.exec("sync");
+            // Get used space and resize filesystem
+            let usedBytes = 0;
+            try {
+                const usageOutput = yield this.getBtrfsUsage();
+                usedBytes = this.parseUsedBytes(usageOutput);
+            }
+            catch (error) {
+                core.warning(`Could not determine exact usage, using default buffer: ${error}`);
+                usedBytes = 512 * 1024 * 1024; // 512MB default
+            }
+            const targetSize = usedBytes + this.bufferBytes;
+            const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
+            core.info(`→ Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
+            yield exec.exec("sudo", [
+                "btrfs",
+                "filesystem",
+                "resize",
+                `${targetMb}M`,
+                this.mountPoint
+            ]);
+            // Unmount
+            yield this.unmount();
+            // Compress with LZ4
+            core.info(`[BTRFS] Compressing image with LZ4 → ${this.archivePath}`);
+            yield exec.exec("lz4", ["--rm", this.imageFile, this.archivePath]);
+        });
+    }
+    checkPathTraversal(base, pathToCheck) {
+        // Validate that the resolved path is within the base directory
+        const absBase = path_1.default.resolve(base);
+        const absPathToCheck = path_1.default.resolve(path_1.default.join(base, pathToCheck));
+        if (!absPathToCheck.startsWith(absBase)) {
+            throw new Error(`Path traversal detected: ${pathToCheck} resolves outside base directory`);
+        }
+    }
+    checkPrerequisites() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (process.platform !== "linux") {
+                throw new Error(`BTRFS-LZ4 compression is only supported on Linux platforms. ` +
+                    `Current platform: ${process.platform}. ` +
+                    `Please use a different compression method or switch to a Linux runner.`);
+            }
+            const requiredTools = [
+                { command: "fallocate", description: "creating sparse files" },
+                {
+                    command: "mkfs.btrfs",
+                    description: "creating BTRFS filesystems (install btrfs-progs)"
+                },
+                {
+                    command: "btrfs",
+                    description: "BTRFS filesystem operations (install btrfs-progs)"
+                },
+                { command: "lz4", description: "LZ4 compression (install lz4)" },
+                {
+                    command: "sudo",
+                    description: "elevated privileges for mounting operations"
+                }
+            ];
+            const missingTools = [];
+            yield Promise.all(requiredTools.map((tool) => __awaiter(this, void 0, void 0, function* () {
+                try {
+                    yield exec.exec("which", [tool.command], { silent: true });
+                }
+                catch (error) {
+                    missingTools.push(`${tool.command} (${tool.description})`);
+                }
+            })));
+            if (missingTools.length > 0) {
+                throw new Error(`Missing required tools for BTRFS-LZ4 compression: ${missingTools.join(", ")}. ` +
+                    `Please install the missing tools or use a different compression method.`);
+            }
+            // Check if sudo works without password prompt (for CI environments)
+            try {
+                yield exec.exec("sudo", ["-n", "true"], { silent: true });
+            }
+            catch (error) {
+                throw new Error(`sudo access is required for BTRFS mounting operations but sudo is not available or requires a password. ` +
+                    `Please ensure the runner has passwordless sudo access or use a different compression method.`);
+            }
+        });
+    }
+    getBtrfsUsage() {
+        return __awaiter(this, void 0, void 0, function* () {
+            let output = "";
+            yield exec.exec("sudo", ["btrfs", "filesystem", "usage", "-b", this.mountPoint], {
+                listeners: {
+                    stdout: (data) => {
+                        output += data.toString();
+                    }
+                }
+            });
+            return output;
+        });
+    }
+    parseUsedBytes(usageOutput) {
+        const lines = usageOutput.split("\n");
+        for (const line of lines) {
+            const match = line.match(/^\s*Used:\s*(\d+)$/);
+            if (match) {
+                return parseInt(match[1], 10);
+            }
+        }
+        throw new Error("Could not parse BTRFS usage output");
+    }
+    mount() {
+        return __awaiter(this, void 0, void 0, function* () {
+            // Create mount point and mount the image
+            yield fs.mkdir(this.mountPoint, { recursive: true });
+            core.info(`[BTRFS] Mounting image to ${this.mountPoint}`);
+            yield exec.exec("sudo", [
+                "mount",
+                "-o",
+                "loop,rw",
+                this.imageFile,
+                this.mountPoint
+            ]);
+            // Bind-mount each path to cache into the BTRFS mount
+            const promises = this.pathsToCache.map((p) => __awaiter(this, void 0, void 0, function* () {
+                const absPath = path_1.default.join(this.baseDir, p);
+                const targetPath = path_1.default.join(this.mountPoint, p);
+                core.info(`[BTRFS] Bind-mounting ${absPath} → ${targetPath}`);
+                yield Promise.all([
+                    fs.mkdir(path_1.default.dirname(targetPath), { recursive: true }),
+                    fs.mkdir(path_1.default.dirname(absPath), { recursive: true })
+                ]);
+                yield exec.exec("sudo", ["mount", "--bind", absPath, targetPath]);
+            }));
+            yield Promise.all(promises);
+        });
+    }
+    unmount() {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                yield exec.exec("sync");
+                // Check if mounted
+                const mountCheck = yield exec.exec("mountpoint", [this.mountPoint], {
+                    ignoreReturnCode: true,
+                    silent: true
+                });
+                if (mountCheck === 0) {
+                    yield exec.exec("sudo", ["umount", this.mountPoint]);
+                }
+            }
+            catch (error) {
+                core.debug(`Cleanup mount failed (non-critical): ${error}`);
+            }
+            try {
+                yield fs.rm(this.mountPoint, { recursive: true, force: true });
+            }
+            catch (error) {
+                core.debug(`Cleanup mount point failed (non-critical): ${error}`);
+            }
+        });
+    }
+}
+exports.BtrfsCache = BtrfsCache;
+function isBtrfsCompressionMethod(compressionMethod) {
+    return compressionMethod === "btrfs-lz4";
+}
+exports.isBtrfsCompressionMethod = isBtrfsCompressionMethod;
 
 
 /***/ }),
