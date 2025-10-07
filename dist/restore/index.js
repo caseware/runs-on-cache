@@ -95102,9 +95102,10 @@ var Inputs;
     Inputs["FailOnCacheMiss"] = "fail-on-cache-miss";
     Inputs["LookupOnly"] = "lookup-only";
     Inputs["CustomCompression"] = "custom-compression";
+    Inputs["ContainerFormat"] = "container-format";
     Inputs["Sync"] = "sync";
     Inputs["FsSize"] = "fs-size";
-    Inputs["FsBufferMB"] = "fs-buffer-mb"; // Input for btrfs-lz4 filesystem buffer size
+    Inputs["FsBufferMB"] = "fs-buffer-mb"; // Input for btrfs filesystem buffer size
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {
@@ -96558,6 +96559,7 @@ class BtrfsCache {
                 yield exec.exec("mkfs.btrfs", ["-f", this.imageFile], {
                     silent: true
                 });
+                // Mount the filesystem so workspace operations write directly to it
                 return this.mountForSave();
             }
             catch (error) {
@@ -96791,13 +96793,13 @@ class BtrfsCache {
                     }
                     const absPath = path_1.default.join(this.baseDir, p);
                     const targetPath = path_1.default.join(this.mountPoint, p);
-                    core.debug(`[BTRFS] Bind-mounting ${absPath} → ${targetPath} (save mode)`);
+                    core.debug(`[BTRFS] Bind-mounting ${targetPath} → ${absPath} (save mode - workspace points to BTRFS)`);
                     try {
                         yield Promise.all([
                             exec.exec("sudo", ["mkdir", "-p", targetPath], { silent: true }),
-                            fs.mkdir(absPath, { recursive: true })
+                            fs.mkdir(path_1.default.dirname(absPath), { recursive: true })
                         ]);
-                        yield exec.exec("sudo", ["mount", "--bind", absPath, targetPath], { silent: true });
+                        yield exec.exec("sudo", ["mount", "--bind", targetPath, absPath], { silent: true });
                     }
                     catch (error) {
                         throw new Error(`Failed to bind-mount ${absPath} to ${targetPath}: ${error instanceof Error ? error.message : error}`);
@@ -96828,14 +96830,32 @@ class BtrfsCache {
                 throw new Error("Mount point is not set");
             }
             try {
-                yield exec.exec("sync");
-                // Check if mounted
+                yield exec.exec("sync", [], { silent: true });
+                // First unmount all bind mounts
+                for (const p of this.pathsToCache) {
+                    const absPath = path_1.default.join(this.baseDir, p);
+                    try {
+                        const bindMountCheck = yield exec.exec("mountpoint", [absPath], {
+                            ignoreReturnCode: true,
+                            silent: true
+                        });
+                        if (bindMountCheck === 0) {
+                            core.debug(`[BTRFS] Unmounting bind mount: ${absPath}`);
+                            yield exec.exec("sudo", ["umount", absPath], { silent: true });
+                        }
+                    }
+                    catch (error) {
+                        core.debug(`Failed to unmount bind mount ${absPath}: ${error}`);
+                    }
+                }
+                // Then unmount the main BTRFS filesystem
                 const mountCheck = yield exec.exec("mountpoint", [this.mountPoint], {
                     ignoreReturnCode: true,
                     silent: true
                 });
                 if (mountCheck === 0) {
-                    yield exec.exec("sudo", ["umount", this.mountPoint]);
+                    core.debug(`[BTRFS] Unmounting main filesystem: ${this.mountPoint}`);
+                    yield exec.exec("sudo", ["umount", this.mountPoint], { silent: true });
                 }
             }
             catch (error) {

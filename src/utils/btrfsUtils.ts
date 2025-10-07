@@ -69,6 +69,7 @@ export class BtrfsCache {
                 silent: true
             });
 
+            // Mount the filesystem so workspace operations write directly to it
             return this.mountForSave();
         } catch (error) {
             throw new Error(`Failed to create empty BTRFS cache: ${error instanceof Error ? error.message : error}`);
@@ -333,13 +334,13 @@ export class BtrfsCache {
                 const absPath = path.join(this.baseDir, p);
                 const targetPath = path.join(this.mountPoint, p);
 
-                core.debug(`[BTRFS] Bind-mounting ${absPath} → ${targetPath} (save mode)`);
+                core.debug(`[BTRFS] Bind-mounting ${targetPath} → ${absPath} (save mode - workspace points to BTRFS)`);
                 try {
                     await Promise.all([
                         exec.exec("sudo", ["mkdir", "-p", targetPath], { silent: true }),
-                        fs.mkdir(absPath, { recursive: true })
+                        fs.mkdir(path.dirname(absPath), { recursive: true })
                     ]);
-                    await exec.exec("sudo", ["mount", "--bind", absPath, targetPath], { silent: true });
+                    await exec.exec("sudo", ["mount", "--bind", targetPath, absPath], { silent: true });
                 } catch (error) {
                     throw new Error(`Failed to bind-mount ${absPath} to ${targetPath}: ${error instanceof Error ? error.message : error}`);
                 }
@@ -370,9 +371,30 @@ export class BtrfsCache {
         }
         
         try {
-            await exec.exec("sync");
+            await exec.exec("sync", [], { silent: true });
 
-            // Check if mounted
+            // First unmount all bind mounts
+            for (const p of this.pathsToCache) {
+                const absPath = path.join(this.baseDir, p);
+                try {
+                    const bindMountCheck = await exec.exec(
+                        "mountpoint",
+                        [absPath],
+                        {
+                            ignoreReturnCode: true,
+                            silent: true
+                        }
+                    );
+                    if (bindMountCheck === 0) {
+                        core.debug(`[BTRFS] Unmounting bind mount: ${absPath}`);
+                        await exec.exec("sudo", ["umount", absPath], { silent: true });
+                    }
+                } catch (error) {
+                    core.debug(`Failed to unmount bind mount ${absPath}: ${error}`);
+                }
+            }
+
+            // Then unmount the main BTRFS filesystem
             const mountCheck = await exec.exec(
                 "mountpoint",
                 [this.mountPoint],
@@ -383,7 +405,8 @@ export class BtrfsCache {
             );
 
             if (mountCheck === 0) {
-                await exec.exec("sudo", ["umount", this.mountPoint]);
+                core.debug(`[BTRFS] Unmounting main filesystem: ${this.mountPoint}`);
+                await exec.exec("sudo", ["umount", this.mountPoint], { silent: true });
             }
         } catch (error) {
             core.debug(`Cleanup mount failed (non-critical): ${error}`);
