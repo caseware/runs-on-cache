@@ -95538,7 +95538,7 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
                     const btrfsCache = new btrfsUtils_1.BtrfsCache(archivePath, baseDir, paths, {
                         fsSize,
                         bufferMb
-                    });
+                    }, primaryKey);
                     core.debug("Creating empty BTRFS cache");
                     yield btrfsCache.initialize();
                     core.debug("Initialized BTRFS cache");
@@ -95568,7 +95568,7 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
                 const btrfsCache = new btrfsUtils_1.BtrfsCache(archivePath, baseDir, paths, {
                     fsSize,
                     bufferMb
-                });
+                }, cacheEntry.cacheKey);
                 yield btrfsCache.initialize();
                 yield btrfsCache.restore();
             }
@@ -95717,7 +95717,7 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
                 const btrfsCache = new btrfsUtils_1.BtrfsCache(archivePath, baseDir, paths, {
                     fsSize,
                     bufferMb
-                });
+                }, key);
                 yield btrfsCache.initialize();
                 // Save and compress the mounted cache
                 yield btrfsCache.save();
@@ -96514,13 +96514,20 @@ const exec = __importStar(__nccwpck_require__(1514));
 const fs = __importStar(__nccwpck_require__(3292));
 const path_1 = __importDefault(__nccwpck_require__(1017));
 class BtrfsCache {
-    constructor(archivePath, baseDir, pathsToCache, options) {
+    constructor(archivePath, baseDir, pathsToCache, options, cacheKey) {
         this.archivePath = archivePath;
         this.baseDir = baseDir;
         this.pathsToCache = pathsToCache;
+        /**
+         * The mount point for the BTRFS filesystem
+         *
+         * This is a temporary directory where the BTRFS image will be mounted, the actual paths to cache will be bind-mounted.
+         */
+        this.mountPoint = "";
         this.fsSize = options.fsSize;
         this.bufferBytes = (options.bufferMb || 512) * 1024 * 1024; // Convert MB to bytes
         this.imageFile = this.archivePath.replace(/\.lz4$/, "");
+        this.cacheKey = cacheKey || "unknown";
         // Security input validations
         this.checkPathTraversal(this.baseDir, this.archivePath);
         this.pathsToCache.forEach(pathToCheck => this.checkPathTraversal(this.baseDir, pathToCheck));
@@ -96691,28 +96698,34 @@ class BtrfsCache {
                 }
             });
             core.debug("Mount output: " + output);
-            // Look for a line that contains our image file
+            // Create the expected directory pattern using the cache key
+            const safeKey = this.cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, '_');
+            const expectedPattern = `btrfs-cache-${safeKey}`;
+            // Look for BTRFS filesystem mounted in our cache-key specific directory
             const lines = output.split("\n");
             for (const line of lines) {
                 core.debug("Line " + line);
-                // Mount output format: "device on mountpoint type filesystem (options)"
-                // e.g., "/tmp/cache.img on /tmp/mount_point type btrfs (rw,relatime)"
-                if (line.includes(this.imageFile)) {
-                    core.debug("Line " + line + " contained imageFile");
-                    const match = line.match(/^.+ on (.+) type btrfs/);
+                // Look for lines with our cache pattern and type btrfs
+                if (line.includes(expectedPattern) && line.includes("type btrfs")) {
+                    core.debug(`Found potential BTRFS cache mount: ${line}`);
+                    const match = line.match(/^(.+cache\.img) on (.+) type btrfs/);
                     if (match) {
-                        core.debug("Match: " + JSON.stringify(match));
-                        return match[1];
+                        const mountedImageFile = match[1];
+                        const mountPoint = match[2];
+                        core.info(`[BTRFS] Found existing mount: ${mountedImageFile} → ${mountPoint}`);
+                        // Update our imageFile to match the actually mounted one
+                        this.imageFile = mountedImageFile;
+                        return mountPoint;
                     }
                 }
             }
-            throw new Error(`BTRFS image ${this.imageFile} is not currently mounted. ` +
+            throw new Error(`No BTRFS cache filesystem found for cache key ${this.cacheKey} (pattern: ${expectedPattern}). ` +
                 `Make sure the cache was properly initialized and mounted first.`);
         });
     }
     mount() {
         return __awaiter(this, void 0, void 0, function* () {
-            this.mountPoint = yield utils.createTempDirectory();
+            this.mountPoint = yield this.createCacheKeySpecificTempDirectory();
             // Create mount point and mount the image
             yield fs.mkdir(this.mountPoint, { recursive: true });
             core.info(`[BTRFS] Mounting image to ${this.mountPoint}`);
@@ -96738,6 +96751,18 @@ class BtrfsCache {
                 yield exec.exec("sudo", ["mount", "--bind", absPath, targetPath]);
             }));
             yield Promise.all(promises);
+        });
+    }
+    createCacheKeySpecificTempDirectory() {
+        return __awaiter(this, void 0, void 0, function* () {
+            // Use the cache key directly in the directory name
+            // Replace invalid filesystem characters with underscores
+            const safeKey = this.cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, '_');
+            const baseTempDir = yield utils.createTempDirectory();
+            const cacheSpecificDir = path_1.default.join(baseTempDir, `btrfs-cache-${safeKey}`);
+            yield fs.mkdir(cacheSpecificDir, { recursive: true });
+            core.debug(`[BTRFS] Created cache-specific directory: ${cacheSpecificDir} for key: ${this.cacheKey}`);
+            return cacheSpecificDir;
         });
     }
     unmount() {

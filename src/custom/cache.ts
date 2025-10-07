@@ -132,7 +132,7 @@ export async function restoreCache(
                 const btrfsCache = new BtrfsCache(archivePath, baseDir, paths, {
                     fsSize,
                     bufferMb
-                });
+                }, primaryKey);
                 core.debug("Creating empty BTRFS cache");
                 await btrfsCache.initialize();
                 core.debug("Initialized BTRFS cache");
@@ -174,7 +174,7 @@ export async function restoreCache(
             const btrfsCache = new BtrfsCache(archivePath, baseDir, paths, {
                 fsSize,
                 bufferMb
-            });
+            }, cacheEntry.cacheKey);
             await btrfsCache.initialize();
             await btrfsCache.restore();
         } else if (customCompression && process.platform !== "win32") {
@@ -355,7 +355,7 @@ export async function saveCache(
             const btrfsCache = new BtrfsCache(archivePath, baseDir, paths, {
                 fsSize,
                 bufferMb
-            });
+            }, key);
             await btrfsCache.initialize();
 
             // Save and compress the mounted cache

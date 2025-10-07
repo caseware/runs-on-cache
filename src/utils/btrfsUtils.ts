@@ -15,21 +15,24 @@ export class BtrfsCache {
      *
      * This is a temporary directory where the BTRFS image will be mounted, the actual paths to cache will be bind-mounted.
      */
-    private mountPoint?: string;
+    private mountPoint = "";
 
     private fsSize: string;
     private bufferBytes: number;
     private readonly imageFile: string;
+    private readonly cacheKey: string;
 
     constructor(
         private readonly archivePath: string,
         private readonly baseDir: string,
         private readonly pathsToCache: string[],
-        options: BtrfsOptions
+        options: BtrfsOptions,
+        cacheKey?: string
     ) {
         this.fsSize = options.fsSize;
         this.bufferBytes = (options.bufferMb || 512) * 1024 * 1024; // Convert MB to bytes
         this.imageFile = this.archivePath.replace(/\.lz4$/, "");
+        this.cacheKey = cacheKey || "unknown";
 
         // Security input validations
         this.checkPathTraversal(this.baseDir, this.archivePath);
@@ -233,30 +236,38 @@ export class BtrfsCache {
 
         core.debug("Mount output: " + output);
 
-        // Look for a line that contains our image file
+        // Create the expected directory pattern using the cache key
+        const safeKey = this.cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, '_');
+        const expectedPattern = `btrfs-cache-${safeKey}`;
+
+        // Look for BTRFS filesystem mounted in our cache-key specific directory
         const lines = output.split("\n");
         for (const line of lines) {
             core.debug("Line " + line)
-            // Mount output format: "device on mountpoint type filesystem (options)"
-            // e.g., "/tmp/cache.img on /tmp/mount_point type btrfs (rw,relatime)"
-            if (line.includes(this.imageFile)) {
-                core.debug("Line " + line + " contained imageFile");
-                const match = line.match(/^.+ on (.+) type btrfs/);
+            // Look for lines with our cache pattern and type btrfs
+            if (line.includes(expectedPattern) && line.includes("type btrfs")) {
+                core.debug(`Found potential BTRFS cache mount: ${line}`);
+                const match = line.match(/^(.+cache\.img) on (.+) type btrfs/);
                 if (match) {
-                    core.debug("Match: " + JSON.stringify(match));
-                    return match[1];
+                    const mountedImageFile = match[1];
+                    const mountPoint = match[2];
+                    core.info(`[BTRFS] Found existing mount: ${mountedImageFile} → ${mountPoint}`);
+                    
+                    // Update our imageFile to match the actually mounted one
+                    (this as any).imageFile = mountedImageFile;
+                    return mountPoint;
                 }
             }
         }
 
         throw new Error(
-            `BTRFS image ${this.imageFile} is not currently mounted. ` +
+            `No BTRFS cache filesystem found for cache key ${this.cacheKey} (pattern: ${expectedPattern}). ` +
             `Make sure the cache was properly initialized and mounted first.`
         );
     }
 
     private async mount(): Promise<void> {
-        this.mountPoint = await utils.createTempDirectory();
+        this.mountPoint = await this.createCacheKeySpecificTempDirectory();
         
         // Create mount point and mount the image
         await fs.mkdir(this.mountPoint, { recursive: true });
@@ -286,6 +297,20 @@ export class BtrfsCache {
             await exec.exec("sudo", ["mount", "--bind", absPath, targetPath]);
         });
         await Promise.all(promises);
+    }
+
+    private async createCacheKeySpecificTempDirectory(): Promise<string> {
+        // Use the cache key directly in the directory name
+        // Replace invalid filesystem characters with underscores
+        const safeKey = this.cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, '_');
+        
+        const baseTempDir = await utils.createTempDirectory();
+        const cacheSpecificDir = path.join(baseTempDir, `btrfs-cache-${safeKey}`);
+        
+        await fs.mkdir(cacheSpecificDir, { recursive: true });
+        core.debug(`[BTRFS] Created cache-specific directory: ${cacheSpecificDir} for key: ${this.cacheKey}`);
+        
+        return cacheSpecificDir;
     }
 
     private async unmount(): Promise<void> {
