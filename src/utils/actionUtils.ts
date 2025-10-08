@@ -96,7 +96,5 @@ export function getCacheFileName(compressionMethod: CompressionMethod | string) 
     }
     if (compressionMethod === "none")
         return "cache"
-    if (compressionMethod === "btrfs-lz4")
-        return "cache.img.lz4"
     return `cache.${compressionMethod}`;
 }

@@ -3,13 +3,11 @@ import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 import * as fs from "fs/promises";
 import path from "path";
+import { Container, ContainerOptions } from "./Container";
 
-export interface BtrfsOptions {
-    fsSize: string;
-    bufferMb?: number;
-}
+export class BtrfsContainer extends Container {
+    public requiresCreateEmptyCache = true;
 
-export class BtrfsCache {
     /**
      * The mount point for the BTRFS filesystem
      *
@@ -19,23 +17,25 @@ export class BtrfsCache {
 
     private fsSize: string;
     private bufferBytes: number;
-    private readonly imageFile: string;
-    private readonly cacheKey: string;
 
     constructor(
-        private readonly archivePath: string,
-        private readonly baseDir: string,
-        private readonly pathsToCache: string[],
-        options: BtrfsOptions,
-        cacheKey?: string
+        containerFile: string,
+        compressionMethod: string,
+        baseDir: string,
+        pathsToCache: string[],
+        cacheKey: string,
+        options: ContainerOptions
     ) {
+        super(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options);
+        if (!options.fsSize) {
+            throw new Error("fsSize option is required for BtrfsContainer");
+        }
+
         this.fsSize = options.fsSize;
         this.bufferBytes = (options.bufferMb || 512) * 1024 * 1024; // Convert MB to bytes
-        this.imageFile = this.archivePath.replace(/\.lz4$/, "");
-        this.cacheKey = cacheKey || "unknown";
 
         // Security input validations
-        this.checkPathTraversal(this.baseDir, this.archivePath);
+        this.checkPathTraversal(this.baseDir, this.containerFile);
         this.pathsToCache.forEach(pathToCheck =>
             this.checkPathTraversal(this.baseDir, pathToCheck)
         );
@@ -46,6 +46,10 @@ export class BtrfsCache {
                 `Invalid filesystem size format: ${this.fsSize}. Must be a number followed by optional K, M, G, or T.`
             );
         }
+    }
+
+    isSupportedMethod(method?: string): boolean {
+        return (method?.split('-')[0] || method) === "btrfs";
     }
 
     async initialize(): Promise<void> {
@@ -60,12 +64,12 @@ export class BtrfsCache {
     async createEmptyCache(): Promise<void> {
         try {
             // Create new empty cache image
-            core.info(`[BTRFS] Creating sparse image: ${this.imageFile}`);
-            await exec.exec("truncate", ["-s", this.fsSize, this.imageFile]);
+            core.info(`[BTRFS] Creating sparse image: ${this.containerFile}`);
+            await exec.exec("truncate", ["-s", this.fsSize, this.containerFile]);
 
             // Format with BTRFS
             core.info(`[BTRFS] Formatting image with BTRFS`);
-            await exec.exec("mkfs.btrfs", ["-f", this.imageFile], {
+            await exec.exec("mkfs.btrfs", ["-f", this.containerFile], {
                 silent: !core.isDebug()
             });
 
@@ -78,15 +82,6 @@ export class BtrfsCache {
 
     async restore(): Promise<void> {
         try {
-            // Decompress existing cache (silently to avoid spam)
-            core.debug(`[BTRFS] Decompressing ${this.archivePath} → ${this.imageFile}`);
-            await exec.exec("lz4", [
-                "-d",
-                "--rm",
-                this.archivePath,
-                this.imageFile
-            ], { silent: !core.isDebug() });
-
             return this.mount();
         } catch (error) {
             throw new Error(`Failed to restore BTRFS cache: ${error instanceof Error ? error.message : error}`);
@@ -96,6 +91,9 @@ export class BtrfsCache {
     async save(): Promise<void> {
         // Find the existing mount point for this image
         this.mountPoint = await this.findExistingMountPoint();
+
+        core.debug(`[BTRFS] Defragmenting filesystem`);
+        await exec.exec("btrfs", ["filesystem", "defragment", "-r", this.mountPoint], { silent: !core.isDebug() });
 
         core.debug(`[BTRFS] Syncing and calculating used space`);
         await exec.exec("sync", [], { silent: !core.isDebug() });
@@ -126,10 +124,6 @@ export class BtrfsCache {
 
         // Unmount
         await this.unmount();
-
-        // Compress with LZ4 (silently)
-        core.debug(`[BTRFS] Compressing image with LZ4 → ${this.archivePath}`);
-        await exec.exec("lz4", ["--rm", this.imageFile, this.archivePath], { silent: !core.isDebug() });
     }
 
     private checkPathTraversal(base: string, pathToCheck: string): void {
@@ -146,7 +140,7 @@ export class BtrfsCache {
     private async checkPrerequisites(): Promise<void> {
         if (process.platform !== "linux") {
             throw new Error(
-                `BTRFS-LZ4 compression is only supported on Linux platforms. ` +
+                `BTRFS compression is only supported on Linux platforms. ` +
                     `Current platform: ${process.platform}. ` +
                     `Please use a different compression method or switch to a Linux runner.`
             );
@@ -162,7 +156,6 @@ export class BtrfsCache {
                 command: "btrfs",
                 description: "BTRFS filesystem operations (install btrfs-progs)"
             },
-            { command: "lz4", description: "LZ4 compression (install lz4)" },
             {
                 command: "sudo",
                 description: "elevated privileges for mounting operations"
@@ -182,7 +175,7 @@ export class BtrfsCache {
 
         if (missingTools.length > 0) {
             throw new Error(
-                `Missing required tools for BTRFS-LZ4 compression: ${missingTools.join(
+                `Missing required tools for BTRFS compression: ${missingTools.join(
                     ", "
                 )}. ` +
                     `Please install the missing tools or use a different compression method.`
@@ -245,19 +238,22 @@ export class BtrfsCache {
         const safeKey = this.cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, '_');
         const expectedPattern = `btrfs-cache-${safeKey}`;
 
+        core.debug(`[BTRFS] Looking for mount pattern: ${expectedPattern}`);
+        core.debug(`[BTRFS] Mount output:\n${output}`);
+
         // Look for BTRFS filesystem mounted in our cache-key specific directory
         const lines = output.split("\n");
         for (const line of lines) {
             // Look for lines with our cache pattern and type btrfs
             if (line.includes(expectedPattern) && line.includes("type btrfs")) {
-                const match = line.match(/^(.+cache\.img) on (.+) type btrfs/);
+                const match = line.match(/^(.+\.btrfs) on (.+) type btrfs/);
                 if (match) {
                     const mountedImageFile = match[1];
                     const mountPoint = match[2];
                     core.debug(`[BTRFS] Found existing mount: ${mountedImageFile} → ${mountPoint}`);
                     
-                    // Update our imageFile to match the actually mounted one
-                    (this as any).imageFile = mountedImageFile;
+                    // Update our containerFile to match the actually mounted one
+                    this.containerFile = mountedImageFile;
                     return mountPoint;
                 }
             }
@@ -279,8 +275,8 @@ export class BtrfsCache {
             await exec.exec("sudo", [
                 "mount",
                 "-o",
-                "loop,rw",
-                this.imageFile,
+                "loop,rw,compress=zstd",
+                this.containerFile,
                 this.mountPoint
             ], { silent: !core.isDebug() });
 
@@ -387,8 +383,4 @@ export class BtrfsCache {
             core.debug(`Cleanup mount point failed (non-critical): ${error}`);
         }
     }
-}
-
-export function isBtrfsCompressionMethod(compressionMethod?: string): boolean {
-    return compressionMethod === "btrfs-lz4";
 }

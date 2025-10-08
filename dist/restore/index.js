@@ -95445,9 +95445,8 @@ const path = __importStar(__nccwpck_require__(1017));
 const utils = __importStar(__nccwpck_require__(1518));
 const cacheHttpClient = __importStar(__nccwpck_require__(9268));
 const tar_1 = __nccwpck_require__(6490);
-const child_process_1 = __nccwpck_require__(2081);
 const actionUtils_1 = __nccwpck_require__(6850);
-const btrfsUtils_1 = __nccwpck_require__(9090);
+const ContainerFactory_1 = __nccwpck_require__(1074);
 const constants_1 = __nccwpck_require__(9042);
 class ValidationError extends Error {
     constructor(message) {
@@ -95529,24 +95528,16 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
                 compressionMethod,
                 enableCrossOsArchive
             });
+            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb });
             core.debug(`Cache Entry: ${JSON.stringify(cacheEntry)}`);
             if (!(cacheEntry === null || cacheEntry === void 0 ? void 0 : cacheEntry.archiveLocation)) {
                 // Cache not found
                 core.debug("Cache not found");
-                if ((0, btrfsUtils_1.isBtrfsCompressionMethod)(customCompression)) {
-                    // Create empty BTRFS cache
-                    core.info("Cache not found, creating empty BTRFS cache");
-                    const btrfsCache = new btrfsUtils_1.BtrfsCache(archivePath, baseDir, paths, {
-                        fsSize,
-                        bufferMb
-                    }, primaryKey);
-                    core.debug("Creating empty BTRFS cache");
-                    yield btrfsCache.initialize();
-                    core.debug("Initialized BTRFS cache");
-                    yield btrfsCache.createEmptyCache();
-                    core.debug("Created empty BTRFS cache");
+                if (cacheContainer && cacheContainer.requiresCreateEmptyCache) {
+                    yield cacheContainer.initialize();
+                    yield cacheContainer.createEmptyCache();
+                    core.debug(`Created empty cache container of type ${cacheContainer.constructor.name}`);
                 }
-                core.debug("Cache not found after btrfs check");
                 return undefined;
             }
             if (options === null || options === void 0 ? void 0 : options.lookupOnly) {
@@ -95565,49 +95556,8 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             }
             const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
             core.info(`Cache Size: ~${Math.round(archiveFileSize / (1024 * 1024))} MB (${archiveFileSize} B)`);
-            if ((0, btrfsUtils_1.isBtrfsCompressionMethod)(customCompression)) {
-                const btrfsCache = new btrfsUtils_1.BtrfsCache(archivePath, baseDir, paths, {
-                    fsSize,
-                    bufferMb
-                }, cacheEntry.cacheKey);
-                yield btrfsCache.initialize();
-                yield btrfsCache.restore();
-            }
-            else if (customCompression && process.platform !== "win32") {
-                const compressionArgs = customCompression === "none" ? "" : `--use-compress-program=${customCompression}`;
-                const command = `tar -xf ${archivePath} -P -C ${baseDir} ${compressionArgs}`;
-                core.info(`Extracting ${archivePath} to ${baseDir}`);
-                const output = (0, child_process_1.execSync)(command);
-                if (output && output.length > 0) {
-                    core.info(output.toString());
-                }
-            }
-            else if (customCompression && process.platform === "win32") {
-                const tarPathObj = yield (0, tar_1.getTarPath)();
-                const tarPath = tarPathObj.path; // Access the 'path' property
-                const lz4Path = 'lz4.exe';
-                // Build the arguments array
-                let args = [];
-                args.push('--force-local');
-                args.push('--posix');
-                if (customCompression !== 'none') {
-                    args.push(`--use-compress-program="${lz4Path}"`);
-                }
-                // Properly quote and convert paths
-                args.push('-xf', `"${toTarPath(archivePath)}"`);
-                args.push('-P');
-                args.push('-C', `"${toTarPath(baseDir)}"`);
-                // Combine all arguments into the command
-                const command = `"${tarPath}" ${args.join(' ')}`;
-                core.debug(`Executing command: ${command}`);
-                const output = (0, child_process_1.execSync)(command, { stdio: 'inherit' });
-                if (output && output.length > 0) {
-                    core.debug(output.toString());
-                }
-            }
-            else {
-                yield (0, tar_1.extractTar)(archivePath, compressionMethod);
-            }
+            yield cacheContainer.initialize();
+            yield cacheContainer.restore();
             core.info("Cache restored successfully");
             return cacheEntry.cacheKey;
         }
@@ -95679,9 +95629,6 @@ function restoreCacheSync(paths, primaryKey, options) {
     });
 }
 exports.restoreCacheSync = restoreCacheSync;
-function toTarPath(p) {
-    return p.replace(/\\/g, '/');
-}
 /**
  * Saves a list of files with the specified key
  *
@@ -95712,61 +95659,11 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
         try {
             core.info(`Archive Path3: ${archivePath}`);
             const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
-            if ((0, btrfsUtils_1.isBtrfsCompressionMethod)(customCompression)) {
-                const fsSize = core.getInput(constants_1.Inputs.FsSize) || "50G";
-                const bufferMb = parseInt(core.getInput(constants_1.Inputs.FsBufferMB) || "2048");
-                const btrfsCache = new btrfsUtils_1.BtrfsCache(archivePath, baseDir, paths, {
-                    fsSize,
-                    bufferMb
-                }, key);
-                yield btrfsCache.initialize();
-                // Save and compress the mounted cache
-                yield btrfsCache.save();
-            }
-            else if (customCompression && process.platform !== "win32") {
-                core.info(`Archive Path4: ${archivePath}`);
-                const compressionArgs = customCompression === "none" ? "" : `--use-compress-program=${customCompression}`;
-                const command = `tar --posix -cf ${archivePath} --exclude ${archivePath} -P -C ${baseDir} ${cachePaths.join(' ')} ${compressionArgs}`;
-                const output = (0, child_process_1.execSync)(command);
-                if (output && output.length > 0) {
-                    core.debug(output.toString());
-                }
-            }
-            else if (customCompression && process.platform === "win32") {
-                core.info(`Archive Path5: ${archivePath}`);
-                const tarPathObj = yield (0, tar_1.getTarPath)();
-                const tarPath = tarPathObj.path; // Access the 'path' property
-                // Use 'lz4' directly, assuming it's in the PATH
-                const lz4Path = 'lz4.exe';
-                // Build the arguments array
-                let args = [];
-                args.push('--posix');
-                args.push('--force-local');
-                if (customCompression !== 'none') {
-                    args.push(`--use-compress-program="${lz4Path}"`);
-                }
-                // Properly quote and convert path
-                args.push('-cf', `"${toTarPath(archivePath)}"`);
-                args.push('--exclude', `"${toTarPath(archivePath)}"`);
-                args.push('-P');
-                args.push('-C', `"${toTarPath(baseDir)}"`);
-                // Properly quote and convert cache paths
-                const quotedCachePaths = cachePaths.map(p => `"${toTarPath(p)}"`);
-                // Combine all arguments into the command
-                const command = `"${tarPath}" ${args.join(' ')} ${quotedCachePaths.join(' ')}`;
-                core.info(`Executing command: ${command}`);
-                const output = (0, child_process_1.execSync)(command, { stdio: 'inherit' });
-                if (output && output.length > 0) {
-                    core.debug(output.toString());
-                }
-            }
-            else {
-                core.info(`Archive Path6: ${archivePath}`);
-                yield (0, tar_1.createTar)(archiveFolder, cachePaths, compressionMethod);
-                if (core.isDebug()) {
-                    yield (0, tar_1.listTar)(archivePath, compressionMethod);
-                }
-            }
+            const fsSize = core.getInput(constants_1.Inputs.FsSize) || "50G";
+            const bufferMb = parseInt(core.getInput(constants_1.Inputs.FsBufferMB) || "2048");
+            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, archivePath, baseDir, paths, key, { fsSize, bufferMb });
+            yield cacheContainer.initialize();
+            yield cacheContainer.save();
             const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
             core.info(`File Size: ${archiveFileSize}`);
             yield cacheHttpClient.saveCache(key, paths, archivePath, {
@@ -96458,8 +96355,6 @@ function getCacheFileName(compressionMethod) {
     }
     if (compressionMethod === "none")
         return "cache";
-    if (compressionMethod === "btrfs-lz4")
-        return "cache.img.lz4";
     return `cache.${compressionMethod}`;
 }
 exports.getCacheFileName = getCacheFileName;
@@ -96467,7 +96362,7 @@ exports.getCacheFileName = getCacheFileName;
 
 /***/ }),
 
-/***/ 9090:
+/***/ 3145:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 "use strict";
@@ -96508,34 +96403,38 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.isBtrfsCompressionMethod = exports.BtrfsCache = void 0;
+exports.BtrfsContainer = void 0;
 const utils = __importStar(__nccwpck_require__(1518));
 const core = __importStar(__nccwpck_require__(2186));
 const exec = __importStar(__nccwpck_require__(1514));
 const fs = __importStar(__nccwpck_require__(3292));
 const path_1 = __importDefault(__nccwpck_require__(1017));
-class BtrfsCache {
-    constructor(archivePath, baseDir, pathsToCache, options, cacheKey) {
-        this.archivePath = archivePath;
-        this.baseDir = baseDir;
-        this.pathsToCache = pathsToCache;
+const Container_1 = __nccwpck_require__(9620);
+class BtrfsContainer extends Container_1.Container {
+    constructor(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options) {
+        super(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options);
+        this.requiresCreateEmptyCache = true;
         /**
          * The mount point for the BTRFS filesystem
          *
          * This is a temporary directory where the BTRFS image will be mounted, the actual paths to cache will be bind-mounted.
          */
         this.mountPoint = "";
+        if (!options.fsSize) {
+            throw new Error("fsSize option is required for BtrfsContainer");
+        }
         this.fsSize = options.fsSize;
         this.bufferBytes = (options.bufferMb || 512) * 1024 * 1024; // Convert MB to bytes
-        this.imageFile = this.archivePath.replace(/\.lz4$/, "");
-        this.cacheKey = cacheKey || "unknown";
         // Security input validations
-        this.checkPathTraversal(this.baseDir, this.archivePath);
+        this.checkPathTraversal(this.baseDir, this.containerFile);
         this.pathsToCache.forEach(pathToCheck => this.checkPathTraversal(this.baseDir, pathToCheck));
         // Validate fsSize format to prevent command injection
         if (!/^[0-9]+[KMGT]?$/.test(this.fsSize)) {
             throw new Error(`Invalid filesystem size format: ${this.fsSize}. Must be a number followed by optional K, M, G, or T.`);
         }
+    }
+    isSupportedMethod(method) {
+        return ((method === null || method === void 0 ? void 0 : method.split('-')[0]) || method) === "btrfs";
     }
     initialize() {
         return __awaiter(this, void 0, void 0, function* () {
@@ -96552,11 +96451,11 @@ class BtrfsCache {
         return __awaiter(this, void 0, void 0, function* () {
             try {
                 // Create new empty cache image
-                core.info(`[BTRFS] Creating sparse image: ${this.imageFile}`);
-                yield exec.exec("truncate", ["-s", this.fsSize, this.imageFile]);
+                core.info(`[BTRFS] Creating sparse image: ${this.containerFile}`);
+                yield exec.exec("truncate", ["-s", this.fsSize, this.containerFile]);
                 // Format with BTRFS
                 core.info(`[BTRFS] Formatting image with BTRFS`);
-                yield exec.exec("mkfs.btrfs", ["-f", this.imageFile], {
+                yield exec.exec("mkfs.btrfs", ["-f", this.containerFile], {
                     silent: !core.isDebug()
                 });
                 // Mount the filesystem so workspace operations write directly to it
@@ -96570,14 +96469,6 @@ class BtrfsCache {
     restore() {
         return __awaiter(this, void 0, void 0, function* () {
             try {
-                // Decompress existing cache (silently to avoid spam)
-                core.debug(`[BTRFS] Decompressing ${this.archivePath} → ${this.imageFile}`);
-                yield exec.exec("lz4", [
-                    "-d",
-                    "--rm",
-                    this.archivePath,
-                    this.imageFile
-                ], { silent: !core.isDebug() });
                 return this.mount();
             }
             catch (error) {
@@ -96589,6 +96480,8 @@ class BtrfsCache {
         return __awaiter(this, void 0, void 0, function* () {
             // Find the existing mount point for this image
             this.mountPoint = yield this.findExistingMountPoint();
+            core.debug(`[BTRFS] Defragmenting filesystem`);
+            yield exec.exec("btrfs", ["filesystem", "defragment", "-r", this.mountPoint], { silent: !core.isDebug() });
             core.debug(`[BTRFS] Syncing and calculating used space`);
             yield exec.exec("sync", [], { silent: !core.isDebug() });
             // Get used space and resize filesystem
@@ -96613,9 +96506,6 @@ class BtrfsCache {
             ], { silent: !core.isDebug() });
             // Unmount
             yield this.unmount();
-            // Compress with LZ4 (silently)
-            core.debug(`[BTRFS] Compressing image with LZ4 → ${this.archivePath}`);
-            yield exec.exec("lz4", ["--rm", this.imageFile, this.archivePath], { silent: !core.isDebug() });
         });
     }
     checkPathTraversal(base, pathToCheck) {
@@ -96629,7 +96519,7 @@ class BtrfsCache {
     checkPrerequisites() {
         return __awaiter(this, void 0, void 0, function* () {
             if (process.platform !== "linux") {
-                throw new Error(`BTRFS-LZ4 compression is only supported on Linux platforms. ` +
+                throw new Error(`BTRFS compression is only supported on Linux platforms. ` +
                     `Current platform: ${process.platform}. ` +
                     `Please use a different compression method or switch to a Linux runner.`);
             }
@@ -96643,7 +96533,6 @@ class BtrfsCache {
                     command: "btrfs",
                     description: "BTRFS filesystem operations (install btrfs-progs)"
                 },
-                { command: "lz4", description: "LZ4 compression (install lz4)" },
                 {
                     command: "sudo",
                     description: "elevated privileges for mounting operations"
@@ -96659,7 +96548,7 @@ class BtrfsCache {
                 }
             })));
             if (missingTools.length > 0) {
-                throw new Error(`Missing required tools for BTRFS-LZ4 compression: ${missingTools.join(", ")}. ` +
+                throw new Error(`Missing required tools for BTRFS compression: ${missingTools.join(", ")}. ` +
                     `Please install the missing tools or use a different compression method.`);
             }
             // Check if sudo works without password prompt (for CI environments)
@@ -96712,18 +96601,20 @@ class BtrfsCache {
             // Create the expected directory pattern using the cache key
             const safeKey = this.cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, '_');
             const expectedPattern = `btrfs-cache-${safeKey}`;
+            core.debug(`[BTRFS] Looking for mount pattern: ${expectedPattern}`);
+            core.debug(`[BTRFS] Mount output:\n${output}`);
             // Look for BTRFS filesystem mounted in our cache-key specific directory
             const lines = output.split("\n");
             for (const line of lines) {
                 // Look for lines with our cache pattern and type btrfs
                 if (line.includes(expectedPattern) && line.includes("type btrfs")) {
-                    const match = line.match(/^(.+cache\.img) on (.+) type btrfs/);
+                    const match = line.match(/^(.+\.btrfs) on (.+) type btrfs/);
                     if (match) {
                         const mountedImageFile = match[1];
                         const mountPoint = match[2];
                         core.debug(`[BTRFS] Found existing mount: ${mountedImageFile} → ${mountPoint}`);
-                        // Update our imageFile to match the actually mounted one
-                        this.imageFile = mountedImageFile;
+                        // Update our containerFile to match the actually mounted one
+                        this.containerFile = mountedImageFile;
                         return mountPoint;
                     }
                 }
@@ -96742,8 +96633,8 @@ class BtrfsCache {
                 yield exec.exec("sudo", [
                     "mount",
                     "-o",
-                    "loop,rw",
-                    this.imageFile,
+                    "loop,rw,compress=zstd",
+                    this.containerFile,
                     this.mountPoint
                 ], { silent: !core.isDebug() });
                 // Bind-mount each path so workspace points to BTRFS
@@ -96837,11 +96728,266 @@ class BtrfsCache {
         });
     }
 }
-exports.BtrfsCache = BtrfsCache;
-function isBtrfsCompressionMethod(compressionMethod) {
-    return compressionMethod === "btrfs-lz4";
+exports.BtrfsContainer = BtrfsContainer;
+
+
+/***/ }),
+
+/***/ 9620:
+/***/ (function(__unused_webpack_module, exports) {
+
+"use strict";
+
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.Container = void 0;
+class Container {
+    constructor(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options = {}) {
+        this.containerFile = containerFile;
+        this.compressionMethod = compressionMethod;
+        this.baseDir = baseDir;
+        this.pathsToCache = pathsToCache;
+        this.cacheKey = cacheKey;
+        this.options = options;
+    }
+    initialize() {
+        return __awaiter(this, void 0, void 0, function* () { });
+    }
+    ;
+    createEmptyCache() {
+        return __awaiter(this, void 0, void 0, function* () { });
+    }
+    ;
 }
-exports.isBtrfsCompressionMethod = isBtrfsCompressionMethod;
+exports.Container = Container;
+
+
+/***/ }),
+
+/***/ 1074:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ContainerFactory = void 0;
+const BtrfsContainer_1 = __nccwpck_require__(3145);
+const TarContainer_1 = __nccwpck_require__(7332);
+const TarLz4Container_1 = __nccwpck_require__(292);
+const SUPPORTED_CLASSES = {
+    btrfs: BtrfsContainer_1.BtrfsContainer,
+    tarLz4: TarLz4Container_1.TarLz4Container,
+    tar: TarContainer_1.TarContainer,
+};
+const DEFAULT_CLASS = 'tar';
+class ContainerFactory {
+    static getCacheContainer(customCompression, archivePath, baseDir, pathsToCache, cacheKey, options) {
+        const instances = Object.entries(SUPPORTED_CLASSES).reduce((acc, [key, Clazz]) => {
+            const instance = new Clazz(archivePath, customCompression, baseDir, pathsToCache, cacheKey, options);
+            return Object.assign(Object.assign({}, acc), { [key]: instance });
+        }, {});
+        const foundInstanceKey = Object.keys(instances).find(key => instances[key].isSupportedMethod(customCompression));
+        return instances[foundInstanceKey !== null && foundInstanceKey !== void 0 ? foundInstanceKey : DEFAULT_CLASS];
+    }
+}
+exports.ContainerFactory = ContainerFactory;
+
+
+/***/ }),
+
+/***/ 7332:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.TarContainer = void 0;
+const tar_1 = __nccwpck_require__(6490);
+const Container_1 = __nccwpck_require__(9620);
+class TarContainer extends Container_1.Container {
+    constructor(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options) {
+        super(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options);
+        this.requiresCreateEmptyCache = false;
+    }
+    isSupportedMethod(method) {
+        return method === "tar";
+    }
+    restore() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return (0, tar_1.extractTar)(this.containerFile, this.compressionMethod);
+        });
+    }
+    save() {
+        return __awaiter(this, void 0, void 0, function* () {
+        });
+    }
+}
+exports.TarContainer = TarContainer;
+
+
+/***/ }),
+
+/***/ 292:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.TarLz4Container = void 0;
+const tar_1 = __nccwpck_require__(6490);
+const Container_1 = __nccwpck_require__(9620);
+const core = __importStar(__nccwpck_require__(2186));
+const child_process_1 = __nccwpck_require__(2081);
+const path_1 = __nccwpck_require__(1017);
+class TarLz4Container extends Container_1.Container {
+    constructor(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options) {
+        super(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options);
+        this.requiresCreateEmptyCache = false;
+    }
+    isSupportedMethod(method) {
+        return method === "lz4";
+    }
+    restore() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (this.compressionMethod && process.platform !== "win32") {
+                const compressionArgs = this.compressionMethod === "none" ? "" : `--use-compress-program=${this.compressionMethod}`;
+                const command = `tar -xf ${this.containerFile} -P -C ${this.baseDir} ${compressionArgs}`;
+                core.info(`Extracting ${this.containerFile} to ${this.baseDir}`);
+                const output = (0, child_process_1.execSync)(command);
+                if (output && output.length > 0) {
+                    core.info(output.toString());
+                }
+            }
+            else if (this.compressionMethod && process.platform === "win32") {
+                const tarPathObj = yield (0, tar_1.getTarPath)();
+                const tarPath = tarPathObj.path; // Access the 'path' property
+                const lz4Path = 'lz4.exe';
+                // Build the arguments array
+                let args = [];
+                args.push('--force-local');
+                args.push('--posix');
+                if (this.compressionMethod !== 'none') {
+                    args.push(`--use-compress-program="${lz4Path}"`);
+                }
+                // Properly quote and convert paths
+                args.push('-xf', `"${this.toTarPath(this.containerFile)}"`);
+                args.push('-P');
+                args.push('-C', `"${this.toTarPath(this.baseDir)}"`);
+                // Combine all arguments into the command
+                const command = `"${tarPath}" ${args.join(' ')}`;
+                core.debug(`Executing command: ${command}`);
+                const output = (0, child_process_1.execSync)(command, { stdio: 'inherit' });
+                if (output && output.length > 0) {
+                    core.debug(output.toString());
+                }
+            }
+            else {
+                return (0, tar_1.extractTar)(this.containerFile, this.compressionMethod);
+            }
+        });
+    }
+    save() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (this.compressionMethod && process.platform !== "win32") {
+                core.info(`Archive Path4: ${this.containerFile}`);
+                const compressionArgs = this.compressionMethod === "none" ? "" : `--use-compress-program=${this.compressionMethod}`;
+                const command = `tar --posix -cf ${this.containerFile} --exclude ${this.containerFile} -P -C ${this.baseDir} ${this.pathsToCache.join(' ')} ${compressionArgs}`;
+                const output = (0, child_process_1.execSync)(command);
+                if (output && output.length > 0) {
+                    core.debug(output.toString());
+                }
+            }
+            else if (this.compressionMethod && process.platform === "win32") {
+                core.info(`Archive Path5: ${this.containerFile}`);
+                const tarPathObj = yield (0, tar_1.getTarPath)();
+                const tarPath = tarPathObj.path; // Access the 'path' property
+                // Use 'lz4' directly, assuming it's in the PATH
+                const lz4Path = 'lz4.exe';
+                // Build the arguments array
+                let args = [];
+                args.push('--posix');
+                args.push('--force-local');
+                if (this.compressionMethod !== 'none') {
+                    args.push(`--use-compress-program="${lz4Path}"`);
+                }
+                // Properly quote and convert path
+                args.push('-cf', `"${this.toTarPath(this.containerFile)}"`);
+                args.push('--exclude', `"${this.toTarPath(this.containerFile)}"`);
+                args.push('-P');
+                args.push('-C', `"${this.toTarPath(this.baseDir)}"`);
+                // Properly quote and convert cache paths
+                const quotedCachePaths = this.pathsToCache.map(p => `"${this.toTarPath(p)}"`);
+                // Combine all arguments into the command
+                const command = `"${tarPath}" ${args.join(' ')} ${quotedCachePaths.join(' ')}`;
+                core.info(`Executing command: ${command}`);
+                const output = (0, child_process_1.execSync)(command, { stdio: 'inherit' });
+                if (output && output.length > 0) {
+                    core.debug(output.toString());
+                }
+            }
+            else {
+                core.info(`Archive Path6: ${this.containerFile}`);
+                yield (0, tar_1.createTar)((0, path_1.dirname)(this.containerFile), this.pathsToCache, this.compressionMethod);
+                if (core.isDebug()) {
+                    yield (0, tar_1.listTar)(this.containerFile, this.compressionMethod);
+                }
+            }
+        });
+    }
+    toTarPath(p) {
+        return p.replace(/\\/g, '/');
+    }
+}
+exports.TarLz4Container = TarLz4Container;
 
 
 /***/ }),

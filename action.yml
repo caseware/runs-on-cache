@@ -31,18 +31,18 @@ inputs:
     default: 'false'
     required: false
   custom-compression:
-    description: 'Custom compression method (e.g., lz4, btrfs-lz4)'
+    description: 'Custom compression method (e.g., lz4, btrfs)'
     required: false
   sync:
     description: 'Use sync method for caching'
     default: 'false'
     required: false
   fs-size:
-    description: 'Filesystem size for btrfs-lz4 format (e.g., 50G)'
+    description: 'Filesystem size for btrfs format (e.g., 50G)'
     default: '50G'
     required: false
   fs-buffer-mb:
-    description: 'Additional buffer size for btrfs-lz4 format (e.g., 2048) after image resize.'
+    description: 'Additional buffer size for btrfs format (e.g., 2048) after image resize.'
     default: '2048'
     required: false
 outputs:
