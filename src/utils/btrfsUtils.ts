@@ -66,11 +66,11 @@ export class BtrfsCache {
             // Format with BTRFS
             core.info(`[BTRFS] Formatting image with BTRFS`);
             await exec.exec("mkfs.btrfs", ["-f", this.imageFile], {
-                silent: true
+                silent: !core.isDebug()
             });
 
             // Mount the filesystem so workspace operations write directly to it
-            return this.mountForSave();
+            return this.mount();
         } catch (error) {
             throw new Error(`Failed to create empty BTRFS cache: ${error instanceof Error ? error.message : error}`);
         }
@@ -85,7 +85,7 @@ export class BtrfsCache {
                 "--rm",
                 this.archivePath,
                 this.imageFile
-            ], { silent: true });
+            ], { silent: !core.isDebug() });
 
             return this.mount();
         } catch (error) {
@@ -98,7 +98,7 @@ export class BtrfsCache {
         this.mountPoint = await this.findExistingMountPoint();
 
         core.debug(`[BTRFS] Syncing and calculating used space`);
-        await exec.exec("sync", [], { silent: true });
+        await exec.exec("sync", [], { silent: !core.isDebug() });
 
         // Get used space and resize filesystem
         let usedBytes = 0;
@@ -122,14 +122,14 @@ export class BtrfsCache {
             "resize",
             `${targetMb}M`,
             this.mountPoint
-        ], { silent: true });
+        ], { silent: !core.isDebug() });
 
         // Unmount
         await this.unmount();
 
         // Compress with LZ4 (silently)
         core.debug(`[BTRFS] Compressing image with LZ4 → ${this.archivePath}`);
-        await exec.exec("lz4", ["--rm", this.imageFile, this.archivePath], { silent: true });
+        await exec.exec("lz4", ["--rm", this.imageFile, this.archivePath], { silent: !core.isDebug() });
     }
 
     private checkPathTraversal(base: string, pathToCheck: string): void {
@@ -173,7 +173,7 @@ export class BtrfsCache {
         await Promise.all(
             requiredTools.map(async tool => {
                 try {
-                    await exec.exec("which", [tool.command], { silent: true });
+                    await exec.exec("which", [tool.command], { silent: !core.isDebug() });
                 } catch (error) {
                     missingTools.push(`${tool.command} (${tool.description})`);
                 }
@@ -191,7 +191,7 @@ export class BtrfsCache {
 
         // Check if sudo works without password prompt (for CI environments)
         try {
-            await exec.exec("sudo", ["-n", "true"], { silent: true });
+            await exec.exec("sudo", ["-n", "true"], { silent: !core.isDebug() });
         } catch (error) {
             throw new Error(
                 `sudo access is required for BTRFS mounting operations but sudo is not available or requires a password. ` +
@@ -238,7 +238,7 @@ export class BtrfsCache {
                     output += data.toString();
                 }
             },
-            silent: true
+            silent: !core.isDebug()
         });
 
         // Create the expected directory pattern using the cache key
@@ -282,72 +282,41 @@ export class BtrfsCache {
                 "loop,rw",
                 this.imageFile,
                 this.mountPoint
-            ], { silent: true });
+            ], { silent: !core.isDebug() });
 
-            // Bind-mount each cached path from the BTRFS mount to the workspace
+            // Bind-mount each path so workspace points to BTRFS
             const promises = this.pathsToCache.map(async p => {
                 if (!this.mountPoint) {
                     throw new Error("Mount point is not set");
                 }
 
                 const absPath = path.join(this.baseDir, p);
-                const sourcePath = path.join(this.mountPoint, p);
+                const btrfsPath = path.join(this.mountPoint, p);
 
-                core.debug(`[BTRFS] Bind-mounting ${sourcePath} → ${absPath} (restore mode)`);
+                core.debug(`[BTRFS] Bind-mounting ${btrfsPath} → ${absPath}`);
+
                 try {
                     await Promise.all([
-                        exec.exec("sudo", ["mkdir", "-p", sourcePath], { silent: true }),
-                        fs.mkdir(path.dirname(absPath), { recursive: true })
+                        exec.exec("sudo", ["mkdir", "-p", btrfsPath], { silent: !core.isDebug() }),
+                        exec.exec("sudo", ["mkdir", "-p", absPath], { silent: !core.isDebug() })
                     ]);
-                    await exec.exec("sudo", ["mount", "--bind", sourcePath, absPath], { silent: true });
+                    
+                    // Set ownership to match the workspace directory
+                    const parentDir = path.dirname(absPath);
+                    await Promise.all([
+                        exec.exec("sudo", ["chown", "--reference", parentDir, absPath], { silent: !core.isDebug() }),
+                        exec.exec("sudo", ["chown", "--reference", this.baseDir, btrfsPath], { silent: !core.isDebug() })
+                    ]);
+
+                    // Bind mount: workspace points to BTRFS
+                    await exec.exec("sudo", ["mount", "--bind", btrfsPath, absPath], { silent: !core.isDebug() });
                 } catch (error) {
-                    throw new Error(`Failed to bind-mount ${sourcePath} to ${absPath}: ${error instanceof Error ? error.message : error}`);
+                    throw new Error(`Failed to bind-mount ${btrfsPath} to ${absPath}: ${error instanceof Error ? error.message : error}`);
                 }
             });
             await Promise.all(promises);
         } catch (error) {
             throw new Error(`Failed to mount BTRFS filesystem: ${error instanceof Error ? error.message : error}`);
-        }
-    }
-
-    private async mountForSave(): Promise<void> {
-        try {
-            this.mountPoint = await this.createCacheKeySpecificTempDirectory();
-            
-            // Create mount point and mount the image
-            await fs.mkdir(this.mountPoint, { recursive: true });
-            core.debug(`[BTRFS] Mounting image to ${this.mountPoint}`);
-            await exec.exec("sudo", [
-                "mount",
-                "-o",
-                "loop,rw",
-                this.imageFile,
-                this.mountPoint
-            ], { silent: true });
-
-            // Bind-mount each workspace path INTO the BTRFS mount (for saving/populating cache)
-            const promises = this.pathsToCache.map(async p => {
-                if (!this.mountPoint) {
-                    throw new Error("Mount point is not set");
-                }
-
-                const absPath = path.join(this.baseDir, p);
-                const targetPath = path.join(this.mountPoint, p);
-
-                core.debug(`[BTRFS] Bind-mounting ${targetPath} → ${absPath} (save mode - workspace points to BTRFS)`);
-                try {
-                    await Promise.all([
-                        exec.exec("sudo", ["mkdir", "-p", targetPath], { silent: true }),
-                        fs.mkdir(path.dirname(absPath), { recursive: true })
-                    ]);
-                    await exec.exec("sudo", ["mount", "--bind", targetPath, absPath], { silent: true });
-                } catch (error) {
-                    throw new Error(`Failed to bind-mount ${absPath} to ${targetPath}: ${error instanceof Error ? error.message : error}`);
-                }
-            });
-            await Promise.all(promises);
-        } catch (error) {
-            throw new Error(`Failed to mount BTRFS filesystem for save: ${error instanceof Error ? error.message : error}`);
         }
     }
 
@@ -371,7 +340,7 @@ export class BtrfsCache {
         }
         
         try {
-            await exec.exec("sync", [], { silent: true });
+            await exec.exec("sync", [], { silent: !core.isDebug() });
 
             // First unmount all bind mounts
             for (const p of this.pathsToCache) {
@@ -382,12 +351,12 @@ export class BtrfsCache {
                         [absPath],
                         {
                             ignoreReturnCode: true,
-                            silent: true
+                            silent: !core.isDebug()
                         }
                     );
                     if (bindMountCheck === 0) {
                         core.debug(`[BTRFS] Unmounting bind mount: ${absPath}`);
-                        await exec.exec("sudo", ["umount", absPath], { silent: true });
+                        await exec.exec("sudo", ["umount", absPath], { silent: !core.isDebug() });
                     }
                 } catch (error) {
                     core.debug(`Failed to unmount bind mount ${absPath}: ${error}`);
@@ -400,13 +369,13 @@ export class BtrfsCache {
                 [this.mountPoint],
                 {
                     ignoreReturnCode: true,
-                    silent: true
+                    silent: !core.isDebug()
                 }
             );
 
             if (mountCheck === 0) {
                 core.debug(`[BTRFS] Unmounting main filesystem: ${this.mountPoint}`);
-                await exec.exec("sudo", ["umount", this.mountPoint], { silent: true });
+                await exec.exec("sudo", ["umount", this.mountPoint], { silent: !core.isDebug() });
             }
         } catch (error) {
             core.debug(`Cleanup mount failed (non-critical): ${error}`);
