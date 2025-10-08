@@ -5,6 +5,9 @@ import { RefKey } from "../constants";
 
 import * as utils from "@actions/cache/lib/internal/cacheUtils";
 import { CompressionMethod } from "@actions/cache/lib/internal/constants";
+import * as path from "path";
+import * as fs from "fs/promises";
+import { tmpdir } from "os";
 
 export function isGhes(): boolean {
     const ghUrl = new URL(
@@ -97,4 +100,27 @@ export function getCacheFileName(compressionMethod: CompressionMethod | string) 
     if (compressionMethod === "none")
         return "cache"
     return `cache.${compressionMethod}`;
+}
+
+export async function createCacheKeySpecificTempDirectory(
+    cacheKey: string
+): Promise<string> {
+    // Create a deterministic temp directory based on cache key instead of random UUID
+    // This ensures the same cache key always gets the same temp directory across restore/save operations
+    const safeKey = cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, "_");
+
+    const baseTempDir = process.env["RUNNER_TEMP"] || tmpdir();
+    if (!baseTempDir) {
+        throw new Error("RUNNER_TEMP environment variable is not set");
+    }
+
+    // Use cache key instead of random UUID for deterministic directory
+    const cacheSpecificDir = path.join(baseTempDir, safeKey);
+
+    await fs.mkdir(cacheSpecificDir, { recursive: true });
+    core.debug(
+        `Created cache-specific directory: ${cacheSpecificDir} for key: ${cacheKey}`
+    );
+
+    return cacheSpecificDir;
 }

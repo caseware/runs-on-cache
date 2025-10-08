@@ -22,6 +22,10 @@ inputs:
     description: 'Fail the workflow if cache entry is not found'
     default: 'false'
     required: false
+  force-save:
+    description: 'Force save the cache, even if an existing cache entry is found for the key'
+    default: 'false'
+    required: false
   lookup-only:
     description: 'Check if a cache entry exists for the given input(s) (key, restore-keys) without downloading the cache'
     default: 'false'
@@ -32,6 +36,9 @@ inputs:
     required: false
   custom-compression:
     description: 'Custom compression method (e.g., lz4, btrfs)'
+    required: false
+  custom-compression-level:
+    description: 'Level of compression for the custom method. Syntax varies per method.'
     required: false
   sync:
     description: 'Use sync method for caching'

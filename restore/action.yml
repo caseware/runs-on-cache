@@ -30,6 +30,9 @@ inputs:
   custom-compression:
     description: 'Extracts tar archive with custom compression'
     required: false
+  custom-compression-level:
+    description: 'Level of compression for the custom method. Syntax varies per method.'
+    required: false
 outputs:
   cache-hit:
     description: 'A boolean value to indicate an exact match was found for the primary key'

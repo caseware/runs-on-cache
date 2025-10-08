@@ -1,19 +1,21 @@
-import * as utils from "@actions/cache/lib/internal/cacheUtils";
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 import * as fs from "fs/promises";
-import path from "path";
+import * as path from "path";
+
+import { createCacheKeySpecificTempDirectory } from "../actionUtils";
 import { Container, ContainerOptions } from "./Container";
 
 export class BtrfsContainer extends Container {
     public requiresCreateEmptyCache = true;
+    public requiresKeepArchive = true;
 
     /**
      * The mount point for the BTRFS filesystem
      *
      * This is a temporary directory where the BTRFS image will be mounted, the actual paths to cache will be bind-mounted.
      */
-    private mountPoint = "";
+    private mountPoint: string | undefined;
 
     private fsSize: string;
     private bufferBytes: number;
@@ -21,12 +23,26 @@ export class BtrfsContainer extends Container {
     constructor(
         containerFile: string,
         compressionMethod: string,
+        compressionLevel: string | undefined,
         baseDir: string,
         pathsToCache: string[],
         cacheKey: string,
         options: ContainerOptions
     ) {
-        super(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options);
+        if (!compressionLevel) {
+            // Default to zstd default with compression level 3.
+            compressionLevel = "zstd:3";
+        }
+
+        super(
+            containerFile,
+            compressionMethod,
+            compressionLevel,
+            baseDir,
+            pathsToCache,
+            cacheKey,
+            options
+        );
         if (!options.fsSize) {
             throw new Error("fsSize option is required for BtrfsContainer");
         }
@@ -46,10 +62,23 @@ export class BtrfsContainer extends Container {
                 `Invalid filesystem size format: ${this.fsSize}. Must be a number followed by optional K, M, G, or T.`
             );
         }
+
+        // Validate compression level
+        if (
+            this.compressionLevel &&
+            // List of supported compressions: https://btrfs.readthedocs.io/en/latest/Compression.html
+            !/^(zlib(?:[:][1-9])?|lzo|zstd(?::-?(?:[0-9]|1[0-5]))?)$/.test(
+                this.compressionLevel
+            )
+        ) {
+            throw new Error(
+                `Invalid compression level format: ${this.compressionLevel}. Must be 'zlib:<level>' where <level> is between 1 and 9, lzo, or zstd:<level> where <level> is between -15 and 15.`
+            );
+        }
     }
 
     isSupportedMethod(method?: string): boolean {
-        return (method?.split('-')[0] || method) === "btrfs";
+        return (method?.split("-")[0] || method) === "btrfs";
     }
 
     async initialize(): Promise<void> {
@@ -61,14 +90,81 @@ export class BtrfsContainer extends Container {
         }
     }
 
+    // Override the log prefix for BTRFS-specific logging
+    protected getLogPrefix(): string {
+        return "[BTRFS]";
+    }
+
+    private async execWithOutput(
+        command: string,
+        args: string[]
+    ): Promise<string> {
+        let output = "";
+        await exec.exec(command, args, {
+            listeners: {
+                stdout: (data: Buffer) => {
+                    output += data.toString();
+                }
+            },
+            silent: !core.isDebug()
+        });
+        return output.trim();
+    }
+
+    private async mountWithErrorHandling(
+        device: string,
+        mountPath: string,
+        options?: string[],
+        useSudo = true
+    ): Promise<void> {
+        const mountArgs = [device, mountPath];
+        if (options && options.length > 0) {
+            mountArgs.unshift("-o", options.join(","));
+        }
+
+        const command = useSudo ? "sudo" : "mount";
+        const args = useSudo ? ["mount", ...mountArgs] : mountArgs;
+
+        try {
+            await exec.exec(command, args, { silent: !core.isDebug() });
+        } catch (error) {
+            throw this.wrapError(`mount ${device} at ${mountPath}`, error);
+        }
+    }
+
+    private async execSudo(
+        command: string,
+        args: string[] = []
+    ): Promise<void> {
+        await exec.exec("sudo", [command, ...args], {
+            silent: !core.isDebug()
+        });
+    }
+
+    private async umountWithErrorHandling(mountPath: string): Promise<void> {
+        try {
+            await this.execSudo("umount", [mountPath]);
+        } catch (error) {
+            core.warning(
+                `${this.getLogPrefix()} Failed to umount ${mountPath}: ${
+                    error instanceof Error ? error.message : error
+                }`
+            );
+        }
+    }
+
     async createEmptyCache(): Promise<void> {
         try {
             // Create new empty cache image
-            core.info(`[BTRFS] Creating sparse image: ${this.containerFile}`);
-            await exec.exec("truncate", ["-s", this.fsSize, this.containerFile]);
+            this.logInfo(`Creating sparse image: ${this.containerFile}`);
+            await exec.exec("truncate", [
+                "-s",
+                this.fsSize,
+                this.containerFile
+            ]);
 
             // Format with BTRFS
-            core.info(`[BTRFS] Formatting image with BTRFS`);
+            this.logInfo(`Formatting image with BTRFS`);
             await exec.exec("mkfs.btrfs", ["-f", this.containerFile], {
                 silent: !core.isDebug()
             });
@@ -76,7 +172,7 @@ export class BtrfsContainer extends Container {
             // Mount the filesystem so workspace operations write directly to it
             return this.mount();
         } catch (error) {
-            throw new Error(`Failed to create empty BTRFS cache: ${error instanceof Error ? error.message : error}`);
+            throw this.wrapError("create empty BTRFS cache", error);
         }
     }
 
@@ -84,18 +180,26 @@ export class BtrfsContainer extends Container {
         try {
             return this.mount();
         } catch (error) {
-            throw new Error(`Failed to restore BTRFS cache: ${error instanceof Error ? error.message : error}`);
+            throw this.wrapError("restore BTRFS cache", error);
         }
     }
 
     async save(): Promise<void> {
-        // Find the existing mount point for this image
-        this.mountPoint = await this.findExistingMountPoint();
+        // Discover all mount information once
+        await this.discoverMountInfo();
 
-        core.debug(`[BTRFS] Defragmenting filesystem`);
-        await exec.exec("btrfs", ["filesystem", "defragment", "-r", this.mountPoint], { silent: !core.isDebug() });
+        if (!this.mountPoint) {
+            throw this.createError("Mount point not discovered");
+        }
 
-        core.debug(`[BTRFS] Syncing and calculating used space`);
+        this.logDebug(`Defragmenting filesystem`);
+        await exec.exec(
+            "btrfs",
+            ["filesystem", "defragment", "-r", this.mountPoint],
+            { silent: !core.isDebug() }
+        );
+
+        this.logDebug(`Syncing and calculating used space`);
         await exec.exec("sync", [], { silent: !core.isDebug() });
 
         // Get used space and resize filesystem
@@ -114,16 +218,28 @@ export class BtrfsContainer extends Container {
         const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
 
         core.debug(`Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
-        await exec.exec("sudo", [
-            "btrfs",
-            "filesystem",
-            "resize",
-            `${targetMb}M`,
-            this.mountPoint
-        ], { silent: !core.isDebug() });
+        await exec.exec(
+            "sudo",
+            ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint],
+            { silent: !core.isDebug() }
+        );
 
-        // Unmount
+        // Ensure all changes are written to disk before unmounting
+        await exec.exec("sync", [], { silent: !core.isDebug() });
+
+        // Unmount filesystem - the containerFile now points to the actual file with all data
         await this.unmount();
+
+        // Resize backing file
+        this.logDebug(`Resizing backing file to ${targetMb} MB`);
+        await exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
+
+        // Additional sync and wait after unmount to ensure file is fully accessible
+        await exec.exec("sync", [], { silent: !core.isDebug() });
+
+        this.logDebug(
+            `Save completed. Container file ready for upload: ${this.containerFile}`
+        );
     }
 
     private checkPathTraversal(base: string, pathToCheck: string): void {
@@ -157,6 +273,10 @@ export class BtrfsContainer extends Container {
                 description: "BTRFS filesystem operations (install btrfs-progs)"
             },
             {
+                command: "findmnt",
+                description: "finding mounted filesystems (install util-linux)"
+            },
+            {
                 command: "sudo",
                 description: "elevated privileges for mounting operations"
             }
@@ -166,7 +286,9 @@ export class BtrfsContainer extends Container {
         await Promise.all(
             requiredTools.map(async tool => {
                 try {
-                    await exec.exec("which", [tool.command], { silent: !core.isDebug() });
+                    await exec.exec("which", [tool.command], {
+                        silent: !core.isDebug()
+                    });
                 } catch (error) {
                     missingTools.push(`${tool.command} (${tool.description})`);
                 }
@@ -184,7 +306,9 @@ export class BtrfsContainer extends Container {
 
         // Check if sudo works without password prompt (for CI environments)
         try {
-            await exec.exec("sudo", ["-n", "true"], { silent: !core.isDebug() });
+            await exec.exec("sudo", ["-n", "true"], {
+                silent: !core.isDebug()
+            });
         } catch (error) {
             throw new Error(
                 `sudo access is required for BTRFS mounting operations but sudo is not available or requires a password. ` +
@@ -197,19 +321,13 @@ export class BtrfsContainer extends Container {
         if (!this.mountPoint) {
             throw new Error("Mount point is not set");
         }
-        let output = "";
-        await exec.exec(
-            "sudo",
-            ["btrfs", "filesystem", "usage", "-b", this.mountPoint],
-            {
-                listeners: {
-                    stdout: (data: Buffer) => {
-                        output += data.toString();
-                    }
-                }
-            }
-        );
-        return output;
+        return this.execWithOutput("sudo", [
+            "btrfs",
+            "filesystem",
+            "usage",
+            "-b",
+            this.mountPoint
+        ]);
     }
 
     private parseUsedBytes(usageOutput: string): number {
@@ -223,62 +341,73 @@ export class BtrfsContainer extends Container {
         throw new Error("Could not parse BTRFS usage output");
     }
 
-    private async findExistingMountPoint(): Promise<string> {
-        let output = "";
-        await exec.exec("mount", [], {
-            listeners: {
-                stdout: (data: Buffer) => {
-                    output += data.toString();
-                }
-            },
-            silent: !core.isDebug()
-        });
+    private async discoverMountInfo(): Promise<void> {
+        // Get the expected temp directory for this cache key
+        const tempDir = await createCacheKeySpecificTempDirectory(
+            this.cacheKey
+        );
+        const expectedMountPoint = path.join(tempDir, "mount");
 
-        // Create the expected directory pattern using the cache key
-        const safeKey = this.cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, '_');
-        const expectedPattern = `btrfs-cache-${safeKey}`;
+        this.logDebug(`Looking for BTRFS mount at: ${expectedMountPoint}`);
 
-        core.debug(`[BTRFS] Looking for mount pattern: ${expectedPattern}`);
-        core.debug(`[BTRFS] Mount output:\n${output}`);
+        // Use findmnt to find BTRFS mounts with both target and source
+        const output = await this.execWithOutput("findmnt", [
+            "-t",
+            "btrfs",
+            "-n",
+            "-o",
+            "TARGET,SOURCE"
+        ]);
+        this.logDebug(`findmnt output:\n${output}`);
 
-        // Look for BTRFS filesystem mounted in our cache-key specific directory
+        // Parse findmnt output: TARGET SOURCE
         const lines = output.split("\n");
         for (const line of lines) {
-            // Look for lines with our cache pattern and type btrfs
-            if (line.includes(expectedPattern) && line.includes("type btrfs")) {
-                const match = line.match(/^(.+\.btrfs) on (.+) type btrfs/);
-                if (match) {
-                    const mountedImageFile = match[1];
-                    const mountPoint = match[2];
-                    core.debug(`[BTRFS] Found existing mount: ${mountedImageFile} → ${mountPoint}`);
-                    
-                    // Update our containerFile to match the actually mounted one
-                    this.containerFile = mountedImageFile;
-                    return mountPoint;
+            if (line.trim() === "") continue;
+
+            const parts = line.trim().split(/\s+/);
+            if (parts.length >= 2) {
+                const mountPoint = parts[0];
+                const device = parts[1];
+
+                // Look for our specific mount point
+                if (mountPoint === expectedMountPoint) {
+                    this.logDebug(
+                        `Found existing mount: ${device} → ${mountPoint}`
+                    );
+
+                    this.mountPoint = mountPoint;
+
+                    // With deterministic temp directories, containerFile should already be correct
+                    this.logDebug(`Using containerFile: ${this.containerFile}`);
+
+                    return;
                 }
             }
         }
 
         throw new Error(
-            `No BTRFS cache filesystem found for cache key ${this.cacheKey} (pattern: ${expectedPattern}). ` +
-            `Make sure the cache was properly initialized and mounted first.`
+            `No BTRFS cache filesystem found for cache key ${this.cacheKey}. ` +
+                `Expected mount at: ${expectedMountPoint}. ` +
+                `Make sure the cache was properly initialized and mounted first.`
         );
     }
 
     private async mount(): Promise<void> {
         try {
-            this.mountPoint = await this.createCacheKeySpecificTempDirectory();
-            
+            const tempDir = await createCacheKeySpecificTempDirectory(
+                this.cacheKey
+            );
+            this.mountPoint = path.join(tempDir, "mount");
+
             // Create mount point and mount the image
             await fs.mkdir(this.mountPoint, { recursive: true });
             core.debug(`[BTRFS] Mounting image to ${this.mountPoint}`);
-            await exec.exec("sudo", [
-                "mount",
-                "-o",
-                "loop,rw,compress=zstd",
+            await this.mountWithErrorHandling(
                 this.containerFile,
-                this.mountPoint
-            ], { silent: !core.isDebug() });
+                this.mountPoint,
+                ["loop", "rw", `compress=${this.compressionLevel}`]
+            );
 
             // Bind-mount each path so workspace points to BTRFS
             const promises = this.pathsToCache.map(async p => {
@@ -293,48 +422,52 @@ export class BtrfsContainer extends Container {
 
                 try {
                     await Promise.all([
-                        exec.exec("sudo", ["mkdir", "-p", btrfsPath], { silent: !core.isDebug() }),
-                        exec.exec("sudo", ["mkdir", "-p", absPath], { silent: !core.isDebug() })
+                        this.execSudo("mkdir", ["-p", btrfsPath]),
+                        this.execSudo("mkdir", ["-p", absPath])
                     ]);
-                    
+
                     // Set ownership to match the workspace directory
                     const parentDir = path.dirname(absPath);
                     await Promise.all([
-                        exec.exec("sudo", ["chown", "--reference", parentDir, absPath], { silent: !core.isDebug() }),
-                        exec.exec("sudo", ["chown", "--reference", this.baseDir, btrfsPath], { silent: !core.isDebug() })
+                        this.execSudo("chown", [
+                            "--reference",
+                            parentDir,
+                            absPath
+                        ]),
+                        this.execSudo("chown", [
+                            "--reference",
+                            this.baseDir,
+                            btrfsPath
+                        ])
                     ]);
 
                     // Bind mount: workspace points to BTRFS
-                    await exec.exec("sudo", ["mount", "--bind", btrfsPath, absPath], { silent: !core.isDebug() });
+                    await this.mountWithErrorHandling(btrfsPath, absPath, [
+                        "bind"
+                    ]);
                 } catch (error) {
-                    throw new Error(`Failed to bind-mount ${btrfsPath} to ${absPath}: ${error instanceof Error ? error.message : error}`);
+                    throw new Error(
+                        `Failed to bind-mount ${btrfsPath} to ${absPath}: ${
+                            error instanceof Error ? error.message : error
+                        }`
+                    );
                 }
             });
             await Promise.all(promises);
         } catch (error) {
-            throw new Error(`Failed to mount BTRFS filesystem: ${error instanceof Error ? error.message : error}`);
+            throw new Error(
+                `Failed to mount BTRFS filesystem: ${
+                    error instanceof Error ? error.message : error
+                }`
+            );
         }
-    }
-
-    private async createCacheKeySpecificTempDirectory(): Promise<string> {
-        // Use the cache key directly in the directory name
-        // Replace invalid filesystem characters with underscores
-        const safeKey = this.cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, '_');
-        
-        const baseTempDir = await utils.createTempDirectory();
-        const cacheSpecificDir = path.join(baseTempDir, `btrfs-cache-${safeKey}`);
-        
-        await fs.mkdir(cacheSpecificDir, { recursive: true });
-        core.debug(`[BTRFS] Created cache-specific directory: ${cacheSpecificDir} for key: ${this.cacheKey}`);
-        
-        return cacheSpecificDir;
     }
 
     private async unmount(): Promise<void> {
         if (!this.mountPoint) {
             throw new Error("Mount point is not set");
         }
-        
+
         try {
             await exec.exec("sync", [], { silent: !core.isDebug() });
 
@@ -352,10 +485,12 @@ export class BtrfsContainer extends Container {
                     );
                     if (bindMountCheck === 0) {
                         core.debug(`[BTRFS] Unmounting bind mount: ${absPath}`);
-                        await exec.exec("sudo", ["umount", absPath], { silent: !core.isDebug() });
+                        await this.umountWithErrorHandling(absPath);
                     }
                 } catch (error) {
-                    core.debug(`Failed to unmount bind mount ${absPath}: ${error}`);
+                    core.debug(
+                        `Failed to unmount bind mount ${absPath}: ${error}`
+                    );
                 }
             }
 
@@ -370,8 +505,10 @@ export class BtrfsContainer extends Container {
             );
 
             if (mountCheck === 0) {
-                core.debug(`[BTRFS] Unmounting main filesystem: ${this.mountPoint}`);
-                await exec.exec("sudo", ["umount", this.mountPoint], { silent: !core.isDebug() });
+                core.debug(
+                    `[BTRFS] Unmounting main filesystem: ${this.mountPoint}`
+                );
+                await this.umountWithErrorHandling(this.mountPoint);
             }
         } catch (error) {
             core.debug(`Cleanup mount failed (non-critical): ${error}`);

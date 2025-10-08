@@ -12,10 +12,11 @@ import {
 } from "@actions/cache/lib/internal/tar";
 import { DownloadOptions, UploadOptions } from "@actions/cache/lib/options";
 import { execSync } from "child_process";
-import { getCacheFileName, getCompressionMethod } from "../utils/actionUtils";
+import { createCacheKeySpecificTempDirectory, getCacheFileName, getCompressionMethod } from "../utils/actionUtils";
 import { CompressionMethod } from "@actions/cache/lib/internal/constants";
 import { ContainerFactory } from "../utils/container/ContainerFactory";
 import { Inputs } from "../constants";
+import { Container } from "../utils/container/Container";
 
 export class ValidationError extends Error {
     constructor(message: string) {
@@ -81,7 +82,8 @@ export async function restoreCache(
     restoreKeys?: string[],
     options?: DownloadOptions,
     enableCrossOsArchive = false,
-    customCompression: string | undefined = "none"
+    customCompression: string | undefined = "none",
+    customCompressionLevel: string | undefined = undefined
 ): Promise<string | undefined> {
     checkPaths(paths);
 
@@ -108,11 +110,12 @@ export async function restoreCache(
     core.debug(`Using fsSize: ${fsSize}`);
     const bufferMb = parseInt(core.getInput(Inputs.FsBufferMB) || "2048");
     core.debug(`Using bufferMb: ${bufferMb}`);
+    let cacheContainer: Container | undefined = undefined;
     try {
         const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
         core.debug(`Using baseDir: ${baseDir}`);
         archivePath = path.join(
-            await utils.createTempDirectory(),
+            await createCacheKeySpecificTempDirectory(primaryKey),
             getCacheFileName(compressionMethod)
         );
         core.debug(`Archive Path: ${archivePath}`);
@@ -123,8 +126,9 @@ export async function restoreCache(
             enableCrossOsArchive
         });
    
-        const cacheContainer = ContainerFactory.getCacheContainer(
-            customCompression, 
+        cacheContainer = ContainerFactory.getCacheContainer(
+            customCompression,
+            customCompressionLevel,
             archivePath, 
             baseDir, 
             paths, 
@@ -139,7 +143,9 @@ export async function restoreCache(
             if (cacheContainer && cacheContainer.requiresCreateEmptyCache) {
                 await cacheContainer.initialize();
                 await cacheContainer.createEmptyCache();
-                core.debug(`Created empty cache container of type ${cacheContainer.constructor.name}`);
+                core.debug(
+                    `Created empty cache container of type ${cacheContainer.constructor.name}`
+                );
             }
             return undefined;
         }
@@ -185,11 +191,13 @@ export async function restoreCache(
             core.warning(`Failed to restore: ${(error as Error).message}`);
         }
     } finally {
-        // Try to delete the archive to save space
-        try {
-            await utils.unlinkFile(archivePath);
-        } catch (error) {
-            core.debug(`Failed to delete archive: ${error}`);
+        if (!cacheContainer || !cacheContainer.requiresKeepArchive) {
+            core.debug("Deleting archive to save space");
+            try {
+                await utils.unlinkFile(archivePath);
+            } catch (error) {
+                core.debug(`Failed to delete archive: ${error}`);
+            }
         }
     }
 
@@ -266,7 +274,8 @@ export async function saveCache(
     key: string,
     options?: UploadOptions,
     enableCrossOsArchive = false,
-    customCompression: string | undefined = "none"
+    customCompression: string | undefined = "none",
+    customCompressionLevel: string | undefined = undefined
 ): Promise<number> {
     core.info("Saving Cache via archive.");
     checkPaths(paths);
@@ -286,7 +295,7 @@ export async function saveCache(
         );
     }
 
-    const archiveFolder = await utils.createTempDirectory();
+    const archiveFolder = await createCacheKeySpecificTempDirectory(key);
     const archivePath = path.join(
         archiveFolder,
         getCacheFileName(compressionMethod)
@@ -305,6 +314,7 @@ export async function saveCache(
         );
         const cacheContainer = ContainerFactory.getCacheContainer(
             customCompression, 
+            customCompressionLevel,
             archivePath, 
             baseDir, 
             paths, 

@@ -95100,8 +95100,10 @@ var Inputs;
     Inputs["UploadChunkSize"] = "upload-chunk-size";
     Inputs["EnableCrossOsArchive"] = "enableCrossOsArchive";
     Inputs["FailOnCacheMiss"] = "fail-on-cache-miss";
+    Inputs["ForceSave"] = "force-save";
     Inputs["LookupOnly"] = "lookup-only";
     Inputs["CustomCompression"] = "custom-compression";
+    Inputs["CustomCompressionLevel"] = "custom-compression-level";
     Inputs["ContainerFormat"] = "container-format";
     Inputs["Sync"] = "sync";
     Inputs["FsSize"] = "fs-size";
@@ -95497,7 +95499,7 @@ exports.isFeatureAvailable = isFeatureAvailable;
  * @param enableCrossOsArchive an optional boolean enabled to restore on windows any cache created on any platform
  * @returns string returns the key for the cache hit, otherwise returns undefined
  */
-function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArchive = false, customCompression = "none") {
+function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArchive = false, customCompression = "none", customCompressionLevel = undefined) {
     return __awaiter(this, void 0, void 0, function* () {
         checkPaths(paths);
         restoreKeys = restoreKeys || [];
@@ -95518,17 +95520,18 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
         core.debug(`Using fsSize: ${fsSize}`);
         const bufferMb = parseInt(core.getInput(constants_1.Inputs.FsBufferMB) || "2048");
         core.debug(`Using bufferMb: ${bufferMb}`);
+        let cacheContainer = undefined;
         try {
             const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
             core.debug(`Using baseDir: ${baseDir}`);
-            archivePath = path.join(yield utils.createTempDirectory(), (0, actionUtils_1.getCacheFileName)(compressionMethod));
+            archivePath = path.join(yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(primaryKey), (0, actionUtils_1.getCacheFileName)(compressionMethod));
             core.debug(`Archive Path: ${archivePath}`);
             // path are needed to compute version
             const cacheEntry = yield cacheHttpClient.getCacheEntry(keys, paths, {
                 compressionMethod,
                 enableCrossOsArchive
             });
-            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb });
+            cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb });
             core.debug(`Cache Entry: ${JSON.stringify(cacheEntry)}`);
             if (!(cacheEntry === null || cacheEntry === void 0 ? void 0 : cacheEntry.archiveLocation)) {
                 // Cache not found
@@ -95572,12 +95575,14 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             }
         }
         finally {
-            // Try to delete the archive to save space
-            try {
-                yield utils.unlinkFile(archivePath);
-            }
-            catch (error) {
-                core.debug(`Failed to delete archive: ${error}`);
+            if (!cacheContainer || !cacheContainer.requiresKeepArchive) {
+                core.debug("Deleting archive to save space");
+                try {
+                    yield utils.unlinkFile(archivePath);
+                }
+                catch (error) {
+                    core.debug(`Failed to delete archive: ${error}`);
+                }
             }
         }
         return undefined;
@@ -95638,7 +95643,7 @@ exports.restoreCacheSync = restoreCacheSync;
  * @param options cache upload options
  * @returns number returns cacheId if the cache was saved successfully and throws an error if save fails
  */
-function saveCache(paths, key, options, enableCrossOsArchive = false, customCompression = "none") {
+function saveCache(paths, key, options, enableCrossOsArchive = false, customCompression = "none", customCompressionLevel = undefined) {
     return __awaiter(this, void 0, void 0, function* () {
         core.info("Saving Cache via archive.");
         checkPaths(paths);
@@ -95652,7 +95657,7 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
         if (cachePaths.length === 0) {
             throw new Error(`Path Validation Error: Path(s) specified in the action for caching do(es) not exist, hence no cache is being saved.`);
         }
-        const archiveFolder = yield utils.createTempDirectory();
+        const archiveFolder = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(key);
         const archivePath = path.join(archiveFolder, (0, actionUtils_1.getCacheFileName)(compressionMethod));
         core.info(`Archive Path: ${archivePath}`);
         core.info(`Archive Path2: ${archivePath}`);
@@ -95661,7 +95666,7 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
             const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
             const fsSize = core.getInput(constants_1.Inputs.FsSize) || "50G";
             const bufferMb = parseInt(core.getInput(constants_1.Inputs.FsBufferMB) || "2048");
-            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, archivePath, baseDir, paths, key, { fsSize, bufferMb });
+            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, key, { fsSize, bufferMb });
             yield cacheContainer.initialize();
             yield cacheContainer.save();
             const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
@@ -96092,7 +96097,7 @@ function saveImpl(stateProvider) {
             // If matched restore key is same as primary key, then do not save cache
             // NO-OP in case of SaveOnly action
             const restoredKey = stateProvider.getCacheState();
-            if (utils.isExactKeyMatch(primaryKey, restoredKey)) {
+            if (utils.isExactKeyMatch(primaryKey, restoredKey) && !core.getBooleanInput(constants_1.Inputs.ForceSave)) {
                 core.info(`Cache hit occurred on the primary key ${primaryKey}, not saving cache.`);
                 return;
             }
@@ -96103,6 +96108,7 @@ function saveImpl(stateProvider) {
             const enableCrossOsArchive = utils.getInputAsBool(constants_1.Inputs.EnableCrossOsArchive);
             const sync = utils.getInputAsBool(constants_1.Inputs.Sync);
             const customCompression = core.getInput(constants_1.Inputs.CustomCompression);
+            const customCompressionLevel = core.getInput(constants_1.Inputs.CustomCompressionLevel);
             if (canSaveToS3) {
                 core.info("The cache action detected a local S3 bucket cache. Using it.");
                 if (sync) {
@@ -96111,7 +96117,7 @@ function saveImpl(stateProvider) {
                 else {
                     cacheId = yield custom.saveCache(cachePaths, primaryKey, {
                         uploadChunkSize: utils.getInputAsInt(constants_1.Inputs.UploadChunkSize)
-                    }, enableCrossOsArchive, customCompression);
+                    }, enableCrossOsArchive, customCompression, customCompressionLevel);
                 }
             }
             else {
@@ -96294,12 +96300,15 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.getCacheFileName = exports.getCompressionMethod = exports.isCacheFeatureAvailable = exports.getInputAsBool = exports.getInputAsInt = exports.getInputAsArray = exports.isValidEvent = exports.logWarning = exports.isExactKeyMatch = exports.isGhes = void 0;
+exports.createCacheKeySpecificTempDirectory = exports.getCacheFileName = exports.getCompressionMethod = exports.isCacheFeatureAvailable = exports.getInputAsBool = exports.getInputAsInt = exports.getInputAsArray = exports.isValidEvent = exports.logWarning = exports.isExactKeyMatch = exports.isGhes = void 0;
 const cache = __importStar(__nccwpck_require__(7799));
 const core = __importStar(__nccwpck_require__(2186));
 const constants_1 = __nccwpck_require__(9042);
 const utils = __importStar(__nccwpck_require__(1518));
 const constants_2 = __nccwpck_require__(8840);
+const path = __importStar(__nccwpck_require__(1017));
+const fs = __importStar(__nccwpck_require__(3292));
+const os_1 = __nccwpck_require__(2037);
 function isGhes() {
     const ghUrl = new URL(process.env["GITHUB_SERVER_URL"] || "https://github.com");
     return ghUrl.hostname.toUpperCase() !== "GITHUB.COM";
@@ -96375,6 +96384,23 @@ function getCacheFileName(compressionMethod) {
     return `cache.${compressionMethod}`;
 }
 exports.getCacheFileName = getCacheFileName;
+function createCacheKeySpecificTempDirectory(cacheKey) {
+    return __awaiter(this, void 0, void 0, function* () {
+        // Create a deterministic temp directory based on cache key instead of random UUID
+        // This ensures the same cache key always gets the same temp directory across restore/save operations
+        const safeKey = cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, "_");
+        const baseTempDir = process.env["RUNNER_TEMP"] || (0, os_1.tmpdir)();
+        if (!baseTempDir) {
+            throw new Error("RUNNER_TEMP environment variable is not set");
+        }
+        // Use cache key instead of random UUID for deterministic directory
+        const cacheSpecificDir = path.join(baseTempDir, safeKey);
+        yield fs.mkdir(cacheSpecificDir, { recursive: true });
+        core.debug(`Created cache-specific directory: ${cacheSpecificDir} for key: ${cacheKey}`);
+        return cacheSpecificDir;
+    });
+}
+exports.createCacheKeySpecificTempDirectory = createCacheKeySpecificTempDirectory;
 
 
 /***/ }),
@@ -96416,27 +96442,23 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.BtrfsContainer = void 0;
-const utils = __importStar(__nccwpck_require__(1518));
 const core = __importStar(__nccwpck_require__(2186));
 const exec = __importStar(__nccwpck_require__(1514));
 const fs = __importStar(__nccwpck_require__(3292));
-const path_1 = __importDefault(__nccwpck_require__(1017));
+const path = __importStar(__nccwpck_require__(1017));
+const actionUtils_1 = __nccwpck_require__(6850);
 const Container_1 = __nccwpck_require__(9620);
 class BtrfsContainer extends Container_1.Container {
-    constructor(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options) {
-        super(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options);
+    constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
+        if (!compressionLevel) {
+            // Default to zstd default with compression level 3.
+            compressionLevel = "zstd:3";
+        }
+        super(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options);
         this.requiresCreateEmptyCache = true;
-        /**
-         * The mount point for the BTRFS filesystem
-         *
-         * This is a temporary directory where the BTRFS image will be mounted, the actual paths to cache will be bind-mounted.
-         */
-        this.mountPoint = "";
+        this.requiresKeepArchive = true;
         if (!options.fsSize) {
             throw new Error("fsSize option is required for BtrfsContainer");
         }
@@ -96449,9 +96471,15 @@ class BtrfsContainer extends Container_1.Container {
         if (!/^[0-9]+[KMGT]?$/.test(this.fsSize)) {
             throw new Error(`Invalid filesystem size format: ${this.fsSize}. Must be a number followed by optional K, M, G, or T.`);
         }
+        // Validate compression level
+        if (this.compressionLevel &&
+            // List of supported compressions: https://btrfs.readthedocs.io/en/latest/Compression.html
+            !/^(zlib(?:[:][1-9])?|lzo|zstd(?::-?(?:[0-9]|1[0-5]))?)$/.test(this.compressionLevel)) {
+            throw new Error(`Invalid compression level format: ${this.compressionLevel}. Must be 'zlib:<level>' where <level> is between 1 and 9, lzo, or zstd:<level> where <level> is between -15 and 15.`);
+        }
     }
     isSupportedMethod(method) {
-        return ((method === null || method === void 0 ? void 0 : method.split('-')[0]) || method) === "btrfs";
+        return ((method === null || method === void 0 ? void 0 : method.split("-")[0]) || method) === "btrfs";
     }
     initialize() {
         return __awaiter(this, void 0, void 0, function* () {
@@ -96464,14 +96492,69 @@ class BtrfsContainer extends Container_1.Container {
             }
         });
     }
+    // Override the log prefix for BTRFS-specific logging
+    getLogPrefix() {
+        return "[BTRFS]";
+    }
+    execWithOutput(command, args) {
+        return __awaiter(this, void 0, void 0, function* () {
+            let output = "";
+            yield exec.exec(command, args, {
+                listeners: {
+                    stdout: (data) => {
+                        output += data.toString();
+                    }
+                },
+                silent: !core.isDebug()
+            });
+            return output.trim();
+        });
+    }
+    mountWithErrorHandling(device, mountPath, options, useSudo = true) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const mountArgs = [device, mountPath];
+            if (options && options.length > 0) {
+                mountArgs.unshift("-o", options.join(","));
+            }
+            const command = useSudo ? "sudo" : "mount";
+            const args = useSudo ? ["mount", ...mountArgs] : mountArgs;
+            try {
+                yield exec.exec(command, args, { silent: !core.isDebug() });
+            }
+            catch (error) {
+                throw this.wrapError(`mount ${device} at ${mountPath}`, error);
+            }
+        });
+    }
+    execSudo(command, args = []) {
+        return __awaiter(this, void 0, void 0, function* () {
+            yield exec.exec("sudo", [command, ...args], {
+                silent: !core.isDebug()
+            });
+        });
+    }
+    umountWithErrorHandling(mountPath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                yield this.execSudo("umount", [mountPath]);
+            }
+            catch (error) {
+                core.warning(`${this.getLogPrefix()} Failed to umount ${mountPath}: ${error instanceof Error ? error.message : error}`);
+            }
+        });
+    }
     createEmptyCache() {
         return __awaiter(this, void 0, void 0, function* () {
             try {
                 // Create new empty cache image
-                core.info(`[BTRFS] Creating sparse image: ${this.containerFile}`);
-                yield exec.exec("truncate", ["-s", this.fsSize, this.containerFile]);
+                this.logInfo(`Creating sparse image: ${this.containerFile}`);
+                yield exec.exec("truncate", [
+                    "-s",
+                    this.fsSize,
+                    this.containerFile
+                ]);
                 // Format with BTRFS
-                core.info(`[BTRFS] Formatting image with BTRFS`);
+                this.logInfo(`Formatting image with BTRFS`);
                 yield exec.exec("mkfs.btrfs", ["-f", this.containerFile], {
                     silent: !core.isDebug()
                 });
@@ -96479,7 +96562,7 @@ class BtrfsContainer extends Container_1.Container {
                 return this.mount();
             }
             catch (error) {
-                throw new Error(`Failed to create empty BTRFS cache: ${error instanceof Error ? error.message : error}`);
+                throw this.wrapError("create empty BTRFS cache", error);
             }
         });
     }
@@ -96489,17 +96572,20 @@ class BtrfsContainer extends Container_1.Container {
                 return this.mount();
             }
             catch (error) {
-                throw new Error(`Failed to restore BTRFS cache: ${error instanceof Error ? error.message : error}`);
+                throw this.wrapError("restore BTRFS cache", error);
             }
         });
     }
     save() {
         return __awaiter(this, void 0, void 0, function* () {
-            // Find the existing mount point for this image
-            this.mountPoint = yield this.findExistingMountPoint();
-            core.debug(`[BTRFS] Defragmenting filesystem`);
+            // Discover all mount information once
+            yield this.discoverMountInfo();
+            if (!this.mountPoint) {
+                throw this.createError("Mount point not discovered");
+            }
+            this.logDebug(`Defragmenting filesystem`);
             yield exec.exec("btrfs", ["filesystem", "defragment", "-r", this.mountPoint], { silent: !core.isDebug() });
-            core.debug(`[BTRFS] Syncing and calculating used space`);
+            this.logDebug(`Syncing and calculating used space`);
             yield exec.exec("sync", [], { silent: !core.isDebug() });
             // Get used space and resize filesystem
             let usedBytes = 0;
@@ -96514,21 +96600,23 @@ class BtrfsContainer extends Container_1.Container {
             const targetSize = usedBytes + this.bufferBytes;
             const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
             core.debug(`Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
-            yield exec.exec("sudo", [
-                "btrfs",
-                "filesystem",
-                "resize",
-                `${targetMb}M`,
-                this.mountPoint
-            ], { silent: !core.isDebug() });
-            // Unmount
+            yield exec.exec("sudo", ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint], { silent: !core.isDebug() });
+            // Ensure all changes are written to disk before unmounting
+            yield exec.exec("sync", [], { silent: !core.isDebug() });
+            // Unmount filesystem - the containerFile now points to the actual file with all data
             yield this.unmount();
+            // Resize backing file
+            this.logDebug(`Resizing backing file to ${targetMb} MB`);
+            yield exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
+            // Additional sync and wait after unmount to ensure file is fully accessible
+            yield exec.exec("sync", [], { silent: !core.isDebug() });
+            this.logDebug(`Save completed. Container file ready for upload: ${this.containerFile}`);
         });
     }
     checkPathTraversal(base, pathToCheck) {
         // Validate that the resolved path is within the base directory
-        const absBase = path_1.default.resolve(base);
-        const absPathToCheck = path_1.default.resolve(path_1.default.join(base, pathToCheck));
+        const absBase = path.resolve(base);
+        const absPathToCheck = path.resolve(path.join(base, pathToCheck));
         if (!absPathToCheck.startsWith(absBase)) {
             throw new Error(`Path traversal detected: ${pathToCheck} resolves outside base directory`);
         }
@@ -96551,6 +96639,10 @@ class BtrfsContainer extends Container_1.Container {
                     description: "BTRFS filesystem operations (install btrfs-progs)"
                 },
                 {
+                    command: "findmnt",
+                    description: "finding mounted filesystems (install util-linux)"
+                },
+                {
                     command: "sudo",
                     description: "elevated privileges for mounting operations"
                 }
@@ -96558,7 +96650,9 @@ class BtrfsContainer extends Container_1.Container {
             const missingTools = [];
             yield Promise.all(requiredTools.map((tool) => __awaiter(this, void 0, void 0, function* () {
                 try {
-                    yield exec.exec("which", [tool.command], { silent: !core.isDebug() });
+                    yield exec.exec("which", [tool.command], {
+                        silent: !core.isDebug()
+                    });
                 }
                 catch (error) {
                     missingTools.push(`${tool.command} (${tool.description})`);
@@ -96570,7 +96664,9 @@ class BtrfsContainer extends Container_1.Container {
             }
             // Check if sudo works without password prompt (for CI environments)
             try {
-                yield exec.exec("sudo", ["-n", "true"], { silent: !core.isDebug() });
+                yield exec.exec("sudo", ["-n", "true"], {
+                    silent: !core.isDebug()
+                });
             }
             catch (error) {
                 throw new Error(`sudo access is required for BTRFS mounting operations but sudo is not available or requires a password. ` +
@@ -96583,15 +96679,13 @@ class BtrfsContainer extends Container_1.Container {
             if (!this.mountPoint) {
                 throw new Error("Mount point is not set");
             }
-            let output = "";
-            yield exec.exec("sudo", ["btrfs", "filesystem", "usage", "-b", this.mountPoint], {
-                listeners: {
-                    stdout: (data) => {
-                        output += data.toString();
-                    }
-                }
-            });
-            return output;
+            return this.execWithOutput("sudo", [
+                "btrfs",
+                "filesystem",
+                "usage",
+                "-b",
+                this.mountPoint
+            ]);
         });
     }
     parseUsedBytes(usageOutput) {
@@ -96604,77 +96698,85 @@ class BtrfsContainer extends Container_1.Container {
         }
         throw new Error("Could not parse BTRFS usage output");
     }
-    findExistingMountPoint() {
+    discoverMountInfo() {
         return __awaiter(this, void 0, void 0, function* () {
-            let output = "";
-            yield exec.exec("mount", [], {
-                listeners: {
-                    stdout: (data) => {
-                        output += data.toString();
-                    }
-                },
-                silent: !core.isDebug()
-            });
-            // Create the expected directory pattern using the cache key
-            const safeKey = this.cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, '_');
-            const expectedPattern = `btrfs-cache-${safeKey}`;
-            core.debug(`[BTRFS] Looking for mount pattern: ${expectedPattern}`);
-            core.debug(`[BTRFS] Mount output:\n${output}`);
-            // Look for BTRFS filesystem mounted in our cache-key specific directory
+            // Get the expected temp directory for this cache key
+            const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
+            const expectedMountPoint = path.join(tempDir, "mount");
+            this.logDebug(`Looking for BTRFS mount at: ${expectedMountPoint}`);
+            // Use findmnt to find BTRFS mounts with both target and source
+            const output = yield this.execWithOutput("findmnt", [
+                "-t",
+                "btrfs",
+                "-n",
+                "-o",
+                "TARGET,SOURCE"
+            ]);
+            this.logDebug(`findmnt output:\n${output}`);
+            // Parse findmnt output: TARGET SOURCE
             const lines = output.split("\n");
             for (const line of lines) {
-                // Look for lines with our cache pattern and type btrfs
-                if (line.includes(expectedPattern) && line.includes("type btrfs")) {
-                    const match = line.match(/^(.+\.btrfs) on (.+) type btrfs/);
-                    if (match) {
-                        const mountedImageFile = match[1];
-                        const mountPoint = match[2];
-                        core.debug(`[BTRFS] Found existing mount: ${mountedImageFile} → ${mountPoint}`);
-                        // Update our containerFile to match the actually mounted one
-                        this.containerFile = mountedImageFile;
-                        return mountPoint;
+                if (line.trim() === "")
+                    continue;
+                const parts = line.trim().split(/\s+/);
+                if (parts.length >= 2) {
+                    const mountPoint = parts[0];
+                    const device = parts[1];
+                    // Look for our specific mount point
+                    if (mountPoint === expectedMountPoint) {
+                        this.logDebug(`Found existing mount: ${device} → ${mountPoint}`);
+                        this.mountPoint = mountPoint;
+                        // With deterministic temp directories, containerFile should already be correct
+                        this.logDebug(`Using containerFile: ${this.containerFile}`);
+                        return;
                     }
                 }
             }
-            throw new Error(`No BTRFS cache filesystem found for cache key ${this.cacheKey} (pattern: ${expectedPattern}). ` +
+            throw new Error(`No BTRFS cache filesystem found for cache key ${this.cacheKey}. ` +
+                `Expected mount at: ${expectedMountPoint}. ` +
                 `Make sure the cache was properly initialized and mounted first.`);
         });
     }
     mount() {
         return __awaiter(this, void 0, void 0, function* () {
             try {
-                this.mountPoint = yield this.createCacheKeySpecificTempDirectory();
+                const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
+                this.mountPoint = path.join(tempDir, "mount");
                 // Create mount point and mount the image
                 yield fs.mkdir(this.mountPoint, { recursive: true });
                 core.debug(`[BTRFS] Mounting image to ${this.mountPoint}`);
-                yield exec.exec("sudo", [
-                    "mount",
-                    "-o",
-                    "loop,rw,compress=zstd",
-                    this.containerFile,
-                    this.mountPoint
-                ], { silent: !core.isDebug() });
+                yield this.mountWithErrorHandling(this.containerFile, this.mountPoint, ["loop", "rw", `compress=${this.compressionLevel}`]);
                 // Bind-mount each path so workspace points to BTRFS
                 const promises = this.pathsToCache.map((p) => __awaiter(this, void 0, void 0, function* () {
                     if (!this.mountPoint) {
                         throw new Error("Mount point is not set");
                     }
-                    const absPath = path_1.default.join(this.baseDir, p);
-                    const btrfsPath = path_1.default.join(this.mountPoint, p);
+                    const absPath = path.join(this.baseDir, p);
+                    const btrfsPath = path.join(this.mountPoint, p);
                     core.debug(`[BTRFS] Bind-mounting ${btrfsPath} → ${absPath}`);
                     try {
                         yield Promise.all([
-                            exec.exec("sudo", ["mkdir", "-p", btrfsPath], { silent: !core.isDebug() }),
-                            exec.exec("sudo", ["mkdir", "-p", absPath], { silent: !core.isDebug() })
+                            this.execSudo("mkdir", ["-p", btrfsPath]),
+                            this.execSudo("mkdir", ["-p", absPath])
                         ]);
                         // Set ownership to match the workspace directory
-                        const parentDir = path_1.default.dirname(absPath);
+                        const parentDir = path.dirname(absPath);
                         yield Promise.all([
-                            exec.exec("sudo", ["chown", "--reference", parentDir, absPath], { silent: !core.isDebug() }),
-                            exec.exec("sudo", ["chown", "--reference", this.baseDir, btrfsPath], { silent: !core.isDebug() })
+                            this.execSudo("chown", [
+                                "--reference",
+                                parentDir,
+                                absPath
+                            ]),
+                            this.execSudo("chown", [
+                                "--reference",
+                                this.baseDir,
+                                btrfsPath
+                            ])
                         ]);
                         // Bind mount: workspace points to BTRFS
-                        yield exec.exec("sudo", ["mount", "--bind", btrfsPath, absPath], { silent: !core.isDebug() });
+                        yield this.mountWithErrorHandling(btrfsPath, absPath, [
+                            "bind"
+                        ]);
                     }
                     catch (error) {
                         throw new Error(`Failed to bind-mount ${btrfsPath} to ${absPath}: ${error instanceof Error ? error.message : error}`);
@@ -96687,18 +96789,6 @@ class BtrfsContainer extends Container_1.Container {
             }
         });
     }
-    createCacheKeySpecificTempDirectory() {
-        return __awaiter(this, void 0, void 0, function* () {
-            // Use the cache key directly in the directory name
-            // Replace invalid filesystem characters with underscores
-            const safeKey = this.cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, '_');
-            const baseTempDir = yield utils.createTempDirectory();
-            const cacheSpecificDir = path_1.default.join(baseTempDir, `btrfs-cache-${safeKey}`);
-            yield fs.mkdir(cacheSpecificDir, { recursive: true });
-            core.debug(`[BTRFS] Created cache-specific directory: ${cacheSpecificDir} for key: ${this.cacheKey}`);
-            return cacheSpecificDir;
-        });
-    }
     unmount() {
         return __awaiter(this, void 0, void 0, function* () {
             if (!this.mountPoint) {
@@ -96708,7 +96798,7 @@ class BtrfsContainer extends Container_1.Container {
                 yield exec.exec("sync", [], { silent: !core.isDebug() });
                 // First unmount all bind mounts
                 for (const p of this.pathsToCache) {
-                    const absPath = path_1.default.join(this.baseDir, p);
+                    const absPath = path.join(this.baseDir, p);
                     try {
                         const bindMountCheck = yield exec.exec("mountpoint", [absPath], {
                             ignoreReturnCode: true,
@@ -96716,7 +96806,7 @@ class BtrfsContainer extends Container_1.Container {
                         });
                         if (bindMountCheck === 0) {
                             core.debug(`[BTRFS] Unmounting bind mount: ${absPath}`);
-                            yield exec.exec("sudo", ["umount", absPath], { silent: !core.isDebug() });
+                            yield this.umountWithErrorHandling(absPath);
                         }
                     }
                     catch (error) {
@@ -96730,7 +96820,7 @@ class BtrfsContainer extends Container_1.Container {
                 });
                 if (mountCheck === 0) {
                     core.debug(`[BTRFS] Unmounting main filesystem: ${this.mountPoint}`);
-                    yield exec.exec("sudo", ["umount", this.mountPoint], { silent: !core.isDebug() });
+                    yield this.umountWithErrorHandling(this.mountPoint);
                 }
             }
             catch (error) {
@@ -96751,10 +96841,33 @@ exports.BtrfsContainer = BtrfsContainer;
 /***/ }),
 
 /***/ 9620:
-/***/ (function(__unused_webpack_module, exports) {
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 "use strict";
 
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -96766,23 +96879,45 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.Container = void 0;
+const core = __importStar(__nccwpck_require__(2186));
 class Container {
-    constructor(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options = {}) {
+    constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options = {}) {
         this.containerFile = containerFile;
         this.compressionMethod = compressionMethod;
+        this.compressionLevel = compressionLevel;
         this.baseDir = baseDir;
         this.pathsToCache = pathsToCache;
         this.cacheKey = cacheKey;
         this.options = options;
     }
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
     initialize() {
         return __awaiter(this, void 0, void 0, function* () { });
     }
-    ;
+    // eslint-disable-next-line @typescript-eslint/no-empty-function
     createEmptyCache() {
         return __awaiter(this, void 0, void 0, function* () { });
     }
-    ;
+    // Common helper methods for all container implementations
+    wrapError(operation, error) {
+        return new Error(`Failed to ${operation}: ${error instanceof Error ? error.message : error}`);
+    }
+    logInfo(message, prefix) {
+        const logPrefix = prefix || this.getLogPrefix();
+        core.info(`${logPrefix} ${message}`);
+    }
+    logDebug(message, prefix) {
+        const logPrefix = prefix || this.getLogPrefix();
+        core.debug(`${logPrefix} ${message}`);
+    }
+    createError(message, prefix) {
+        const logPrefix = prefix || this.getLogPrefix();
+        return new Error(`${logPrefix} ${message}`);
+    }
+    // Default log prefix - subclasses can override
+    getLogPrefix() {
+        return "[CONTAINER]";
+    }
 }
 exports.Container = Container;
 
@@ -96802,13 +96937,13 @@ const TarLz4Container_1 = __nccwpck_require__(292);
 const SUPPORTED_CLASSES = {
     btrfs: BtrfsContainer_1.BtrfsContainer,
     tarLz4: TarLz4Container_1.TarLz4Container,
-    tar: TarContainer_1.TarContainer,
+    tar: TarContainer_1.TarContainer
 };
-const DEFAULT_CLASS = 'tar';
+const DEFAULT_CLASS = "tar";
 class ContainerFactory {
-    static getCacheContainer(customCompression, archivePath, baseDir, pathsToCache, cacheKey, options) {
+    static getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, pathsToCache, cacheKey, options) {
         const instances = Object.entries(SUPPORTED_CLASSES).reduce((acc, [key, Clazz]) => {
-            const instance = new Clazz(archivePath, customCompression, baseDir, pathsToCache, cacheKey, options);
+            const instance = new Clazz(archivePath, customCompression, customCompressionLevel, baseDir, pathsToCache, cacheKey, options);
             return Object.assign(Object.assign({}, acc), { [key]: instance });
         }, {});
         const foundInstanceKey = Object.keys(instances).find(key => instances[key].isSupportedMethod(customCompression));
@@ -96839,20 +96974,36 @@ exports.TarContainer = void 0;
 const tar_1 = __nccwpck_require__(6490);
 const Container_1 = __nccwpck_require__(9620);
 class TarContainer extends Container_1.Container {
-    constructor(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options) {
-        super(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options);
+    constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
+        super(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options);
         this.requiresCreateEmptyCache = false;
+        this.requiresKeepArchive = false;
+    }
+    getLogPrefix() {
+        return "[TAR]";
     }
     isSupportedMethod(method) {
         return method === "tar";
     }
     restore() {
         return __awaiter(this, void 0, void 0, function* () {
-            return (0, tar_1.extractTar)(this.containerFile, this.compressionMethod);
+            try {
+                return (0, tar_1.extractTar)(this.containerFile, this.compressionMethod);
+            }
+            catch (error) {
+                throw this.wrapError("restore TAR cache", error);
+            }
         });
     }
     save() {
         return __awaiter(this, void 0, void 0, function* () {
+            try {
+                this.logDebug(`Creating TAR archive: ${this.containerFile}`);
+                // TAR save implementation would go here
+            }
+            catch (error) {
+                throw this.wrapError("save TAR cache", error);
+            }
         });
     }
 }
@@ -96901,107 +97052,125 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.TarLz4Container = void 0;
 const tar_1 = __nccwpck_require__(6490);
-const Container_1 = __nccwpck_require__(9620);
 const core = __importStar(__nccwpck_require__(2186));
 const child_process_1 = __nccwpck_require__(2081);
 const path_1 = __nccwpck_require__(1017);
+const Container_1 = __nccwpck_require__(9620);
 class TarLz4Container extends Container_1.Container {
-    constructor(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options) {
-        super(containerFile, compressionMethod, baseDir, pathsToCache, cacheKey, options);
+    constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
+        super(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options);
         this.requiresCreateEmptyCache = false;
+        this.requiresKeepArchive = false;
+    }
+    getLogPrefix() {
+        return "[TAR-LZ4]";
     }
     isSupportedMethod(method) {
         return method === "lz4";
     }
     restore() {
         return __awaiter(this, void 0, void 0, function* () {
-            if (this.compressionMethod && process.platform !== "win32") {
-                const compressionArgs = this.compressionMethod === "none" ? "" : `--use-compress-program=${this.compressionMethod}`;
-                const command = `tar -xf ${this.containerFile} -P -C ${this.baseDir} ${compressionArgs}`;
-                core.info(`Extracting ${this.containerFile} to ${this.baseDir}`);
-                const output = (0, child_process_1.execSync)(command);
-                if (output && output.length > 0) {
-                    core.info(output.toString());
+            try {
+                if (this.compressionMethod && process.platform !== "win32") {
+                    const compressionArgs = this.compressionMethod === "none"
+                        ? ""
+                        : `--use-compress-program=${this.compressionMethod}`;
+                    const command = `tar -xf ${this.containerFile} -P -C ${this.baseDir} ${compressionArgs}`;
+                    this.logInfo(`Extracting ${this.containerFile} to ${this.baseDir}`);
+                    const output = (0, child_process_1.execSync)(command);
+                    if (output && output.length > 0) {
+                        this.logInfo(output.toString());
+                    }
+                }
+                else if (this.compressionMethod && process.platform === "win32") {
+                    const tarPathObj = yield (0, tar_1.getTarPath)();
+                    const tarPath = tarPathObj.path; // Access the 'path' property
+                    const lz4Path = "lz4.exe";
+                    // Build the arguments array
+                    const args = [];
+                    args.push("--force-local");
+                    args.push("--posix");
+                    if (this.compressionMethod !== "none") {
+                        args.push(`--use-compress-program="${lz4Path}"`);
+                    }
+                    // Properly quote and convert paths
+                    args.push("-xf", `"${this.toTarPath(this.containerFile)}"`);
+                    args.push("-P");
+                    args.push("-C", `"${this.toTarPath(this.baseDir)}"`);
+                    // Combine all arguments into the command
+                    const command = `"${tarPath}" ${args.join(" ")}`;
+                    this.logDebug(`Executing command: ${command}`);
+                    const output = (0, child_process_1.execSync)(command, { stdio: "inherit" });
+                    if (output && output.length > 0) {
+                        this.logDebug(output.toString());
+                    }
+                }
+                else {
+                    return (0, tar_1.extractTar)(this.containerFile, this.compressionMethod);
                 }
             }
-            else if (this.compressionMethod && process.platform === "win32") {
-                const tarPathObj = yield (0, tar_1.getTarPath)();
-                const tarPath = tarPathObj.path; // Access the 'path' property
-                const lz4Path = 'lz4.exe';
-                // Build the arguments array
-                let args = [];
-                args.push('--force-local');
-                args.push('--posix');
-                if (this.compressionMethod !== 'none') {
-                    args.push(`--use-compress-program="${lz4Path}"`);
-                }
-                // Properly quote and convert paths
-                args.push('-xf', `"${this.toTarPath(this.containerFile)}"`);
-                args.push('-P');
-                args.push('-C', `"${this.toTarPath(this.baseDir)}"`);
-                // Combine all arguments into the command
-                const command = `"${tarPath}" ${args.join(' ')}`;
-                core.debug(`Executing command: ${command}`);
-                const output = (0, child_process_1.execSync)(command, { stdio: 'inherit' });
-                if (output && output.length > 0) {
-                    core.debug(output.toString());
-                }
-            }
-            else {
-                return (0, tar_1.extractTar)(this.containerFile, this.compressionMethod);
+            catch (error) {
+                throw this.wrapError("restore TAR-LZ4 cache", error);
             }
         });
     }
     save() {
         return __awaiter(this, void 0, void 0, function* () {
-            if (this.compressionMethod && process.platform !== "win32") {
-                core.info(`Archive Path4: ${this.containerFile}`);
-                const compressionArgs = this.compressionMethod === "none" ? "" : `--use-compress-program=${this.compressionMethod}`;
-                const command = `tar --posix -cf ${this.containerFile} --exclude ${this.containerFile} -P -C ${this.baseDir} ${this.pathsToCache.join(' ')} ${compressionArgs}`;
-                const output = (0, child_process_1.execSync)(command);
-                if (output && output.length > 0) {
-                    core.debug(output.toString());
+            try {
+                if (this.compressionMethod && process.platform !== "win32") {
+                    this.logDebug(`Creating archive: ${this.containerFile}`);
+                    const compressionArgs = this.compressionMethod === "none"
+                        ? ""
+                        : `--use-compress-program=${this.compressionMethod}`;
+                    const command = `tar --posix -cf ${this.containerFile} --exclude ${this.containerFile} -P -C ${this.baseDir} ${this.pathsToCache.join(" ")} ${compressionArgs}`;
+                    const output = (0, child_process_1.execSync)(command);
+                    if (output && output.length > 0) {
+                        this.logDebug(output.toString());
+                    }
+                }
+                else if (this.compressionMethod && process.platform === "win32") {
+                    this.logDebug(`Creating archive: ${this.containerFile}`);
+                    const tarPathObj = yield (0, tar_1.getTarPath)();
+                    const tarPath = tarPathObj.path; // Access the 'path' property
+                    // Use 'lz4' directly, assuming it's in the PATH
+                    const lz4Path = "lz4.exe";
+                    // Build the arguments array
+                    const args = [];
+                    args.push("--posix");
+                    args.push("--force-local");
+                    if (this.compressionMethod !== "none") {
+                        args.push(`--use-compress-program="${lz4Path}"`);
+                    }
+                    // Properly quote and convert path
+                    args.push("-cf", `"${this.toTarPath(this.containerFile)}"`);
+                    args.push("--exclude", `"${this.toTarPath(this.containerFile)}"`);
+                    args.push("-P");
+                    args.push("-C", `"${this.toTarPath(this.baseDir)}"`);
+                    // Properly quote and convert cache paths
+                    const quotedCachePaths = this.pathsToCache.map(p => `"${this.toTarPath(p)}"`);
+                    // Combine all arguments into the command
+                    const command = `"${tarPath}" ${args.join(" ")} ${quotedCachePaths.join(" ")}`;
+                    this.logInfo(`Executing command: ${command}`);
+                    const output = (0, child_process_1.execSync)(command, { stdio: "inherit" });
+                    if (output && output.length > 0) {
+                        this.logDebug(output.toString());
+                    }
+                }
+                else {
+                    this.logDebug(`Creating archive: ${this.containerFile}`);
+                    yield (0, tar_1.createTar)((0, path_1.dirname)(this.containerFile), this.pathsToCache, this.compressionMethod);
+                    if (core.isDebug()) {
+                        yield (0, tar_1.listTar)(this.containerFile, this.compressionMethod);
+                    }
                 }
             }
-            else if (this.compressionMethod && process.platform === "win32") {
-                core.info(`Archive Path5: ${this.containerFile}`);
-                const tarPathObj = yield (0, tar_1.getTarPath)();
-                const tarPath = tarPathObj.path; // Access the 'path' property
-                // Use 'lz4' directly, assuming it's in the PATH
-                const lz4Path = 'lz4.exe';
-                // Build the arguments array
-                let args = [];
-                args.push('--posix');
-                args.push('--force-local');
-                if (this.compressionMethod !== 'none') {
-                    args.push(`--use-compress-program="${lz4Path}"`);
-                }
-                // Properly quote and convert path
-                args.push('-cf', `"${this.toTarPath(this.containerFile)}"`);
-                args.push('--exclude', `"${this.toTarPath(this.containerFile)}"`);
-                args.push('-P');
-                args.push('-C', `"${this.toTarPath(this.baseDir)}"`);
-                // Properly quote and convert cache paths
-                const quotedCachePaths = this.pathsToCache.map(p => `"${this.toTarPath(p)}"`);
-                // Combine all arguments into the command
-                const command = `"${tarPath}" ${args.join(' ')} ${quotedCachePaths.join(' ')}`;
-                core.info(`Executing command: ${command}`);
-                const output = (0, child_process_1.execSync)(command, { stdio: 'inherit' });
-                if (output && output.length > 0) {
-                    core.debug(output.toString());
-                }
-            }
-            else {
-                core.info(`Archive Path6: ${this.containerFile}`);
-                yield (0, tar_1.createTar)((0, path_1.dirname)(this.containerFile), this.pathsToCache, this.compressionMethod);
-                if (core.isDebug()) {
-                    yield (0, tar_1.listTar)(this.containerFile, this.compressionMethod);
-                }
+            catch (error) {
+                throw this.wrapError("save TAR-LZ4 cache", error);
             }
         });
     }
     toTarPath(p) {
-        return p.replace(/\\/g, '/');
+        return p.replace(/\\/g, "/");
     }
 }
 exports.TarLz4Container = TarLz4Container;

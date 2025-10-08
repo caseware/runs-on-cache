@@ -50,6 +50,9 @@ export async function restoreImpl(
         const isSync = utils.getInputAsBool(Inputs.Sync);
 
         const customCompression = core.getInput(Inputs.CustomCompression);
+        const customCompressionLevel = core.getInput(
+            Inputs.CustomCompressionLevel
+        );
 
         let cacheKey: string | undefined;
 
@@ -71,7 +74,8 @@ export async function restoreImpl(
                     restoreKeys,
                     { lookupOnly: lookupOnly },
                     false,
-                    customCompression
+                    customCompression,
+                    customCompressionLevel
                 );
             }
         } else {

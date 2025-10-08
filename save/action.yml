@@ -22,6 +22,9 @@ inputs:
   custom-compression:
     description: 'Creates tar archive with custom compression'
     required: false
+  custom-compression-level:
+    description: 'Level of compression for the custom method. Syntax varies per method.'
+    required: false
 runs:
   using: 'node20'
   main: '../dist/save-only/index.js'

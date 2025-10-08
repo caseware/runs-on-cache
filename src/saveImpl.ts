@@ -49,7 +49,7 @@ export async function saveImpl(
         // NO-OP in case of SaveOnly action
         const restoredKey = stateProvider.getCacheState();
 
-        if (utils.isExactKeyMatch(primaryKey, restoredKey)) {
+        if (utils.isExactKeyMatch(primaryKey, restoredKey) && !core.getBooleanInput(Inputs.ForceSave)) {
             core.info(
                 `Cache hit occurred on the primary key ${primaryKey}, not saving cache.`
             );
@@ -69,6 +69,9 @@ export async function saveImpl(
         const sync = utils.getInputAsBool(Inputs.Sync);
 
         const customCompression = core.getInput(Inputs.CustomCompression);
+        const customCompressionLevel = core.getInput(
+            Inputs.CustomCompressionLevel
+        );
 
         if (canSaveToS3) {
             core.info(
@@ -88,7 +91,8 @@ export async function saveImpl(
                         uploadChunkSize: utils.getInputAsInt(Inputs.UploadChunkSize)
                     },
                     enableCrossOsArchive,
-                    customCompression
+                    customCompression,
+                    customCompressionLevel
                 );
             }
         } else {
