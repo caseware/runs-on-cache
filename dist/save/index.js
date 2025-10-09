@@ -1327,7 +1327,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.createTar = exports.extractTar = exports.listTar = exports.getTarPath = void 0;
+exports.createTar = exports.extractTar = exports.listTar = void 0;
 const exec_1 = __nccwpck_require__(1514);
 const io = __importStar(__nccwpck_require__(7436));
 const fs_1 = __nccwpck_require__(7147);
@@ -1374,7 +1374,6 @@ function getTarPath() {
         };
     });
 }
-exports.getTarPath = getTarPath;
 // Return arguments for tar as per tarPath, compressionMethod, method type and os
 function getTarArgs(tarPath, compressionMethod, type, archivePath = '') {
     return __awaiter(this, void 0, void 0, function* () {
@@ -95101,6 +95100,7 @@ var Inputs;
     Inputs["UploadChunkSize"] = "upload-chunk-size";
     Inputs["EnableCrossOsArchive"] = "enableCrossOsArchive";
     Inputs["FailOnCacheMiss"] = "fail-on-cache-miss";
+    Inputs["ForceSave"] = "force-save";
     Inputs["LookupOnly"] = "lookup-only";
     Inputs["CustomCompression"] = "custom-compression";
     Inputs["Sync"] = "sync"; // Input for cache, save action
@@ -96149,7 +96149,7 @@ function saveImpl(stateProvider) {
             // If matched restore key is same as primary key, then do not save cache
             // NO-OP in case of SaveOnly action
             const restoredKey = stateProvider.getCacheState();
-            if (utils.isExactKeyMatch(primaryKey, restoredKey)) {
+            if (utils.isExactKeyMatch(primaryKey, restoredKey) && core.getInput(constants_1.Inputs.ForceSave) !== 'true') {
                 core.info(`Cache hit occurred on the primary key ${primaryKey}, not saving cache.`);
                 return;
             }
