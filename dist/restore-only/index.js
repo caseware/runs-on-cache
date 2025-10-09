@@ -1327,7 +1327,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.createTar = exports.extractTar = exports.listTar = exports.getTarPath = void 0;
+exports.createTar = exports.extractTar = exports.listTar = void 0;
 const exec_1 = __nccwpck_require__(1514);
 const io = __importStar(__nccwpck_require__(7436));
 const fs_1 = __nccwpck_require__(7147);
@@ -1374,7 +1374,6 @@ function getTarPath() {
         };
     });
 }
-exports.getTarPath = getTarPath;
 // Return arguments for tar as per tarPath, compressionMethod, method type and os
 function getTarArgs(tarPath, compressionMethod, type, archivePath = '') {
     return __awaiter(this, void 0, void 0, function* () {
@@ -95101,6 +95100,7 @@ var Inputs;
     Inputs["UploadChunkSize"] = "upload-chunk-size";
     Inputs["EnableCrossOsArchive"] = "enableCrossOsArchive";
     Inputs["FailOnCacheMiss"] = "fail-on-cache-miss";
+    Inputs["ForceSave"] = "force-save";
     Inputs["LookupOnly"] = "lookup-only";
     Inputs["CustomCompression"] = "custom-compression";
     Inputs["Sync"] = "sync"; // Input for cache, save action
