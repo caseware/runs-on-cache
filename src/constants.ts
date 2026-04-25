@@ -14,7 +14,9 @@ export enum Inputs {
     Sync = "sync", // Input for cache, save action
     FsSize = "fs-size", // Input for btrfs filesystem size
     FsBufferMB = "fs-buffer-mb", // Input for btrfs filesystem buffer size
-    SaveCompressionLevel = "save-compression-level" // Input for btrfs defrag compression before upload
+    SaveCompressionLevel = "save-compression-level", // Input for btrfs defrag compression before upload
+    NodeLocalCacheDir = "node-local-cache-dir", // Input for node-local persistent cache directory (HostPath mount)
+    MountMode = "mount-mode" // Input for mount mode: "ro" (read-only, default for node_modules) or "rw" (read-write, for mutable caches)
 }
 
 export enum Outputs {

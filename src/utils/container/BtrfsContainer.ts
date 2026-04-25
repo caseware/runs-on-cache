@@ -5,6 +5,7 @@ import * as path from "path";
 
 import { createCacheKeySpecificTempDirectory } from "../actionUtils";
 import { Container, ContainerOptions } from "./Container";
+import { NodeLocalCache } from "./NodeLocalCache";
 
 const MOUNT_TIMEOUT_MS = 30_000;
 const MIN_DISK_HEADROOM_MB = 1024;
@@ -23,6 +24,13 @@ export class BtrfsContainer extends Container {
     private fsSize: string;
     private bufferBytes: number;
     private saveCompressionLevel: string;
+    private readonly mountMode: "ro" | "rw";
+    private readonly nodeLocal: NodeLocalCache;
+
+    /**
+     * Tracks whether restore used a node-local image (skip S3 upload on save).
+     */
+    private restoredFromNodeLocal = false;
 
     constructor(
         containerFile: string,
@@ -56,6 +64,12 @@ export class BtrfsContainer extends Container {
         // Use higher compression for save (upload) to minimize image size.
         // Restore decompresses on-demand, so higher save compression = smaller image + same read perf.
         this.saveCompressionLevel = options.saveCompressionLevel || "zstd:9";
+        this.mountMode = options.mountMode || "ro";
+        this.nodeLocal = new NodeLocalCache(
+            options.nodeLocalCacheDir || "",
+            cacheKey,
+            ".btrfs"
+        );
 
         // Security input validations
         this.checkPathTraversal(this.baseDir, this.containerFile);
@@ -91,6 +105,8 @@ export class BtrfsContainer extends Container {
     async initialize(): Promise<void> {
         try {
             await this.checkPrerequisites();
+            // Clean up stale temp files at the start of every job
+            await this.nodeLocal.cleanupStaleTempFiles();
         } catch (e) {
             core.setFailed((e as Error).message);
             process.exit(1);
@@ -101,6 +117,233 @@ export class BtrfsContainer extends Container {
     protected getLogPrefix(): string {
         return "[BTRFS]";
     }
+
+    // ── Node-local restore (hot path) ────────────────────────────────
+
+    /**
+     * Check if a node-local BTRFS image exists for this cache key.
+     * This is the fast path: mount directly from the node's HostPath volume (~1-2s).
+     */
+    async tryRestoreFromNodeLocal(): Promise<boolean> {
+        if (!this.nodeLocal.enabled) return false;
+
+        const localExists = await this.nodeLocal.exists();
+        if (!localExists) return false;
+
+        const localPath = this.nodeLocal.localPath;
+        this.logInfo(`Node-local cache hit — mounting from ${localPath}`);
+
+        // Verify integrity before mounting
+        const isHealthy = await this.verifyImageIntegrity(localPath);
+        if (!isHealthy) {
+            this.logInfo("Node-local image corrupted — falling back to S3");
+            return false;
+        }
+
+        try {
+            if (this.mountMode === "rw") {
+                // Copy to job-local location before mounting read-write
+                await this.copyAndMountReadWrite(localPath);
+            } else {
+                // Mount read-only directly from the shared node-local image
+                await this.mountReadOnly(localPath);
+            }
+
+            this.restoredFromNodeLocal = true;
+            return true;
+        } catch (error) {
+            core.warning(
+                `${this.getLogPrefix()} Node-local mount failed, falling back to S3: ${
+                    error instanceof Error ? error.message : error
+                }`
+            );
+            return false;
+        }
+    }
+
+    /**
+     * Mount a BTRFS image read-only and bind-mount paths to the workspace.
+     * Used for node_modules and other immutable caches.
+     */
+    private async mountReadOnly(imageFile: string): Promise<void> {
+        const tempDir = await createCacheKeySpecificTempDirectory(this.cacheKey);
+        this.mountPoint = path.join(tempDir, "mount");
+
+        await fs.mkdir(this.mountPoint, { recursive: true });
+        this.logInfo(`Mounting read-only: ${imageFile} → ${this.mountPoint}`);
+
+        await this.mountWithErrorHandling(
+            imageFile,
+            this.mountPoint,
+            ["loop", "ro", `compress=${this.compressionLevel}`]
+        );
+
+        // Bind-mount each path read-only to the workspace
+        await this.bindMountPaths(true);
+
+        await this.checkFilesystemHealth();
+    }
+
+    /**
+     * Copy the BTRFS image to a job-local temp directory, then mount read-write.
+     * Used for mutable caches (e.g., sparse git repos).
+     */
+    private async copyAndMountReadWrite(imageFile: string): Promise<void> {
+        const tempDir = await createCacheKeySpecificTempDirectory(this.cacheKey);
+        const localCopy = path.join(tempDir, "cache.btrfs");
+
+        this.logInfo(`Copying for RW mount: ${imageFile} → ${localCopy}`);
+        await fs.copyFile(imageFile, localCopy);
+
+        // Update containerFile to the local copy so save() operates on the right file
+        this.containerFile = localCopy;
+        await this.mount();
+    }
+
+    // ── Standard restore (S3 download path) ──────────────────────────
+
+    async restore(): Promise<void> {
+        try {
+            // Verify image integrity before mounting
+            const isHealthy = await this.verifyImageIntegrity(
+                this.containerFile
+            );
+            if (!isHealthy) {
+                this.logInfo(
+                    "Corrupted image detected — falling back to empty cache"
+                );
+                return this.createEmptyCache();
+            }
+
+            // If node-local is enabled, persist the S3 download to the node
+            if (this.nodeLocal.enabled) {
+                await this.nodeLocal.persistFromS3Download(this.containerFile);
+            }
+
+            if (this.mountMode === "ro") {
+                // Mount the downloaded image read-only
+                await this.mountReadOnly(this.containerFile);
+            } else {
+                // Standard read-write mount
+                await this.mount();
+                await this.checkFilesystemHealth();
+            }
+        } catch (error) {
+            // Clean up any leaked loop devices
+            await this.cleanupLoopDevices(this.containerFile);
+            throw this.wrapError("restore BTRFS cache", error);
+        }
+    }
+
+    async createEmptyCache(): Promise<void> {
+        try {
+            // Calculate optimal sparse file size based on available disk space
+            const effectiveSize = await this.calculateSparseSize();
+
+            // Create new empty cache image
+            this.logInfo(`Creating sparse image: ${this.containerFile} (virtual size: ${effectiveSize})`);
+            await exec.exec("truncate", [
+                "-s",
+                effectiveSize,
+                this.containerFile
+            ]);
+
+            // Format with BTRFS
+            this.logInfo(`Formatting image with BTRFS`);
+            await exec.exec("mkfs.btrfs", ["-f", this.containerFile], {
+                silent: !core.isDebug()
+            });
+
+            // Mount the filesystem so workspace operations write directly to it
+            return this.mount();
+        } catch (error) {
+            // Clean up loop devices on failure
+            await this.cleanupLoopDevices(this.containerFile);
+            throw this.wrapError("create empty BTRFS cache", error);
+        }
+    }
+
+    async save(): Promise<void> {
+        // If restored from read-only node-local mount, skip save entirely
+        // (WORM: the image was already committed and is immutable)
+        if (this.restoredFromNodeLocal && this.mountMode === "ro") {
+            this.logInfo("Skipping save — restored from node-local read-only image (WORM)");
+            return;
+        }
+
+        // Discover all mount information once
+        await this.discoverMountInfo();
+
+        if (!this.mountPoint) {
+            throw this.createError("Mount point not discovered");
+        }
+
+        this.logDebug(`Defragmenting + recompressing with ${this.saveCompressionLevel}`);
+        await exec.exec(
+            "sudo",
+            ["btrfs", "filesystem", "defragment", "-r", `-c${this.saveCompressionLevel}`, this.mountPoint],
+            { silent: !core.isDebug() }
+        );
+
+        this.logDebug(`Syncing and calculating used space`);
+        await exec.exec("sync", [], { silent: !core.isDebug() });
+
+        // Get used space and resize filesystem
+        let usedBytes = 0;
+        try {
+            const usageOutput = await this.getBtrfsUsage();
+            usedBytes = this.parseUsedBytes(usageOutput);
+        } catch (error) {
+            core.warning(
+                `Could not determine exact usage, using default buffer: ${error}`
+            );
+            usedBytes = 512 * 1024 * 1024; // 512MB default
+        }
+
+        const targetSize = usedBytes + this.bufferBytes;
+        const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
+
+        core.debug(`Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
+        await exec.exec(
+            "sudo",
+            ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint],
+            { silent: !core.isDebug() }
+        );
+
+        // Ensure all changes are written to disk before unmounting
+        await exec.exec("sync", [], { silent: !core.isDebug() });
+
+        // Unmount filesystem - the containerFile now points to the actual file with all data
+        await this.unmount();
+
+        // Resize backing file
+        this.logDebug(`Resizing backing file to ${targetMb} MB`);
+        await exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
+
+        // Additional sync and wait after unmount to ensure file is fully accessible
+        await exec.exec("sync", [], { silent: !core.isDebug() });
+
+        // Clean up loop devices after save
+        await this.cleanupLoopDevices(this.containerFile);
+
+        // If node-local is enabled, atomically persist the image to the node
+        if (this.nodeLocal.enabled) {
+            await this.nodeLocal.persistFromS3Download(this.containerFile);
+        }
+
+        this.logDebug(
+            `Save completed. Container file ready for upload: ${this.containerFile}`
+        );
+    }
+
+    /**
+     * Whether the S3 upload should be skipped because the node already has the image.
+     */
+    shouldSkipS3Upload(): boolean {
+        return this.restoredFromNodeLocal && this.mountMode === "ro";
+    }
+
+    // ── Private helpers ──────────────────────────────────────────────
 
     private async execWithOutput(
         command: string,
@@ -382,119 +625,6 @@ export class BtrfsContainer extends Container {
         }
     }
 
-    async createEmptyCache(): Promise<void> {
-        try {
-            // Calculate optimal sparse file size based on available disk space
-            const effectiveSize = await this.calculateSparseSize();
-
-            // Create new empty cache image
-            this.logInfo(`Creating sparse image: ${this.containerFile} (virtual size: ${effectiveSize})`);
-            await exec.exec("truncate", [
-                "-s",
-                effectiveSize,
-                this.containerFile
-            ]);
-
-            // Format with BTRFS
-            this.logInfo(`Formatting image with BTRFS`);
-            await exec.exec("mkfs.btrfs", ["-f", this.containerFile], {
-                silent: !core.isDebug()
-            });
-
-            // Mount the filesystem so workspace operations write directly to it
-            return this.mount();
-        } catch (error) {
-            // Clean up loop devices on failure
-            await this.cleanupLoopDevices(this.containerFile);
-            throw this.wrapError("create empty BTRFS cache", error);
-        }
-    }
-
-    async restore(): Promise<void> {
-        try {
-            // Verify image integrity before mounting
-            const isHealthy = await this.verifyImageIntegrity(
-                this.containerFile
-            );
-            if (!isHealthy) {
-                this.logInfo(
-                    "Corrupted image detected — falling back to empty cache"
-                );
-                return this.createEmptyCache();
-            }
-
-            await this.mount();
-
-            // Check filesystem health after mount
-            await this.checkFilesystemHealth();
-        } catch (error) {
-            // Clean up any leaked loop devices
-            await this.cleanupLoopDevices(this.containerFile);
-            throw this.wrapError("restore BTRFS cache", error);
-        }
-    }
-
-    async save(): Promise<void> {
-        // Discover all mount information once
-        await this.discoverMountInfo();
-
-        if (!this.mountPoint) {
-            throw this.createError("Mount point not discovered");
-        }
-
-        this.logDebug(`Defragmenting + recompressing with ${this.saveCompressionLevel}`);
-        await exec.exec(
-            "sudo",
-            ["btrfs", "filesystem", "defragment", "-r", `-c${this.saveCompressionLevel}`, this.mountPoint],
-            { silent: !core.isDebug() }
-        );
-
-        this.logDebug(`Syncing and calculating used space`);
-        await exec.exec("sync", [], { silent: !core.isDebug() });
-
-        // Get used space and resize filesystem
-        let usedBytes = 0;
-        try {
-            const usageOutput = await this.getBtrfsUsage();
-            usedBytes = this.parseUsedBytes(usageOutput);
-        } catch (error) {
-            core.warning(
-                `Could not determine exact usage, using default buffer: ${error}`
-            );
-            usedBytes = 512 * 1024 * 1024; // 512MB default
-        }
-
-        const targetSize = usedBytes + this.bufferBytes;
-        const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
-
-        core.debug(`Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
-        await exec.exec(
-            "sudo",
-            ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint],
-            { silent: !core.isDebug() }
-        );
-
-        // Ensure all changes are written to disk before unmounting
-        await exec.exec("sync", [], { silent: !core.isDebug() });
-
-        // Unmount filesystem - the containerFile now points to the actual file with all data
-        await this.unmount();
-
-        // Resize backing file
-        this.logDebug(`Resizing backing file to ${targetMb} MB`);
-        await exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
-
-        // Additional sync and wait after unmount to ensure file is fully accessible
-        await exec.exec("sync", [], { silent: !core.isDebug() });
-
-        // Clean up loop devices after save
-        await this.cleanupLoopDevices(this.containerFile);
-
-        this.logDebug(
-            `Save completed. Container file ready for upload: ${this.containerFile}`
-        );
-    }
-
     private checkPathTraversal(base: string, pathToCheck: string): void {
         // Validate that the resolved path is within the base directory
         const absBase = path.resolve(base);
@@ -646,6 +776,9 @@ export class BtrfsContainer extends Container {
         );
     }
 
+    /**
+     * Mount the BTRFS image read-write (standard mode for population/save).
+     */
     private async mount(): Promise<void> {
         try {
             const tempDir = await createCacheKeySpecificTempDirectory(
@@ -662,51 +795,8 @@ export class BtrfsContainer extends Container {
                 ["loop", "rw", `compress=${this.compressionLevel}`]
             );
 
-            // Bind-mount each path so workspace points to BTRFS
-            const promises = this.pathsToCache.map(async p => {
-                if (!this.mountPoint) {
-                    throw new Error("Mount point is not set");
-                }
-
-                const absPath = path.join(this.baseDir, p);
-                const btrfsPath = path.join(this.mountPoint, p);
-
-                core.debug(`[BTRFS] Bind-mounting ${btrfsPath} → ${absPath}`);
-
-                try {
-                    await Promise.all([
-                        this.execSudo("mkdir", ["-p", btrfsPath]),
-                        this.execSudo("mkdir", ["-p", absPath])
-                    ]);
-
-                    // Set ownership to match the workspace directory
-                    const parentDir = path.dirname(absPath);
-                    await Promise.all([
-                        this.execSudo("chown", [
-                            "--reference",
-                            parentDir,
-                            absPath
-                        ]),
-                        this.execSudo("chown", [
-                            "--reference",
-                            this.baseDir,
-                            btrfsPath
-                        ])
-                    ]);
-
-                    // Bind mount: workspace points to BTRFS
-                    await this.mountWithErrorHandling(btrfsPath, absPath, [
-                        "bind"
-                    ]);
-                } catch (error) {
-                    throw new Error(
-                        `Failed to bind-mount ${btrfsPath} to ${absPath}: ${
-                            error instanceof Error ? error.message : error
-                        }`
-                    );
-                }
-            });
-            await Promise.all(promises);
+            // Bind-mount each path so workspace points to BTRFS (read-write)
+            await this.bindMountPaths(false);
         } catch (error) {
             // Clean up loop devices on mount failure
             await this.cleanupLoopDevices(this.containerFile);
@@ -716,6 +806,66 @@ export class BtrfsContainer extends Container {
                 }`
             );
         }
+    }
+
+    /**
+     * Bind-mount each cached path from the BTRFS mount to the workspace.
+     * @param readOnly If true, bind mounts are remounted read-only after initial bind.
+     */
+    private async bindMountPaths(readOnly: boolean): Promise<void> {
+        const promises = this.pathsToCache.map(async p => {
+            if (!this.mountPoint) {
+                throw new Error("Mount point is not set");
+            }
+
+            const absPath = path.join(this.baseDir, p);
+            const btrfsPath = path.join(this.mountPoint, p);
+
+            core.debug(`[BTRFS] Bind-mounting ${btrfsPath} → ${absPath}${readOnly ? " (ro)" : ""}`);
+
+            try {
+                await Promise.all([
+                    this.execSudo("mkdir", ["-p", btrfsPath]),
+                    this.execSudo("mkdir", ["-p", absPath])
+                ]);
+
+                // Set ownership to match the workspace directory
+                const parentDir = path.dirname(absPath);
+                await Promise.all([
+                    this.execSudo("chown", [
+                        "--reference",
+                        parentDir,
+                        absPath
+                    ]),
+                    this.execSudo("chown", [
+                        "--reference",
+                        this.baseDir,
+                        btrfsPath
+                    ])
+                ]);
+
+                // Bind mount: workspace points to BTRFS
+                await this.mountWithErrorHandling(btrfsPath, absPath, [
+                    "bind"
+                ]);
+
+                // Remount read-only if requested
+                if (readOnly) {
+                    await this.mountWithErrorHandling(btrfsPath, absPath, [
+                        "bind",
+                        "remount",
+                        "ro"
+                    ]);
+                }
+            } catch (error) {
+                throw new Error(
+                    `Failed to bind-mount ${btrfsPath} to ${absPath}: ${
+                        error instanceof Error ? error.message : error
+                    }`
+                );
+            }
+        });
+        await Promise.all(promises);
     }
 
     private async unmount(): Promise<void> {

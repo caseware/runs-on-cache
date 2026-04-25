@@ -95108,7 +95108,9 @@ var Inputs;
     Inputs["Sync"] = "sync";
     Inputs["FsSize"] = "fs-size";
     Inputs["FsBufferMB"] = "fs-buffer-mb";
-    Inputs["SaveCompressionLevel"] = "save-compression-level"; // Input for btrfs defrag compression before upload
+    Inputs["SaveCompressionLevel"] = "save-compression-level";
+    Inputs["NodeLocalCacheDir"] = "node-local-cache-dir";
+    Inputs["MountMode"] = "mount-mode"; // Input for mount mode: "ro" (read-only, default for node_modules) or "rw" (read-write, for mutable caches)
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {
@@ -95522,24 +95524,33 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
         const bufferMb = parseInt(core.getInput(constants_1.Inputs.FsBufferMB) || "2048");
         core.debug(`Using bufferMb: ${bufferMb}`);
         const saveCompressionLevel = core.getInput(constants_1.Inputs.SaveCompressionLevel) || undefined;
+        const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
+        const mountMode = (core.getInput(constants_1.Inputs.MountMode) || "ro");
         let cacheContainer = undefined;
         try {
             const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
             core.debug(`Using baseDir: ${baseDir}`);
             archivePath = path.join(yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(primaryKey), (0, actionUtils_1.getCacheFileName)(compressionMethod));
             core.debug(`Archive Path: ${archivePath}`);
+            cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode });
+            // Initialize container (prerequisite checks, stale temp cleanup)
+            yield cacheContainer.initialize();
+            // Try node-local restore first (fast path: ~1-2s on warm node)
+            const restoredFromLocal = yield cacheContainer.tryRestoreFromNodeLocal();
+            if (restoredFromLocal) {
+                core.info("Cache restored from node-local storage (fast path)");
+                return primaryKey;
+            }
             // path are needed to compute version
             const cacheEntry = yield cacheHttpClient.getCacheEntry(keys, paths, {
                 compressionMethod,
                 enableCrossOsArchive
             });
-            cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb, saveCompressionLevel });
             core.debug(`Cache Entry: ${JSON.stringify(cacheEntry)}`);
             if (!(cacheEntry === null || cacheEntry === void 0 ? void 0 : cacheEntry.archiveLocation)) {
                 // Cache not found
                 core.debug("Cache not found");
                 if (cacheContainer && cacheContainer.requiresCreateEmptyCache) {
-                    yield cacheContainer.initialize();
                     yield cacheContainer.createEmptyCache();
                     core.debug(`Created empty cache container of type ${cacheContainer.constructor.name}`);
                 }
@@ -95561,9 +95572,8 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             }
             const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
             core.info(`Cache Size: ~${Math.round(archiveFileSize / (1024 * 1024))} MB (${archiveFileSize} B)`);
-            yield cacheContainer.initialize();
             yield cacheContainer.restore();
-            core.info("Cache restored successfully");
+            core.info("Cache restored successfully from S3");
             return cacheEntry.cacheKey;
         }
         catch (error) {
@@ -95669,18 +95679,26 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
             const fsSize = core.getInput(constants_1.Inputs.FsSize) || "50G";
             const bufferMb = parseInt(core.getInput(constants_1.Inputs.FsBufferMB) || "2048");
             const saveCompressionLevel = core.getInput(constants_1.Inputs.SaveCompressionLevel) || undefined;
-            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, key, { fsSize, bufferMb, saveCompressionLevel });
+            const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
+            const mountMode = (core.getInput(constants_1.Inputs.MountMode) || "ro");
+            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, key, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode });
             yield cacheContainer.initialize();
             yield cacheContainer.save();
-            const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
-            core.info(`File Size: ${archiveFileSize}`);
-            yield cacheHttpClient.saveCache(key, paths, archivePath, {
-                compressionMethod,
-                enableCrossOsArchive,
-                cacheSize: archiveFileSize
-            });
-            // dummy cacheId, if we get there without raising, it means the cache has been saved
-            cacheId = 1;
+            // Skip S3 upload if the container was restored from node-local storage (WORM)
+            if (cacheContainer.shouldSkipS3Upload()) {
+                core.info("Skipping S3 upload — restored from node-local cache (WORM)");
+                cacheId = 1;
+            }
+            else {
+                const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
+                core.info(`File Size: ${archiveFileSize}`);
+                yield cacheHttpClient.saveCache(key, paths, archivePath, {
+                    compressionMethod,
+                    enableCrossOsArchive,
+                    cacheSize: archiveFileSize
+                });
+                cacheId = 1;
+            }
         }
         catch (error) {
             const typedError = error;
@@ -96453,6 +96471,7 @@ const fs = __importStar(__nccwpck_require__(3292));
 const path = __importStar(__nccwpck_require__(1017));
 const actionUtils_1 = __nccwpck_require__(6850);
 const Container_1 = __nccwpck_require__(9620);
+const NodeLocalCache_1 = __nccwpck_require__(8033);
 const MOUNT_TIMEOUT_MS = 30000;
 const MIN_DISK_HEADROOM_MB = 1024;
 class BtrfsContainer extends Container_1.Container {
@@ -96465,6 +96484,10 @@ class BtrfsContainer extends Container_1.Container {
         super(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options);
         this.requiresCreateEmptyCache = true;
         this.requiresKeepArchive = true;
+        /**
+         * Tracks whether restore used a node-local image (skip S3 upload on save).
+         */
+        this.restoredFromNodeLocal = false;
         if (!options.fsSize) {
             throw new Error("fsSize option is required for BtrfsContainer");
         }
@@ -96473,6 +96496,8 @@ class BtrfsContainer extends Container_1.Container {
         // Use higher compression for save (upload) to minimize image size.
         // Restore decompresses on-demand, so higher save compression = smaller image + same read perf.
         this.saveCompressionLevel = options.saveCompressionLevel || "zstd:9";
+        this.mountMode = options.mountMode || "ro";
+        this.nodeLocal = new NodeLocalCache_1.NodeLocalCache(options.nodeLocalCacheDir || "", cacheKey, ".btrfs");
         // Security input validations
         this.checkPathTraversal(this.baseDir, this.containerFile);
         this.pathsToCache.forEach(pathToCheck => this.checkPathTraversal(this.baseDir, pathToCheck));
@@ -96496,6 +96521,8 @@ class BtrfsContainer extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             try {
                 yield this.checkPrerequisites();
+                // Clean up stale temp files at the start of every job
+                yield this.nodeLocal.cleanupStaleTempFiles();
             }
             catch (e) {
                 core.setFailed(e.message);
@@ -96507,6 +96534,189 @@ class BtrfsContainer extends Container_1.Container {
     getLogPrefix() {
         return "[BTRFS]";
     }
+    // ── Node-local restore (hot path) ────────────────────────────────
+    /**
+     * Check if a node-local BTRFS image exists for this cache key.
+     * This is the fast path: mount directly from the node's HostPath volume (~1-2s).
+     */
+    tryRestoreFromNodeLocal() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.nodeLocal.enabled)
+                return false;
+            const localExists = yield this.nodeLocal.exists();
+            if (!localExists)
+                return false;
+            const localPath = this.nodeLocal.localPath;
+            this.logInfo(`Node-local cache hit — mounting from ${localPath}`);
+            // Verify integrity before mounting
+            const isHealthy = yield this.verifyImageIntegrity(localPath);
+            if (!isHealthy) {
+                this.logInfo("Node-local image corrupted — falling back to S3");
+                return false;
+            }
+            try {
+                if (this.mountMode === "rw") {
+                    // Copy to job-local location before mounting read-write
+                    yield this.copyAndMountReadWrite(localPath);
+                }
+                else {
+                    // Mount read-only directly from the shared node-local image
+                    yield this.mountReadOnly(localPath);
+                }
+                this.restoredFromNodeLocal = true;
+                return true;
+            }
+            catch (error) {
+                core.warning(`${this.getLogPrefix()} Node-local mount failed, falling back to S3: ${error instanceof Error ? error.message : error}`);
+                return false;
+            }
+        });
+    }
+    /**
+     * Mount a BTRFS image read-only and bind-mount paths to the workspace.
+     * Used for node_modules and other immutable caches.
+     */
+    mountReadOnly(imageFile) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
+            this.mountPoint = path.join(tempDir, "mount");
+            yield fs.mkdir(this.mountPoint, { recursive: true });
+            this.logInfo(`Mounting read-only: ${imageFile} → ${this.mountPoint}`);
+            yield this.mountWithErrorHandling(imageFile, this.mountPoint, ["loop", "ro", `compress=${this.compressionLevel}`]);
+            // Bind-mount each path read-only to the workspace
+            yield this.bindMountPaths(true);
+            yield this.checkFilesystemHealth();
+        });
+    }
+    /**
+     * Copy the BTRFS image to a job-local temp directory, then mount read-write.
+     * Used for mutable caches (e.g., sparse git repos).
+     */
+    copyAndMountReadWrite(imageFile) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
+            const localCopy = path.join(tempDir, "cache.btrfs");
+            this.logInfo(`Copying for RW mount: ${imageFile} → ${localCopy}`);
+            yield fs.copyFile(imageFile, localCopy);
+            // Update containerFile to the local copy so save() operates on the right file
+            this.containerFile = localCopy;
+            yield this.mount();
+        });
+    }
+    // ── Standard restore (S3 download path) ──────────────────────────
+    restore() {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                // Verify image integrity before mounting
+                const isHealthy = yield this.verifyImageIntegrity(this.containerFile);
+                if (!isHealthy) {
+                    this.logInfo("Corrupted image detected — falling back to empty cache");
+                    return this.createEmptyCache();
+                }
+                // If node-local is enabled, persist the S3 download to the node
+                if (this.nodeLocal.enabled) {
+                    yield this.nodeLocal.persistFromS3Download(this.containerFile);
+                }
+                if (this.mountMode === "ro") {
+                    // Mount the downloaded image read-only
+                    yield this.mountReadOnly(this.containerFile);
+                }
+                else {
+                    // Standard read-write mount
+                    yield this.mount();
+                    yield this.checkFilesystemHealth();
+                }
+            }
+            catch (error) {
+                // Clean up any leaked loop devices
+                yield this.cleanupLoopDevices(this.containerFile);
+                throw this.wrapError("restore BTRFS cache", error);
+            }
+        });
+    }
+    createEmptyCache() {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                // Calculate optimal sparse file size based on available disk space
+                const effectiveSize = yield this.calculateSparseSize();
+                // Create new empty cache image
+                this.logInfo(`Creating sparse image: ${this.containerFile} (virtual size: ${effectiveSize})`);
+                yield exec.exec("truncate", [
+                    "-s",
+                    effectiveSize,
+                    this.containerFile
+                ]);
+                // Format with BTRFS
+                this.logInfo(`Formatting image with BTRFS`);
+                yield exec.exec("mkfs.btrfs", ["-f", this.containerFile], {
+                    silent: !core.isDebug()
+                });
+                // Mount the filesystem so workspace operations write directly to it
+                return this.mount();
+            }
+            catch (error) {
+                // Clean up loop devices on failure
+                yield this.cleanupLoopDevices(this.containerFile);
+                throw this.wrapError("create empty BTRFS cache", error);
+            }
+        });
+    }
+    save() {
+        return __awaiter(this, void 0, void 0, function* () {
+            // If restored from read-only node-local mount, skip save entirely
+            // (WORM: the image was already committed and is immutable)
+            if (this.restoredFromNodeLocal && this.mountMode === "ro") {
+                this.logInfo("Skipping save — restored from node-local read-only image (WORM)");
+                return;
+            }
+            // Discover all mount information once
+            yield this.discoverMountInfo();
+            if (!this.mountPoint) {
+                throw this.createError("Mount point not discovered");
+            }
+            this.logDebug(`Defragmenting + recompressing with ${this.saveCompressionLevel}`);
+            yield exec.exec("sudo", ["btrfs", "filesystem", "defragment", "-r", `-c${this.saveCompressionLevel}`, this.mountPoint], { silent: !core.isDebug() });
+            this.logDebug(`Syncing and calculating used space`);
+            yield exec.exec("sync", [], { silent: !core.isDebug() });
+            // Get used space and resize filesystem
+            let usedBytes = 0;
+            try {
+                const usageOutput = yield this.getBtrfsUsage();
+                usedBytes = this.parseUsedBytes(usageOutput);
+            }
+            catch (error) {
+                core.warning(`Could not determine exact usage, using default buffer: ${error}`);
+                usedBytes = 512 * 1024 * 1024; // 512MB default
+            }
+            const targetSize = usedBytes + this.bufferBytes;
+            const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
+            core.debug(`Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
+            yield exec.exec("sudo", ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint], { silent: !core.isDebug() });
+            // Ensure all changes are written to disk before unmounting
+            yield exec.exec("sync", [], { silent: !core.isDebug() });
+            // Unmount filesystem - the containerFile now points to the actual file with all data
+            yield this.unmount();
+            // Resize backing file
+            this.logDebug(`Resizing backing file to ${targetMb} MB`);
+            yield exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
+            // Additional sync and wait after unmount to ensure file is fully accessible
+            yield exec.exec("sync", [], { silent: !core.isDebug() });
+            // Clean up loop devices after save
+            yield this.cleanupLoopDevices(this.containerFile);
+            // If node-local is enabled, atomically persist the image to the node
+            if (this.nodeLocal.enabled) {
+                yield this.nodeLocal.persistFromS3Download(this.containerFile);
+            }
+            this.logDebug(`Save completed. Container file ready for upload: ${this.containerFile}`);
+        });
+    }
+    /**
+     * Whether the S3 upload should be skipped because the node already has the image.
+     */
+    shouldSkipS3Upload() {
+        return this.restoredFromNodeLocal && this.mountMode === "ro";
+    }
+    // ── Private helpers ──────────────────────────────────────────────
     execWithOutput(command, args) {
         return __awaiter(this, void 0, void 0, function* () {
             let output = "";
@@ -96745,92 +96955,6 @@ class BtrfsContainer extends Container_1.Container {
             }
         });
     }
-    createEmptyCache() {
-        return __awaiter(this, void 0, void 0, function* () {
-            try {
-                // Calculate optimal sparse file size based on available disk space
-                const effectiveSize = yield this.calculateSparseSize();
-                // Create new empty cache image
-                this.logInfo(`Creating sparse image: ${this.containerFile} (virtual size: ${effectiveSize})`);
-                yield exec.exec("truncate", [
-                    "-s",
-                    effectiveSize,
-                    this.containerFile
-                ]);
-                // Format with BTRFS
-                this.logInfo(`Formatting image with BTRFS`);
-                yield exec.exec("mkfs.btrfs", ["-f", this.containerFile], {
-                    silent: !core.isDebug()
-                });
-                // Mount the filesystem so workspace operations write directly to it
-                return this.mount();
-            }
-            catch (error) {
-                // Clean up loop devices on failure
-                yield this.cleanupLoopDevices(this.containerFile);
-                throw this.wrapError("create empty BTRFS cache", error);
-            }
-        });
-    }
-    restore() {
-        return __awaiter(this, void 0, void 0, function* () {
-            try {
-                // Verify image integrity before mounting
-                const isHealthy = yield this.verifyImageIntegrity(this.containerFile);
-                if (!isHealthy) {
-                    this.logInfo("Corrupted image detected — falling back to empty cache");
-                    return this.createEmptyCache();
-                }
-                yield this.mount();
-                // Check filesystem health after mount
-                yield this.checkFilesystemHealth();
-            }
-            catch (error) {
-                // Clean up any leaked loop devices
-                yield this.cleanupLoopDevices(this.containerFile);
-                throw this.wrapError("restore BTRFS cache", error);
-            }
-        });
-    }
-    save() {
-        return __awaiter(this, void 0, void 0, function* () {
-            // Discover all mount information once
-            yield this.discoverMountInfo();
-            if (!this.mountPoint) {
-                throw this.createError("Mount point not discovered");
-            }
-            this.logDebug(`Defragmenting + recompressing with ${this.saveCompressionLevel}`);
-            yield exec.exec("sudo", ["btrfs", "filesystem", "defragment", "-r", `-c${this.saveCompressionLevel}`, this.mountPoint], { silent: !core.isDebug() });
-            this.logDebug(`Syncing and calculating used space`);
-            yield exec.exec("sync", [], { silent: !core.isDebug() });
-            // Get used space and resize filesystem
-            let usedBytes = 0;
-            try {
-                const usageOutput = yield this.getBtrfsUsage();
-                usedBytes = this.parseUsedBytes(usageOutput);
-            }
-            catch (error) {
-                core.warning(`Could not determine exact usage, using default buffer: ${error}`);
-                usedBytes = 512 * 1024 * 1024; // 512MB default
-            }
-            const targetSize = usedBytes + this.bufferBytes;
-            const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
-            core.debug(`Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
-            yield exec.exec("sudo", ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint], { silent: !core.isDebug() });
-            // Ensure all changes are written to disk before unmounting
-            yield exec.exec("sync", [], { silent: !core.isDebug() });
-            // Unmount filesystem - the containerFile now points to the actual file with all data
-            yield this.unmount();
-            // Resize backing file
-            this.logDebug(`Resizing backing file to ${targetMb} MB`);
-            yield exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
-            // Additional sync and wait after unmount to ensure file is fully accessible
-            yield exec.exec("sync", [], { silent: !core.isDebug() });
-            // Clean up loop devices after save
-            yield this.cleanupLoopDevices(this.containerFile);
-            this.logDebug(`Save completed. Container file ready for upload: ${this.containerFile}`);
-        });
-    }
     checkPathTraversal(base, pathToCheck) {
         // Validate that the resolved path is within the base directory
         const absBase = path.resolve(base);
@@ -96955,6 +97079,9 @@ class BtrfsContainer extends Container_1.Container {
                 `Make sure the cache was properly initialized and mounted first.`);
         });
     }
+    /**
+     * Mount the BTRFS image read-write (standard mode for population/save).
+     */
     mount() {
         return __awaiter(this, void 0, void 0, function* () {
             try {
@@ -96964,49 +97091,66 @@ class BtrfsContainer extends Container_1.Container {
                 yield fs.mkdir(this.mountPoint, { recursive: true });
                 core.debug(`[BTRFS] Mounting image to ${this.mountPoint}`);
                 yield this.mountWithErrorHandling(this.containerFile, this.mountPoint, ["loop", "rw", `compress=${this.compressionLevel}`]);
-                // Bind-mount each path so workspace points to BTRFS
-                const promises = this.pathsToCache.map((p) => __awaiter(this, void 0, void 0, function* () {
-                    if (!this.mountPoint) {
-                        throw new Error("Mount point is not set");
-                    }
-                    const absPath = path.join(this.baseDir, p);
-                    const btrfsPath = path.join(this.mountPoint, p);
-                    core.debug(`[BTRFS] Bind-mounting ${btrfsPath} → ${absPath}`);
-                    try {
-                        yield Promise.all([
-                            this.execSudo("mkdir", ["-p", btrfsPath]),
-                            this.execSudo("mkdir", ["-p", absPath])
-                        ]);
-                        // Set ownership to match the workspace directory
-                        const parentDir = path.dirname(absPath);
-                        yield Promise.all([
-                            this.execSudo("chown", [
-                                "--reference",
-                                parentDir,
-                                absPath
-                            ]),
-                            this.execSudo("chown", [
-                                "--reference",
-                                this.baseDir,
-                                btrfsPath
-                            ])
-                        ]);
-                        // Bind mount: workspace points to BTRFS
-                        yield this.mountWithErrorHandling(btrfsPath, absPath, [
-                            "bind"
-                        ]);
-                    }
-                    catch (error) {
-                        throw new Error(`Failed to bind-mount ${btrfsPath} to ${absPath}: ${error instanceof Error ? error.message : error}`);
-                    }
-                }));
-                yield Promise.all(promises);
+                // Bind-mount each path so workspace points to BTRFS (read-write)
+                yield this.bindMountPaths(false);
             }
             catch (error) {
                 // Clean up loop devices on mount failure
                 yield this.cleanupLoopDevices(this.containerFile);
                 throw new Error(`Failed to mount BTRFS filesystem: ${error instanceof Error ? error.message : error}`);
             }
+        });
+    }
+    /**
+     * Bind-mount each cached path from the BTRFS mount to the workspace.
+     * @param readOnly If true, bind mounts are remounted read-only after initial bind.
+     */
+    bindMountPaths(readOnly) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const promises = this.pathsToCache.map((p) => __awaiter(this, void 0, void 0, function* () {
+                if (!this.mountPoint) {
+                    throw new Error("Mount point is not set");
+                }
+                const absPath = path.join(this.baseDir, p);
+                const btrfsPath = path.join(this.mountPoint, p);
+                core.debug(`[BTRFS] Bind-mounting ${btrfsPath} → ${absPath}${readOnly ? " (ro)" : ""}`);
+                try {
+                    yield Promise.all([
+                        this.execSudo("mkdir", ["-p", btrfsPath]),
+                        this.execSudo("mkdir", ["-p", absPath])
+                    ]);
+                    // Set ownership to match the workspace directory
+                    const parentDir = path.dirname(absPath);
+                    yield Promise.all([
+                        this.execSudo("chown", [
+                            "--reference",
+                            parentDir,
+                            absPath
+                        ]),
+                        this.execSudo("chown", [
+                            "--reference",
+                            this.baseDir,
+                            btrfsPath
+                        ])
+                    ]);
+                    // Bind mount: workspace points to BTRFS
+                    yield this.mountWithErrorHandling(btrfsPath, absPath, [
+                        "bind"
+                    ]);
+                    // Remount read-only if requested
+                    if (readOnly) {
+                        yield this.mountWithErrorHandling(btrfsPath, absPath, [
+                            "bind",
+                            "remount",
+                            "ro"
+                        ]);
+                    }
+                }
+                catch (error) {
+                    throw new Error(`Failed to bind-mount ${btrfsPath} to ${absPath}: ${error instanceof Error ? error.message : error}`);
+                }
+            }));
+            yield Promise.all(promises);
         });
     }
     unmount() {
@@ -97118,6 +97262,22 @@ class Container {
     createEmptyCache() {
         return __awaiter(this, void 0, void 0, function* () { });
     }
+    /**
+     * Try to restore from a node-local persistent cache.
+     * Returns true if restored from node-local, false if S3 download is needed.
+     * Default implementation returns false (no node-local support).
+     */
+    tryRestoreFromNodeLocal() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return false;
+        });
+    }
+    /**
+     * Whether the S3 upload should be skipped (e.g., restored from node-local read-only).
+     */
+    shouldSkipS3Upload() {
+        return false;
+    }
     // Common helper methods for all container implementations
     wrapError(operation, error) {
         return new Error(`Failed to ${operation}: ${error instanceof Error ? error.message : error}`);
@@ -97177,11 +97337,285 @@ exports.ContainerFactory = ContainerFactory;
 
 /***/ }),
 
+/***/ 8033:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.NodeLocalCache = void 0;
+const core = __importStar(__nccwpck_require__(2186));
+const fs = __importStar(__nccwpck_require__(3292));
+const path = __importStar(__nccwpck_require__(1017));
+const crypto = __importStar(__nccwpck_require__(6113));
+const STALE_TEMP_FILE_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
+/**
+ * NodeLocalCache provides node-level persistent caching via a HostPath-mounted directory.
+ *
+ * Architecture:
+ *   /opt/local-volumes/btrfs-cache/   (HostPath mount on EKS nodes)
+ *     ├── <cache-key>.btrfs           (final WORM images)
+ *     ├── <cache-key>.tar.lz4         (final tar archives)
+ *     └── .temp<random>.btrfs         (in-progress population, cleaned after 12h)
+ *
+ * Flow:
+ *   1. Check if node-local file exists for the cache key → instant mount (~1-2s)
+ *   2. If missing, download from S3 → write to .tempXXX → atomic mv → mount
+ *   3. Prune stale .temp* files older than 12 hours
+ *
+ * This class is shared by BtrfsContainer, VhdxContainer, TarLz4Container, and TarContainer.
+ */
+class NodeLocalCache {
+    constructor(cacheDir, cacheKey, extension) {
+        this.cacheDir = cacheDir;
+        this.cacheKey = cacheKey;
+        this.extension = extension;
+    }
+    /**
+     * Whether node-local caching is enabled (non-empty cacheDir).
+     */
+    get enabled() {
+        return this.cacheDir.length > 0;
+    }
+    /**
+     * The final path for this cache key on the node.
+     * e.g. /opt/local-volumes/btrfs-cache/<cache-key>.btrfs
+     */
+    get localPath() {
+        return path.join(this.cacheDir, `${this.sanitizeKey(this.cacheKey)}${this.extension}`);
+    }
+    /**
+     * Check if a node-local image already exists for this cache key.
+     */
+    exists() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.enabled)
+                return false;
+            try {
+                yield fs.access(this.localPath);
+                core.info(`[NodeLocal] Cache hit: ${this.localPath}`);
+                return true;
+            }
+            catch (_a) {
+                core.debug(`[NodeLocal] Cache miss: ${this.localPath}`);
+                return false;
+            }
+        });
+    }
+    /**
+     * Create a temp file path for atomic population.
+     * Returns the path to write to before calling commitTempFile().
+     */
+    createTempFile() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.enabled) {
+                throw new Error("[NodeLocal] Cannot create temp file — node-local caching is disabled");
+            }
+            yield fs.mkdir(this.cacheDir, { recursive: true });
+            const randomSuffix = crypto.randomBytes(8).toString("hex");
+            const tempPath = path.join(this.cacheDir, `.temp${randomSuffix}${this.extension}`);
+            core.debug(`[NodeLocal] Created temp path: ${tempPath}`);
+            return tempPath;
+        });
+    }
+    /**
+     * Atomically move the temp file to the final cache location.
+     * If another runner already placed a file there, silently succeeds
+     * (the temp file is removed and we use the existing one).
+     *
+     * Returns true if this runner "won" the race, false if another runner beat us.
+     */
+    commitTempFile(tempPath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.enabled)
+                return false;
+            const finalPath = this.localPath;
+            try {
+                // Check if final path already exists (another runner beat us)
+                try {
+                    yield fs.access(finalPath);
+                    // Another runner already placed it — clean up our temp and move on
+                    core.info(`[NodeLocal] Another runner already populated ${finalPath} — skipping`);
+                    yield this.removeSafe(tempPath);
+                    return false;
+                }
+                catch (_a) {
+                    // Good — no existing file, we proceed with the mv
+                }
+                // Atomic rename: .tempXXX → <cache-key>.ext
+                yield fs.rename(tempPath, finalPath);
+                core.info(`[NodeLocal] Committed: ${finalPath}`);
+                return true;
+            }
+            catch (error) {
+                // rename can fail with ENOTEMPTY or EEXIST on race — that's fine
+                const code = error.code;
+                if (code === "ENOTEMPTY" || code === "EEXIST") {
+                    core.info(`[NodeLocal] Race detected on commit — another runner won. Cleaning up.`);
+                    yield this.removeSafe(tempPath);
+                    return false;
+                }
+                // Unexpected error — log but don't fail the job
+                core.warning(`[NodeLocal] Failed to commit temp file: ${error instanceof Error ? error.message : error}`);
+                yield this.removeSafe(tempPath);
+                return false;
+            }
+        });
+    }
+    /**
+     * Copy the S3-downloaded archive to the node-local cache directory as a temp file,
+     * then atomically commit it. Returns true if the file was persisted.
+     */
+    persistFromS3Download(s3ArchivePath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.enabled)
+                return false;
+            // Early check: skip if already populated by another runner
+            if (yield this.exists()) {
+                core.info(`[NodeLocal] Already populated by another runner — skipping persist`);
+                return false;
+            }
+            try {
+                const tempPath = yield this.createTempFile();
+                yield fs.copyFile(s3ArchivePath, tempPath);
+                core.info(`[NodeLocal] Copied S3 download to temp: ${tempPath}`);
+                return yield this.commitTempFile(tempPath);
+            }
+            catch (error) {
+                core.warning(`[NodeLocal] Failed to persist S3 download: ${error instanceof Error ? error.message : error}`);
+                return false;
+            }
+        });
+    }
+    /**
+     * Clean up stale .temp* files older than 12 hours.
+     * Should be called at the start of every job.
+     */
+    cleanupStaleTempFiles() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.enabled)
+                return 0;
+            let cleaned = 0;
+            try {
+                const entries = yield fs.readdir(this.cacheDir);
+                const now = Date.now();
+                for (const entry of entries) {
+                    if (!entry.startsWith(".temp"))
+                        continue;
+                    const fullPath = path.join(this.cacheDir, entry);
+                    try {
+                        const stat = yield fs.stat(fullPath);
+                        const ageMs = now - stat.mtimeMs;
+                        if (ageMs > STALE_TEMP_FILE_AGE_MS) {
+                            core.info(`[NodeLocal] Removing stale temp file (${Math.floor(ageMs / 3600000)}h old): ${entry}`);
+                            yield this.removeSafe(fullPath);
+                            cleaned++;
+                        }
+                    }
+                    catch (_a) {
+                        // stat failed — file may have been cleaned by another runner
+                    }
+                }
+                if (cleaned > 0) {
+                    core.info(`[NodeLocal] Cleaned ${cleaned} stale temp file(s)`);
+                }
+            }
+            catch (error) {
+                // Cache dir may not exist yet — that's fine
+                core.debug(`[NodeLocal] Cleanup skipped: ${error instanceof Error ? error.message : error}`);
+            }
+            return cleaned;
+        });
+    }
+    /**
+     * Sanitize cache key to be safe as a filename.
+     * Replaces path separators and special characters with hyphens.
+     */
+    sanitizeKey(key) {
+        return key.replace(/[/\\:*?"<>|]/g, "-");
+    }
+    /**
+     * Safely remove a file, ignoring ENOENT.
+     */
+    removeSafe(filePath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                yield fs.unlink(filePath);
+            }
+            catch (error) {
+                const code = error.code;
+                if (code !== "ENOENT") {
+                    core.debug(`[NodeLocal] Failed to remove ${filePath}: ${error}`);
+                }
+            }
+        });
+    }
+}
+exports.NodeLocalCache = NodeLocalCache;
+
+
+/***/ }),
+
 /***/ 7332:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 "use strict";
 
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -97194,12 +97628,45 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.TarContainer = void 0;
 const tar_1 = __nccwpck_require__(6490);
+const core = __importStar(__nccwpck_require__(2186));
 const Container_1 = __nccwpck_require__(9620);
+const NodeLocalCache_1 = __nccwpck_require__(8033);
 class TarContainer extends Container_1.Container {
     constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
         super(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options);
         this.requiresCreateEmptyCache = false;
         this.requiresKeepArchive = false;
+        this.restoredFromNodeLocal = false;
+        this.nodeLocal = new NodeLocalCache_1.NodeLocalCache(options.nodeLocalCacheDir || "", cacheKey, ".tar");
+    }
+    initialize() {
+        return __awaiter(this, void 0, void 0, function* () {
+            yield this.nodeLocal.cleanupStaleTempFiles();
+        });
+    }
+    tryRestoreFromNodeLocal() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.nodeLocal.enabled)
+                return false;
+            const localExists = yield this.nodeLocal.exists();
+            if (!localExists)
+                return false;
+            const localPath = this.nodeLocal.localPath;
+            this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
+            try {
+                this.containerFile = localPath;
+                yield this.restore();
+                this.restoredFromNodeLocal = true;
+                return true;
+            }
+            catch (error) {
+                core.warning(`${this.getLogPrefix()} Node-local restore failed, falling back to S3: ${error instanceof Error ? error.message : error}`);
+                return false;
+            }
+        });
+    }
+    shouldSkipS3Upload() {
+        return this.restoredFromNodeLocal;
     }
     getLogPrefix() {
         return "[TAR]";
@@ -97210,6 +97677,10 @@ class TarContainer extends Container_1.Container {
     restore() {
         return __awaiter(this, void 0, void 0, function* () {
             try {
+                // Persist to node-local cache if enabled (after S3 download)
+                if (this.nodeLocal.enabled && !this.restoredFromNodeLocal) {
+                    yield this.nodeLocal.persistFromS3Download(this.containerFile);
+                }
                 return (0, tar_1.extractTar)(this.containerFile, this.compressionMethod);
             }
             catch (error) {
@@ -97278,11 +97749,44 @@ const core = __importStar(__nccwpck_require__(2186));
 const child_process_1 = __nccwpck_require__(2081);
 const path_1 = __nccwpck_require__(1017);
 const Container_1 = __nccwpck_require__(9620);
+const NodeLocalCache_1 = __nccwpck_require__(8033);
 class TarLz4Container extends Container_1.Container {
     constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
         super(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options);
         this.requiresCreateEmptyCache = false;
         this.requiresKeepArchive = false;
+        this.restoredFromNodeLocal = false;
+        this.nodeLocal = new NodeLocalCache_1.NodeLocalCache(options.nodeLocalCacheDir || "", cacheKey, ".tar.lz4");
+    }
+    initialize() {
+        return __awaiter(this, void 0, void 0, function* () {
+            yield this.nodeLocal.cleanupStaleTempFiles();
+        });
+    }
+    tryRestoreFromNodeLocal() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.nodeLocal.enabled)
+                return false;
+            const localExists = yield this.nodeLocal.exists();
+            if (!localExists)
+                return false;
+            const localPath = this.nodeLocal.localPath;
+            this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
+            try {
+                // Point containerFile to the node-local archive and restore from it
+                this.containerFile = localPath;
+                yield this.restore();
+                this.restoredFromNodeLocal = true;
+                return true;
+            }
+            catch (error) {
+                core.warning(`${this.getLogPrefix()} Node-local restore failed, falling back to S3: ${error instanceof Error ? error.message : error}`);
+                return false;
+            }
+        });
+    }
+    shouldSkipS3Upload() {
+        return this.restoredFromNodeLocal;
     }
     getLogPrefix() {
         return "[TAR-LZ4]";
@@ -97293,6 +97797,10 @@ class TarLz4Container extends Container_1.Container {
     restore() {
         return __awaiter(this, void 0, void 0, function* () {
             try {
+                // Persist to node-local cache if enabled (after S3 download)
+                if (this.nodeLocal.enabled && !this.restoredFromNodeLocal) {
+                    yield this.nodeLocal.persistFromS3Download(this.containerFile);
+                }
                 if (this.compressionMethod && process.platform !== "win32") {
                     const compressionArgs = this.compressionMethod === "none"
                         ? ""
@@ -97371,9 +97879,9 @@ class TarLz4Container extends Container_1.Container {
                     // Combine all arguments into the command
                     const command = `"${tarPath}" ${args.join(" ")} ${quotedCachePaths.join(" ")}`;
                     this.logInfo(`Executing command: ${command}`);
-                    const output = (0, child_process_1.execSync)(command, { stdio: "inherit" });
-                    if (output && output.length > 0) {
-                        this.logDebug(output.toString());
+                    const output2 = (0, child_process_1.execSync)(command, { stdio: "inherit" });
+                    if (output2 && output2.length > 0) {
+                        this.logDebug(output2.toString());
                     }
                 }
                 else {
@@ -97443,6 +97951,7 @@ const fs = __importStar(__nccwpck_require__(3292));
 const path = __importStar(__nccwpck_require__(1017));
 const actionUtils_1 = __nccwpck_require__(6850);
 const Container_1 = __nccwpck_require__(9620);
+const NodeLocalCache_1 = __nccwpck_require__(8033);
 const MOUNT_TIMEOUT_MS = 60000;
 const MIN_DISK_HEADROOM_MB = 1024;
 /**
@@ -97461,11 +97970,13 @@ class VhdxContainer extends Container_1.Container {
         super(containerFile, compressionMethod, compressionLevel !== null && compressionLevel !== void 0 ? compressionLevel : "ntfs", baseDir, pathsToCache, cacheKey, options);
         this.requiresCreateEmptyCache = true;
         this.requiresKeepArchive = true;
+        this.restoredFromNodeLocal = false;
         if (!options.fsSize) {
             throw new Error("fsSize option is required for VhdxContainer");
         }
         this.fsSize = options.fsSize;
         this.bufferBytes = ((_a = options.bufferMb) !== null && _a !== void 0 ? _a : 512) * 1024 * 1024;
+        this.nodeLocal = new NodeLocalCache_1.NodeLocalCache(options.nodeLocalCacheDir || "", cacheKey, ".vhdx");
         // Security: validate paths
         this.checkPathTraversal(this.baseDir, this.containerFile);
         this.pathsToCache.forEach(p => this.checkPathTraversal(this.baseDir, p));
@@ -97481,12 +97992,41 @@ class VhdxContainer extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             try {
                 yield this.checkPrerequisites();
+                yield this.nodeLocal.cleanupStaleTempFiles();
             }
             catch (e) {
                 core.setFailed(e.message);
                 process.exit(1);
             }
         });
+    }
+    tryRestoreFromNodeLocal() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.nodeLocal.enabled)
+                return false;
+            const localExists = yield this.nodeLocal.exists();
+            if (!localExists)
+                return false;
+            const localPath = this.nodeLocal.localPath;
+            this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
+            try {
+                // Copy to job-local location (VHDX mount always needs write access for junction setup)
+                const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
+                const localCopy = path.join(tempDir, "cache.vhdx");
+                yield fs.copyFile(localPath, localCopy);
+                this.containerFile = localCopy;
+                yield this.restore();
+                this.restoredFromNodeLocal = true;
+                return true;
+            }
+            catch (error) {
+                core.warning(`${this.getLogPrefix()} Node-local restore failed, falling back to S3: ${error instanceof Error ? error.message : error}`);
+                return false;
+            }
+        });
+    }
+    shouldSkipS3Upload() {
+        return this.restoredFromNodeLocal;
     }
     getLogPrefix() {
         return "[VHDX]";
@@ -97657,6 +98197,10 @@ class VhdxContainer extends Container_1.Container {
                     this.logInfo("VHDX image not found — falling back to empty cache");
                     return this.createEmptyCache();
                 }
+                // Persist to node-local cache if enabled
+                if (this.nodeLocal.enabled) {
+                    yield this.nodeLocal.persistFromS3Download(this.containerFile);
+                }
                 this.logInfo(`Mounting VHDX: ${this.containerFile}`);
                 const absPath = path.resolve(this.containerFile);
                 yield this.execWithTimeout(() => this.psExec(`Mount-DiskImage -ImagePath '${absPath}' -Access ReadWrite -PassThru | Out-Null`), MOUNT_TIMEOUT_MS, `mount VHDX ${absPath}`);
@@ -97699,6 +98243,10 @@ class VhdxContainer extends Container_1.Container {
             const absPath = path.resolve(this.containerFile);
             this.logDebug(`Dismounting VHDX: ${absPath}`);
             yield this.psExec(`Dismount-DiskImage -ImagePath '${absPath}' | Out-Null`);
+            // Persist to node-local cache if enabled
+            if (this.nodeLocal.enabled) {
+                yield this.nodeLocal.persistFromS3Download(this.containerFile);
+            }
             this.logDebug(`Save completed. Container file ready for upload: ${this.containerFile}`);
         });
     }

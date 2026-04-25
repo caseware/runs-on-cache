@@ -110,6 +110,8 @@ export async function restoreCache(
     const bufferMb = parseInt(core.getInput(Inputs.FsBufferMB) || "2048");
     core.debug(`Using bufferMb: ${bufferMb}`);
     const saveCompressionLevel = core.getInput(Inputs.SaveCompressionLevel) || undefined;
+    const nodeLocalCacheDir = core.getInput(Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
+    const mountMode = (core.getInput(Inputs.MountMode) || "ro") as "ro" | "rw";
     let cacheContainer: Container | undefined = undefined;
     try {
         const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
@@ -120,12 +122,6 @@ export async function restoreCache(
         );
         core.debug(`Archive Path: ${archivePath}`);
 
-        // path are needed to compute version
-        const cacheEntry = await cacheHttpClient.getCacheEntry(keys, paths, {
-            compressionMethod,
-            enableCrossOsArchive
-        });
-   
         cacheContainer = ContainerFactory.getCacheContainer(
             customCompression,
             customCompressionLevel,
@@ -133,15 +129,30 @@ export async function restoreCache(
             baseDir, 
             paths, 
             primaryKey, 
-            { fsSize, bufferMb, saveCompressionLevel }
+            { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode }
         );
+
+        // Initialize container (prerequisite checks, stale temp cleanup)
+        await cacheContainer.initialize();
+
+        // Try node-local restore first (fast path: ~1-2s on warm node)
+        const restoredFromLocal = await cacheContainer.tryRestoreFromNodeLocal();
+        if (restoredFromLocal) {
+            core.info("Cache restored from node-local storage (fast path)");
+            return primaryKey;
+        }
+
+        // path are needed to compute version
+        const cacheEntry = await cacheHttpClient.getCacheEntry(keys, paths, {
+            compressionMethod,
+            enableCrossOsArchive
+        });
 
         core.debug(`Cache Entry: ${JSON.stringify(cacheEntry)}`);
         if (!cacheEntry?.archiveLocation) {
             // Cache not found
             core.debug("Cache not found");
             if (cacheContainer && cacheContainer.requiresCreateEmptyCache) {
-                await cacheContainer.initialize();
                 await cacheContainer.createEmptyCache();
                 core.debug(
                     `Created empty cache container of type ${cacheContainer.constructor.name}`
@@ -177,9 +188,8 @@ export async function restoreCache(
             )} MB (${archiveFileSize} B)`
         );
 
-        await cacheContainer.initialize();
         await cacheContainer.restore();
-        core.info("Cache restored successfully");
+        core.info("Cache restored successfully from S3");
 
         return cacheEntry.cacheKey;
     } catch (error) {
@@ -313,6 +323,8 @@ export async function saveCache(
             core.getInput(Inputs.FsBufferMB) || "2048"
         );
         const saveCompressionLevel = core.getInput(Inputs.SaveCompressionLevel) || undefined;
+        const nodeLocalCacheDir = core.getInput(Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
+        const mountMode = (core.getInput(Inputs.MountMode) || "ro") as "ro" | "rw";
         const cacheContainer = ContainerFactory.getCacheContainer(
             customCompression, 
             customCompressionLevel,
@@ -320,22 +332,27 @@ export async function saveCache(
             baseDir, 
             paths, 
             key,
-            { fsSize, bufferMb, saveCompressionLevel }
+            { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode }
         );
 
         await cacheContainer.initialize();
         await cacheContainer.save();
-        const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
-        core.info(`File Size: ${archiveFileSize}`);
 
-        await cacheHttpClient.saveCache(key, paths, archivePath, {
-            compressionMethod,
-            enableCrossOsArchive,
-            cacheSize: archiveFileSize
-        });
+        // Skip S3 upload if the container was restored from node-local storage (WORM)
+        if (cacheContainer.shouldSkipS3Upload()) {
+            core.info("Skipping S3 upload — restored from node-local cache (WORM)");
+            cacheId = 1;
+        } else {
+            const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
+            core.info(`File Size: ${archiveFileSize}`);
 
-        // dummy cacheId, if we get there without raising, it means the cache has been saved
-        cacheId = 1;
+            await cacheHttpClient.saveCache(key, paths, archivePath, {
+                compressionMethod,
+                enableCrossOsArchive,
+                cacheSize: archiveFileSize
+            });
+            cacheId = 1;
+        }
     } catch (error) {
         const typedError = error as Error;
         if (typedError.name === ValidationError.name) {

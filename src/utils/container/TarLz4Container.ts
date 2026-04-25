@@ -9,10 +9,14 @@ import { execSync } from "child_process";
 import { dirname } from "path";
 
 import { Container, ContainerOptions } from "./Container";
+import { NodeLocalCache } from "./NodeLocalCache";
 
 export class TarLz4Container extends Container {
     requiresCreateEmptyCache = false;
     requiresKeepArchive = false;
+
+    private readonly nodeLocal: NodeLocalCache;
+    private restoredFromNodeLocal = false;
 
     constructor(
         containerFile: string,
@@ -32,6 +36,44 @@ export class TarLz4Container extends Container {
             cacheKey,
             options
         );
+        this.nodeLocal = new NodeLocalCache(
+            options.nodeLocalCacheDir || "",
+            cacheKey,
+            ".tar.lz4"
+        );
+    }
+
+    async initialize(): Promise<void> {
+        await this.nodeLocal.cleanupStaleTempFiles();
+    }
+
+    async tryRestoreFromNodeLocal(): Promise<boolean> {
+        if (!this.nodeLocal.enabled) return false;
+
+        const localExists = await this.nodeLocal.exists();
+        if (!localExists) return false;
+
+        const localPath = this.nodeLocal.localPath;
+        this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
+
+        try {
+            // Point containerFile to the node-local archive and restore from it
+            this.containerFile = localPath;
+            await this.restore();
+            this.restoredFromNodeLocal = true;
+            return true;
+        } catch (error) {
+            core.warning(
+                `${this.getLogPrefix()} Node-local restore failed, falling back to S3: ${
+                    error instanceof Error ? error.message : error
+                }`
+            );
+            return false;
+        }
+    }
+
+    shouldSkipS3Upload(): boolean {
+        return this.restoredFromNodeLocal;
     }
 
     protected getLogPrefix(): string {
@@ -44,6 +86,11 @@ export class TarLz4Container extends Container {
 
     async restore(): Promise<void> {
         try {
+            // Persist to node-local cache if enabled (after S3 download)
+            if (this.nodeLocal.enabled && !this.restoredFromNodeLocal) {
+                await this.nodeLocal.persistFromS3Download(this.containerFile);
+            }
+
             if (this.compressionMethod && process.platform !== "win32") {
                 const compressionArgs =
                     this.compressionMethod === "none"
@@ -152,9 +199,9 @@ export class TarLz4Container extends Container {
 
                 this.logInfo(`Executing command: ${command}`);
 
-                const output = execSync(command, { stdio: "inherit" });
-                if (output && output.length > 0) {
-                    this.logDebug(output.toString());
+                const output2 = execSync(command, { stdio: "inherit" });
+                if (output2 && output2.length > 0) {
+                    this.logDebug(output2.toString());
                 }
             } else {
                 this.logDebug(`Creating archive: ${this.containerFile}`);

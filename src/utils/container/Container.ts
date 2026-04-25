@@ -4,6 +4,8 @@ export interface ContainerOptions {
     fsSize?: string;
     bufferMb?: number;
     saveCompressionLevel?: string;
+    nodeLocalCacheDir?: string;
+    mountMode?: "ro" | "rw";
 }
 
 export abstract class Container {
@@ -27,6 +29,22 @@ export abstract class Container {
     async initialize(): Promise<void> {}
     // eslint-disable-next-line @typescript-eslint/no-empty-function
     async createEmptyCache(): Promise<void> {}
+
+    /**
+     * Try to restore from a node-local persistent cache.
+     * Returns true if restored from node-local, false if S3 download is needed.
+     * Default implementation returns false (no node-local support).
+     */
+    async tryRestoreFromNodeLocal(): Promise<boolean> {
+        return false;
+    }
+
+    /**
+     * Whether the S3 upload should be skipped (e.g., restored from node-local read-only).
+     */
+    shouldSkipS3Upload(): boolean {
+        return false;
+    }
 
     // Common helper methods for all container implementations
     protected wrapError(operation: string, error: unknown): Error {

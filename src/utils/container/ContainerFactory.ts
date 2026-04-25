@@ -8,6 +8,8 @@ export interface ContainerFactoryOptions {
     fsSize?: string;
     bufferMb?: number;
     saveCompressionLevel?: string;
+    nodeLocalCacheDir?: string;
+    mountMode?: "ro" | "rw";
 }
 
 type Instances = {

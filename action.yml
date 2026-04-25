@@ -56,6 +56,14 @@ inputs:
     description: 'Compression level for BTRFS defrag before upload (e.g., zstd:9). Higher = smaller image, same read perf. Default: zstd:9.'
     default: 'zstd:9'
     required: false
+  node-local-cache-dir:
+    description: 'Path to node-local persistent cache directory (HostPath mount on EKS). When set, BTRFS/VHDX images are cached on the node for instant restore. Falls back to S3 on miss. Default: empty (disabled). Recommended: /opt/local-volumes/btrfs-cache/'
+    default: ''
+    required: false
+  mount-mode:
+    description: 'Mount mode for restored cache: "ro" (read-only, default — shared BTRFS image mounted read-only, safe for node_modules) or "rw" (read-write — image copied to job-local dir before mounting, for mutable caches like git repos)'
+    default: 'ro'
+    required: false
 outputs:
   cache-hit:
     description: 'A boolean value to indicate an exact match was found for the primary key'

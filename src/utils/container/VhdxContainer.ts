@@ -5,6 +5,7 @@ import * as path from "path";
 
 import { createCacheKeySpecificTempDirectory } from "../actionUtils";
 import { Container, ContainerOptions } from "./Container";
+import { NodeLocalCache } from "./NodeLocalCache";
 
 const MOUNT_TIMEOUT_MS = 60_000;
 const MIN_DISK_HEADROOM_MB = 1024;
@@ -26,6 +27,8 @@ export class VhdxContainer extends Container {
     private mountDriveLetter: string | undefined;
     private fsSize: string;
     private bufferBytes: number;
+    private readonly nodeLocal: NodeLocalCache;
+    private restoredFromNodeLocal = false;
 
     constructor(
         containerFile: string,
@@ -52,6 +55,11 @@ export class VhdxContainer extends Container {
 
         this.fsSize = options.fsSize;
         this.bufferBytes = (options.bufferMb ?? 512) * 1024 * 1024;
+        this.nodeLocal = new NodeLocalCache(
+            options.nodeLocalCacheDir || "",
+            cacheKey,
+            ".vhdx"
+        );
 
         // Security: validate paths
         this.checkPathTraversal(this.baseDir, this.containerFile);
@@ -74,10 +82,44 @@ export class VhdxContainer extends Container {
     async initialize(): Promise<void> {
         try {
             await this.checkPrerequisites();
+            await this.nodeLocal.cleanupStaleTempFiles();
         } catch (e) {
             core.setFailed((e as Error).message);
             process.exit(1);
         }
+    }
+
+    async tryRestoreFromNodeLocal(): Promise<boolean> {
+        if (!this.nodeLocal.enabled) return false;
+
+        const localExists = await this.nodeLocal.exists();
+        if (!localExists) return false;
+
+        const localPath = this.nodeLocal.localPath;
+        this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
+
+        try {
+            // Copy to job-local location (VHDX mount always needs write access for junction setup)
+            const tempDir = await createCacheKeySpecificTempDirectory(this.cacheKey);
+            const localCopy = path.join(tempDir, "cache.vhdx");
+            await fs.copyFile(localPath, localCopy);
+            this.containerFile = localCopy;
+
+            await this.restore();
+            this.restoredFromNodeLocal = true;
+            return true;
+        } catch (error) {
+            core.warning(
+                `${this.getLogPrefix()} Node-local restore failed, falling back to S3: ${
+                    error instanceof Error ? error.message : error
+                }`
+            );
+            return false;
+        }
+    }
+
+    shouldSkipS3Upload(): boolean {
+        return this.restoredFromNodeLocal;
     }
 
     protected getLogPrefix(): string {
@@ -286,6 +328,11 @@ export class VhdxContainer extends Container {
                 return this.createEmptyCache();
             }
 
+            // Persist to node-local cache if enabled
+            if (this.nodeLocal.enabled) {
+                await this.nodeLocal.persistFromS3Download(this.containerFile);
+            }
+
             this.logInfo(`Mounting VHDX: ${this.containerFile}`);
 
             const absPath = path.resolve(this.containerFile);
@@ -350,6 +397,11 @@ export class VhdxContainer extends Container {
         await this.psExec(
             `Dismount-DiskImage -ImagePath '${absPath}' | Out-Null`
         );
+
+        // Persist to node-local cache if enabled
+        if (this.nodeLocal.enabled) {
+            await this.nodeLocal.persistFromS3Download(this.containerFile);
+        }
 
         this.logDebug(
             `Save completed. Container file ready for upload: ${this.containerFile}`
