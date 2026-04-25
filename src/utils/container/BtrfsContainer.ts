@@ -194,8 +194,8 @@ export class BtrfsContainer extends Container {
 
         this.logDebug(`Defragmenting filesystem`);
         await exec.exec(
-            "btrfs",
-            ["filesystem", "defragment", "-r", this.mountPoint],
+            "sudo",
+            ["btrfs", "filesystem", "defragment", "-r", this.mountPoint],
             { silent: !core.isDebug() }
         );
 

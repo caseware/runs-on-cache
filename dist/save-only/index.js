@@ -96584,7 +96584,7 @@ class BtrfsContainer extends Container_1.Container {
                 throw this.createError("Mount point not discovered");
             }
             this.logDebug(`Defragmenting filesystem`);
-            yield exec.exec("btrfs", ["filesystem", "defragment", "-r", this.mountPoint], { silent: !core.isDebug() });
+            yield exec.exec("sudo", ["btrfs", "filesystem", "defragment", "-r", this.mountPoint], { silent: !core.isDebug() });
             this.logDebug(`Syncing and calculating used space`);
             yield exec.exec("sync", [], { silent: !core.isDebug() });
             // Get used space and resize filesystem
@@ -97083,8 +97083,7 @@ class TarLz4Container extends Container_1.Container {
                     }
                 }
                 else if (this.compressionMethod && process.platform === "win32") {
-                    const tarPathObj = yield (0, tar_1.getTarPath)();
-                    const tarPath = tarPathObj.path; // Access the 'path' property
+                    const tarPath = "tar";
                     const lz4Path = "lz4.exe";
                     // Build the arguments array
                     const args = [];
@@ -97130,8 +97129,7 @@ class TarLz4Container extends Container_1.Container {
                 }
                 else if (this.compressionMethod && process.platform === "win32") {
                     this.logDebug(`Creating archive: ${this.containerFile}`);
-                    const tarPathObj = yield (0, tar_1.getTarPath)();
-                    const tarPath = tarPathObj.path; // Access the 'path' property
+                    const tarPath = "tar";
                     // Use 'lz4' directly, assuming it's in the PATH
                     const lz4Path = "lz4.exe";
                     // Build the arguments array

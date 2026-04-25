@@ -7,8 +7,7 @@ import * as cacheHttpClient from "./backend";
 import {
     createTar,
     extractTar,
-    listTar,
-    getTarPath
+    listTar
 } from "@actions/cache/lib/internal/tar";
 import { DownloadOptions, UploadOptions } from "@actions/cache/lib/options";
 import { execSync } from "child_process";

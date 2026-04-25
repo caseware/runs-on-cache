@@ -2,7 +2,6 @@ import { CompressionMethod } from "@actions/cache/lib/internal/constants";
 import {
     createTar,
     extractTar,
-    getTarPath,
     listTar
 } from "@actions/cache/lib/internal/tar";
 import * as core from "@actions/core";
@@ -59,8 +58,7 @@ export class TarLz4Container extends Container {
                     this.logInfo(output.toString());
                 }
             } else if (this.compressionMethod && process.platform === "win32") {
-                const tarPathObj = await getTarPath();
-                const tarPath = tarPathObj.path; // Access the 'path' property
+                const tarPath = "tar";
 
                 const lz4Path = "lz4.exe";
 
@@ -118,8 +116,7 @@ export class TarLz4Container extends Container {
                 }
             } else if (this.compressionMethod && process.platform === "win32") {
                 this.logDebug(`Creating archive: ${this.containerFile}`);
-                const tarPathObj = await getTarPath();
-                const tarPath = tarPathObj.path; // Access the 'path' property
+                const tarPath = "tar";
 
                 // Use 'lz4' directly, assuming it's in the PATH
                 const lz4Path = "lz4.exe";
