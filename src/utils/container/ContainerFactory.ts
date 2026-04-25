@@ -7,6 +7,7 @@ import { VhdxContainer } from "./VhdxContainer";
 export interface ContainerFactoryOptions {
     fsSize?: string;
     bufferMb?: number;
+    saveCompressionLevel?: string;
 }
 
 type Instances = {

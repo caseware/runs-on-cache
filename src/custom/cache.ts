@@ -109,6 +109,7 @@ export async function restoreCache(
     core.debug(`Using fsSize: ${fsSize}`);
     const bufferMb = parseInt(core.getInput(Inputs.FsBufferMB) || "2048");
     core.debug(`Using bufferMb: ${bufferMb}`);
+    const saveCompressionLevel = core.getInput(Inputs.SaveCompressionLevel) || undefined;
     let cacheContainer: Container | undefined = undefined;
     try {
         const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
@@ -132,7 +133,7 @@ export async function restoreCache(
             baseDir, 
             paths, 
             primaryKey, 
-            { fsSize, bufferMb }
+            { fsSize, bufferMb, saveCompressionLevel }
         );
 
         core.debug(`Cache Entry: ${JSON.stringify(cacheEntry)}`);
@@ -311,6 +312,7 @@ export async function saveCache(
         const bufferMb = parseInt(
             core.getInput(Inputs.FsBufferMB) || "2048"
         );
+        const saveCompressionLevel = core.getInput(Inputs.SaveCompressionLevel) || undefined;
         const cacheContainer = ContainerFactory.getCacheContainer(
             customCompression, 
             customCompressionLevel,
@@ -318,7 +320,7 @@ export async function saveCache(
             baseDir, 
             paths, 
             key,
-            { fsSize, bufferMb }
+            { fsSize, bufferMb, saveCompressionLevel }
         );
 
         await cacheContainer.initialize();

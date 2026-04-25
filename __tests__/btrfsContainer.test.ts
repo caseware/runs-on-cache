@@ -24,6 +24,7 @@ function createBtrfsContainer(
         fsSize?: string;
         bufferMb?: number;
         pathsToCache?: string[];
+        saveCompressionLevel?: string;
     } = {}
 ): BtrfsContainer {
     const containerFile =
@@ -38,7 +39,8 @@ function createBtrfsContainer(
         TEST_CACHE_KEY,
         {
             fsSize: overrides.fsSize ?? "50G",
-            bufferMb: overrides.bufferMb ?? 512
+            bufferMb: overrides.bufferMb ?? 512,
+            saveCompressionLevel: overrides.saveCompressionLevel
         }
     );
 }
@@ -346,7 +348,7 @@ describe("BtrfsContainer.save", () => {
 
         const execCalls = mockedExec.exec.mock.calls;
 
-        // Should defrag with sudo
+        // Should defrag with sudo and save compression level (default zstd:9)
         const defragCall = execCalls.find(
             call =>
                 call[0] === "sudo" &&
@@ -355,6 +357,8 @@ describe("BtrfsContainer.save", () => {
                 call[1]?.[2] === "defragment"
         );
         expect(defragCall).toBeDefined();
+        // Verify defrag uses -czstd:9 for max compression before upload
+        expect(defragCall?.[1]).toContain("-czstd:9");
 
         // Should resize with sudo
         const resizeCall = execCalls.find(
@@ -482,6 +486,59 @@ describe("BtrfsContainer.save", () => {
         expect(mockedCore.warning).toHaveBeenCalledWith(
             expect.stringContaining("Could not determine exact usage")
         );
+    });
+
+    test("uses custom saveCompressionLevel for defrag", async () => {
+        const tempDir = path.join(
+            process.env["RUNNER_TEMP"] || tmpdir(),
+            TEST_CACHE_KEY.replace(/[^a-zA-Z0-9\-_.]/g, "_")
+        );
+        const expectedMountPoint = path.join(tempDir, "mount");
+
+        mockedExec.exec.mockImplementation(async (cmd, args, options) => {
+            if (cmd === "findmnt") {
+                if (options?.listeners?.stdout) {
+                    options.listeners.stdout(
+                        Buffer.from(`${expectedMountPoint} /dev/loop0\n`)
+                    );
+                }
+                return 0;
+            }
+            if (
+                cmd === "sudo" &&
+                args?.[0] === "btrfs" &&
+                args?.[1] === "filesystem" &&
+                args?.[2] === "usage"
+            ) {
+                if (options?.listeners?.stdout) {
+                    options.listeners.stdout(
+                        Buffer.from("    Used:                     104857600\n")
+                    );
+                }
+                return 0;
+            }
+            if (cmd === "mountpoint") return 0;
+            return 0;
+        });
+
+        const container = createBtrfsContainer({ saveCompressionLevel: "zstd:6" });
+        await container.save();
+
+        const defragCall = mockedExec.exec.mock.calls.find(
+            call =>
+                call[0] === "sudo" &&
+                call[1]?.[0] === "btrfs" &&
+                call[1]?.[1] === "filesystem" &&
+                call[1]?.[2] === "defragment"
+        );
+        expect(defragCall).toBeDefined();
+        expect(defragCall?.[1]).toContain("-czstd:6");
+    });
+
+    test("rejects invalid saveCompressionLevel", () => {
+        expect(() =>
+            createBtrfsContainer({ saveCompressionLevel: "invalid" })
+        ).toThrow("Invalid save compression level");
     });
 });
 

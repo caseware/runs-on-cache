@@ -19,6 +19,7 @@ interface CacheInput {
     customCompression?: string;
     sync?: boolean;
     fsSize?: string;
+    saveCompressionLevel?: string;
 }
 
 export function setInputs(input: CacheInput): void {
@@ -39,6 +40,8 @@ export function setInputs(input: CacheInput): void {
         setInput(Inputs.CustomCompression, input.customCompression);
     input.sync !== undefined && setInput(Inputs.Sync, input.sync.toString());
     input.fsSize !== undefined && setInput(Inputs.FsSize, input.fsSize);
+    input.saveCompressionLevel !== undefined &&
+        setInput(Inputs.SaveCompressionLevel, input.saveCompressionLevel);
 }
 
 export function clearInputs(): void {
@@ -52,4 +55,5 @@ export function clearInputs(): void {
     delete process.env[getInputName(Inputs.CustomCompression)];
     delete process.env[getInputName(Inputs.Sync)];
     delete process.env[getInputName(Inputs.FsSize)];
+    delete process.env[getInputName(Inputs.SaveCompressionLevel)];
 }

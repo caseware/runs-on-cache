@@ -13,7 +13,8 @@ export enum Inputs {
     ContainerFormat = "container-format", // Input for cache, save action (tar, btrfs)
     Sync = "sync", // Input for cache, save action
     FsSize = "fs-size", // Input for btrfs filesystem size
-    FsBufferMB = "fs-buffer-mb" // Input for btrfs filesystem buffer size
+    FsBufferMB = "fs-buffer-mb", // Input for btrfs filesystem buffer size
+    SaveCompressionLevel = "save-compression-level" // Input for btrfs defrag compression before upload
 }
 
 export enum Outputs {

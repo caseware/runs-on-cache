@@ -95107,7 +95107,8 @@ var Inputs;
     Inputs["ContainerFormat"] = "container-format";
     Inputs["Sync"] = "sync";
     Inputs["FsSize"] = "fs-size";
-    Inputs["FsBufferMB"] = "fs-buffer-mb"; // Input for btrfs filesystem buffer size
+    Inputs["FsBufferMB"] = "fs-buffer-mb";
+    Inputs["SaveCompressionLevel"] = "save-compression-level"; // Input for btrfs defrag compression before upload
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {
@@ -95520,6 +95521,7 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
         core.debug(`Using fsSize: ${fsSize}`);
         const bufferMb = parseInt(core.getInput(constants_1.Inputs.FsBufferMB) || "2048");
         core.debug(`Using bufferMb: ${bufferMb}`);
+        const saveCompressionLevel = core.getInput(constants_1.Inputs.SaveCompressionLevel) || undefined;
         let cacheContainer = undefined;
         try {
             const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
@@ -95531,7 +95533,7 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
                 compressionMethod,
                 enableCrossOsArchive
             });
-            cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb });
+            cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb, saveCompressionLevel });
             core.debug(`Cache Entry: ${JSON.stringify(cacheEntry)}`);
             if (!(cacheEntry === null || cacheEntry === void 0 ? void 0 : cacheEntry.archiveLocation)) {
                 // Cache not found
@@ -95666,7 +95668,8 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
             const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
             const fsSize = core.getInput(constants_1.Inputs.FsSize) || "50G";
             const bufferMb = parseInt(core.getInput(constants_1.Inputs.FsBufferMB) || "2048");
-            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, key, { fsSize, bufferMb });
+            const saveCompressionLevel = core.getInput(constants_1.Inputs.SaveCompressionLevel) || undefined;
+            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, key, { fsSize, bufferMb, saveCompressionLevel });
             yield cacheContainer.initialize();
             yield cacheContainer.save();
             const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
@@ -96467,6 +96470,9 @@ class BtrfsContainer extends Container_1.Container {
         }
         this.fsSize = options.fsSize;
         this.bufferBytes = ((_a = options.bufferMb) !== null && _a !== void 0 ? _a : 512) * 1024 * 1024; // Convert MB to bytes
+        // Use higher compression for save (upload) to minimize image size.
+        // Restore decompresses on-demand, so higher save compression = smaller image + same read perf.
+        this.saveCompressionLevel = options.saveCompressionLevel || "zstd:9";
         // Security input validations
         this.checkPathTraversal(this.baseDir, this.containerFile);
         this.pathsToCache.forEach(pathToCheck => this.checkPathTraversal(this.baseDir, pathToCheck));
@@ -96475,10 +96481,12 @@ class BtrfsContainer extends Container_1.Container {
             throw new Error(`Invalid filesystem size format: ${this.fsSize}. Must be a number followed by optional K, M, G, or T.`);
         }
         // Validate compression level
-        if (this.compressionLevel &&
-            // List of supported compressions: https://btrfs.readthedocs.io/en/latest/Compression.html
-            !/^(zlib(?:[:][1-9])?|lzo|zstd(?::-?(?:[0-9]|1[0-5]))?)$/.test(this.compressionLevel)) {
+        const compressionRegex = /^(zlib(?:[:][1-9])?|lzo|zstd(?::-?(?:[0-9]|1[0-5]))?)$/;
+        if (this.compressionLevel && !compressionRegex.test(this.compressionLevel)) {
             throw new Error(`Invalid compression level format: ${this.compressionLevel}. Must be 'zlib:<level>' where <level> is between 1 and 9, lzo, or zstd:<level> where <level> is between -15 and 15.`);
+        }
+        if (!compressionRegex.test(this.saveCompressionLevel)) {
+            throw new Error(`Invalid save compression level format: ${this.saveCompressionLevel}. Must be 'zlib:<level>', lzo, or zstd:<level>.`);
         }
     }
     isSupportedMethod(method) {
@@ -96791,8 +96799,8 @@ class BtrfsContainer extends Container_1.Container {
             if (!this.mountPoint) {
                 throw this.createError("Mount point not discovered");
             }
-            this.logDebug(`Defragmenting filesystem`);
-            yield exec.exec("sudo", ["btrfs", "filesystem", "defragment", "-r", this.mountPoint], { silent: !core.isDebug() });
+            this.logDebug(`Defragmenting + recompressing with ${this.saveCompressionLevel}`);
+            yield exec.exec("sudo", ["btrfs", "filesystem", "defragment", "-r", `-c${this.saveCompressionLevel}`, this.mountPoint], { silent: !core.isDebug() });
             this.logDebug(`Syncing and calculating used space`);
             yield exec.exec("sync", [], { silent: !core.isDebug() });
             // Get used space and resize filesystem

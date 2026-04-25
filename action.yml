@@ -52,6 +52,10 @@ inputs:
     description: 'Additional buffer size for btrfs format (e.g., 2048) after image resize.'
     default: '2048'
     required: false
+  save-compression-level:
+    description: 'Compression level for BTRFS defrag before upload (e.g., zstd:9). Higher = smaller image, same read perf. Default: zstd:9.'
+    default: 'zstd:9'
+    required: false
 outputs:
   cache-hit:
     description: 'A boolean value to indicate an exact match was found for the primary key'

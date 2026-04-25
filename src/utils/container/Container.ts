@@ -3,6 +3,7 @@ import * as core from "@actions/core";
 export interface ContainerOptions {
     fsSize?: string;
     bufferMb?: number;
+    saveCompressionLevel?: string;
 }
 
 export abstract class Container {

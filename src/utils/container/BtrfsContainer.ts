@@ -22,6 +22,7 @@ export class BtrfsContainer extends Container {
 
     private fsSize: string;
     private bufferBytes: number;
+    private saveCompressionLevel: string;
 
     constructor(
         containerFile: string,
@@ -52,6 +53,9 @@ export class BtrfsContainer extends Container {
 
         this.fsSize = options.fsSize;
         this.bufferBytes = (options.bufferMb ?? 512) * 1024 * 1024; // Convert MB to bytes
+        // Use higher compression for save (upload) to minimize image size.
+        // Restore decompresses on-demand, so higher save compression = smaller image + same read perf.
+        this.saveCompressionLevel = options.saveCompressionLevel || "zstd:9";
 
         // Security input validations
         this.checkPathTraversal(this.baseDir, this.containerFile);
@@ -67,15 +71,15 @@ export class BtrfsContainer extends Container {
         }
 
         // Validate compression level
-        if (
-            this.compressionLevel &&
-            // List of supported compressions: https://btrfs.readthedocs.io/en/latest/Compression.html
-            !/^(zlib(?:[:][1-9])?|lzo|zstd(?::-?(?:[0-9]|1[0-5]))?)$/.test(
-                this.compressionLevel
-            )
-        ) {
+        const compressionRegex = /^(zlib(?:[:][1-9])?|lzo|zstd(?::-?(?:[0-9]|1[0-5]))?)$/;
+        if (this.compressionLevel && !compressionRegex.test(this.compressionLevel)) {
             throw new Error(
                 `Invalid compression level format: ${this.compressionLevel}. Must be 'zlib:<level>' where <level> is between 1 and 9, lzo, or zstd:<level> where <level> is between -15 and 15.`
+            );
+        }
+        if (!compressionRegex.test(this.saveCompressionLevel)) {
+            throw new Error(
+                `Invalid save compression level format: ${this.saveCompressionLevel}. Must be 'zlib:<level>', lzo, or zstd:<level>.`
             );
         }
     }
@@ -438,10 +442,10 @@ export class BtrfsContainer extends Container {
             throw this.createError("Mount point not discovered");
         }
 
-        this.logDebug(`Defragmenting filesystem`);
+        this.logDebug(`Defragmenting + recompressing with ${this.saveCompressionLevel}`);
         await exec.exec(
             "sudo",
-            ["btrfs", "filesystem", "defragment", "-r", this.mountPoint],
+            ["btrfs", "filesystem", "defragment", "-r", `-c${this.saveCompressionLevel}`, this.mountPoint],
             { silent: !core.isDebug() }
         );
 
