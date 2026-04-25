@@ -96519,6 +96519,10 @@ class BtrfsContainer extends Container_1.Container {
          * Tracks whether restore used a node-local image (skip S3 upload on save).
          */
         this.restoredFromNodeLocal = false;
+        /**
+         * Detected at discoverMountInfo() time — true if the current BTRFS mount is read-only.
+         */
+        this.mountIsReadOnly = false;
         if (!options.fsSize) {
             throw new Error("fsSize option is required for BtrfsContainer");
         }
@@ -96614,8 +96618,18 @@ class BtrfsContainer extends Container_1.Container {
             yield fs.mkdir(this.mountPoint, { recursive: true });
             this.logInfo(`Mounting read-only: ${imageFile} → ${this.mountPoint}`);
             yield this.mountWithErrorHandling(imageFile, this.mountPoint, ["loop", "ro", `compress=${this.compressionLevel}`]);
-            // Bind-mount each path read-only to the workspace
-            yield this.bindMountPaths(true);
+            try {
+                // Bind-mount each path read-only to the workspace
+                yield this.bindMountPaths(true);
+            }
+            catch (error) {
+                // If bind-mount fails, unmount the BTRFS image to avoid a dangling RO mount
+                // that would confuse the save step's discoverMountInfo()
+                yield this.umountWithErrorHandling(this.mountPoint);
+                yield this.cleanupLoopDevices(imageFile);
+                this.mountPoint = undefined;
+                throw error;
+            }
             yield this.checkFilesystemHealth();
         });
     }
@@ -96690,16 +96704,23 @@ class BtrfsContainer extends Container_1.Container {
     }
     save() {
         return __awaiter(this, void 0, void 0, function* () {
-            // If restored from read-only node-local mount, skip save entirely
-            // (WORM: the image was already committed and is immutable)
-            if (this.restoredFromNodeLocal && this.mountMode === "ro") {
-                this.logInfo("Skipping save — restored from node-local read-only image (WORM)");
+            // Discover all mount information once
+            try {
+                yield this.discoverMountInfo();
+            }
+            catch (_a) {
+                // No BTRFS mount found — restore likely failed, nothing to save
+                this.logInfo("No BTRFS mount found — skipping save");
                 return;
             }
-            // Discover all mount information once
-            yield this.discoverMountInfo();
             if (!this.mountPoint) {
-                throw this.createError("Mount point not discovered");
+                this.logInfo("Mount point not discovered — skipping save");
+                return;
+            }
+            // Read-only mount means nothing changed — skip save
+            if (this.mountIsReadOnly) {
+                this.logInfo("Skipping save — mount is read-only, nothing to persist");
+                return;
             }
             this.logDebug(`Defragmenting + recompressing with ${this.saveCompressionLevel}`);
             yield exec.exec("sudo", ["btrfs", "filesystem", "defragment", "-r", `-c${this.saveCompressionLevel}`, this.mountPoint], { silent: !core.isDebug() });
@@ -96737,7 +96758,7 @@ class BtrfsContainer extends Container_1.Container {
      * Whether the S3 upload should be skipped because the node already has the image.
      */
     shouldSkipS3Upload() {
-        return this.restoredFromNodeLocal && this.mountMode === "ro";
+        return this.mountIsReadOnly;
     }
     getNodeLocalDownloadPath() {
         return __awaiter(this, void 0, void 0, function* () {
@@ -97082,16 +97103,16 @@ class BtrfsContainer extends Container_1.Container {
             const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
             const expectedMountPoint = path.join(tempDir, "mount");
             this.logDebug(`Looking for BTRFS mount at: ${expectedMountPoint}`);
-            // Use findmnt to find BTRFS mounts with both target and source
+            // Use findmnt to find BTRFS mounts with target, source, and options
             const output = yield this.execWithOutput("findmnt", [
                 "-t",
                 "btrfs",
                 "-n",
                 "-o",
-                "TARGET,SOURCE"
+                "TARGET,SOURCE,OPTIONS"
             ]);
             this.logDebug(`findmnt output:\n${output}`);
-            // Parse findmnt output: TARGET SOURCE
+            // Parse findmnt output: TARGET SOURCE OPTIONS
             const lines = output.split("\n");
             for (const line of lines) {
                 if (line.trim() === "")
@@ -97100,12 +97121,14 @@ class BtrfsContainer extends Container_1.Container {
                 if (parts.length >= 2) {
                     const mountPoint = parts[0];
                     const device = parts[1];
+                    const options = parts.slice(2).join(" ");
                     // Look for our specific mount point
                     if (mountPoint === expectedMountPoint) {
-                        this.logDebug(`Found existing mount: ${device} → ${mountPoint}`);
+                        this.logDebug(`Found existing mount: ${device} → ${mountPoint} (${options})`);
                         this.mountPoint = mountPoint;
+                        this.mountIsReadOnly = /\bro\b/.test(options);
                         // With deterministic temp directories, containerFile should already be correct
-                        this.logDebug(`Using containerFile: ${this.containerFile}`);
+                        this.logDebug(`Using containerFile: ${this.containerFile} (readOnly=${this.mountIsReadOnly})`);
                         return;
                     }
                 }
@@ -97151,24 +97174,46 @@ class BtrfsContainer extends Container_1.Container {
                 const btrfsPath = path.join(this.mountPoint, p);
                 core.debug(`[BTRFS] Bind-mounting ${btrfsPath} → ${absPath}${readOnly ? " (ro)" : ""}`);
                 try {
-                    yield Promise.all([
-                        this.execSudo("mkdir", ["-p", btrfsPath]),
-                        this.execSudo("mkdir", ["-p", absPath])
-                    ]);
-                    // Set ownership to match the workspace directory
-                    const parentDir = path.dirname(absPath);
-                    yield Promise.all([
-                        this.execSudo("chown", [
+                    if (readOnly) {
+                        // Read-only mount: BTRFS path must already exist in the image.
+                        // Only create the workspace target — never write to the RO filesystem.
+                        try {
+                            yield exec.exec("test", ["-d", btrfsPath], {
+                                ignoreReturnCode: false,
+                                silent: !core.isDebug()
+                            });
+                        }
+                        catch (_a) {
+                            throw new Error(`Source path ${btrfsPath} does not exist in BTRFS image`);
+                        }
+                        yield this.execSudo("mkdir", ["-p", absPath]);
+                        const parentDir = path.dirname(absPath);
+                        yield this.execSudo("chown", [
                             "--reference",
                             parentDir,
                             absPath
-                        ]),
-                        this.execSudo("chown", [
-                            "--reference",
-                            this.baseDir,
-                            btrfsPath
-                        ])
-                    ]);
+                        ]);
+                    }
+                    else {
+                        // Read-write mount: create directories on both sides
+                        yield Promise.all([
+                            this.execSudo("mkdir", ["-p", btrfsPath]),
+                            this.execSudo("mkdir", ["-p", absPath])
+                        ]);
+                        const parentDir = path.dirname(absPath);
+                        yield Promise.all([
+                            this.execSudo("chown", [
+                                "--reference",
+                                parentDir,
+                                absPath
+                            ]),
+                            this.execSudo("chown", [
+                                "--reference",
+                                this.baseDir,
+                                btrfsPath
+                            ])
+                        ]);
+                    }
                     // Bind mount: workspace points to BTRFS
                     yield this.mountWithErrorHandling(btrfsPath, absPath, [
                         "bind"
