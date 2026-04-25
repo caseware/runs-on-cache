@@ -1,0 +1,43 @@
+name: 'Ordered Cache Restore'
+description: 'Restores cache by trying an ordered list of cache keys. Returns which key matched and whether it was an exact or partial hit.'
+inputs:
+  cache-keys:
+    description: |
+      Ordered list of cache keys to try, one per line.
+      The first key is the "exact" key. If it matches, cache-hit-type is "exact".
+      Subsequent keys are fallbacks. If one matches, cache-hit-type is "partial".
+      If none match, cache-hit-type is "miss".
+    required: true
+  path:
+    description: 'A list of files, directories, and wildcard patterns to cache and restore'
+    required: true
+  custom-compression:
+    description: 'Custom compression method (e.g., lz4, btrfs)'
+    required: false
+    default: 'lz4'
+  custom-compression-level:
+    description: 'Level of compression for the custom method'
+    required: false
+  fs-size:
+    description: 'Filesystem size for btrfs format (e.g., 50G)'
+    default: '50G'
+    required: false
+  fs-buffer-mb:
+    description: 'Additional buffer size for btrfs format (e.g., 2048) after image resize.'
+    default: '2048'
+    required: false
+outputs:
+  matched-key:
+    description: 'The cache key that was matched, or empty string if miss'
+    value: '${{ steps.resolve.outputs.matched-key }}'
+  cache-hit-type:
+    description: 'exact if the first key matched, partial if a fallback matched, miss if none matched'
+    value: '${{ steps.resolve.outputs.cache-hit-type }}'
+  cache-hit:
+    description: 'true if any key matched (exact or partial), false if miss'
+    value: '${{ steps.resolve.outputs.cache-hit }}'
+runs:
+  using: 'node20'
+  main: '../dist/ordered-restore/index.js'
+  post: '../dist/save/index.js'
+  post-if: "success() || github.event.inputs.save-always"
