@@ -97557,7 +97557,11 @@ class NodeLocalCache {
             if (!this.enabled) {
                 throw new Error("[NodeLocal] Cannot create temp file — node-local caching is disabled");
             }
+            // Verify the cache directory exists and is writable.
+            // On runners without the HostPath mount, this will fail fast
+            // instead of returning a path that S3 download can't write to.
             yield fs.mkdir(this.cacheDir, { recursive: true });
+            yield fs.access(this.cacheDir, (yield Promise.resolve().then(() => __importStar(__nccwpck_require__(7147)))).constants.W_OK);
             const randomSuffix = crypto.randomBytes(8).toString("hex");
             const tempPath = path.join(this.cacheDir, `.temp${randomSuffix}${this.extension}`);
             core.debug(`[NodeLocal] Created temp path: ${tempPath}`);

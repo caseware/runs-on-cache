@@ -72,7 +72,11 @@ export class NodeLocalCache {
             throw new Error("[NodeLocal] Cannot create temp file — node-local caching is disabled");
         }
 
+        // Verify the cache directory exists and is writable.
+        // On runners without the HostPath mount, this will fail fast
+        // instead of returning a path that S3 download can't write to.
         await fs.mkdir(this.cacheDir, { recursive: true });
+        await fs.access(this.cacheDir, (await import("fs")).constants.W_OK);
 
         const randomSuffix = crypto.randomBytes(8).toString("hex");
         const tempPath = path.join(
