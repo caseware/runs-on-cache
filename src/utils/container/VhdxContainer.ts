@@ -122,6 +122,18 @@ export class VhdxContainer extends Container {
         return this.restoredFromNodeLocal;
     }
 
+    async getNodeLocalDownloadPath(): Promise<string | null> {
+        return this.nodeLocal.getDownloadPath();
+    }
+
+    async commitNodeLocalDownload(tempPath: string): Promise<boolean> {
+        return this.nodeLocal.commitTempFile(tempPath);
+    }
+
+    isNodeLocalEnabled(): boolean {
+        return this.nodeLocal.enabled;
+    }
+
     protected getLogPrefix(): string {
         return "[VHDX]";
     }
@@ -328,11 +340,6 @@ export class VhdxContainer extends Container {
                 return this.createEmptyCache();
             }
 
-            // Persist to node-local cache if enabled
-            if (this.nodeLocal.enabled) {
-                await this.nodeLocal.persistFromS3Download(this.containerFile);
-            }
-
             this.logInfo(`Mounting VHDX: ${this.containerFile}`);
 
             const absPath = path.resolve(this.containerFile);
@@ -397,11 +404,6 @@ export class VhdxContainer extends Container {
         await this.psExec(
             `Dismount-DiskImage -ImagePath '${absPath}' | Out-Null`
         );
-
-        // Persist to node-local cache if enabled
-        if (this.nodeLocal.enabled) {
-            await this.nodeLocal.persistFromS3Download(this.containerFile);
-        }
 
         this.logDebug(
             `Save completed. Container file ready for upload: ${this.containerFile}`

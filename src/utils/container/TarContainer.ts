@@ -70,6 +70,18 @@ export class TarContainer extends Container {
         return this.restoredFromNodeLocal;
     }
 
+    async getNodeLocalDownloadPath(): Promise<string | null> {
+        return this.nodeLocal.getDownloadPath();
+    }
+
+    async commitNodeLocalDownload(tempPath: string): Promise<boolean> {
+        return this.nodeLocal.commitTempFile(tempPath);
+    }
+
+    isNodeLocalEnabled(): boolean {
+        return this.nodeLocal.enabled;
+    }
+
     protected getLogPrefix(): string {
         return "[TAR]";
     }
@@ -80,11 +92,6 @@ export class TarContainer extends Container {
 
     async restore(): Promise<void> {
         try {
-            // Persist to node-local cache if enabled (after S3 download)
-            if (this.nodeLocal.enabled && !this.restoredFromNodeLocal) {
-                await this.nodeLocal.persistFromS3Download(this.containerFile);
-            }
-
             return extractTar(
                 this.containerFile,
                 this.compressionMethod as CompressionMethod

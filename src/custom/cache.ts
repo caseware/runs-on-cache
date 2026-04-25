@@ -14,7 +14,7 @@ import { execSync } from "child_process";
 import { createCacheKeySpecificTempDirectory, getCacheFileName, getCompressionMethod } from "../utils/actionUtils";
 import { CompressionMethod } from "@actions/cache/lib/internal/constants";
 import { ContainerFactory } from "../utils/container/ContainerFactory";
-import { Inputs } from "../constants";
+import { Inputs, Outputs } from "../constants";
 import { Container } from "../utils/container/Container";
 
 export class ValidationError extends Error {
@@ -136,9 +136,11 @@ export async function restoreCache(
         await cacheContainer.initialize();
 
         // Try node-local restore first (fast path: ~1-2s on warm node)
+        const nodeLocalEnabled = cacheContainer.isNodeLocalEnabled();
         const restoredFromLocal = await cacheContainer.tryRestoreFromNodeLocal();
         if (restoredFromLocal) {
             core.info("Cache restored from node-local storage (fast path)");
+            core.setOutput(Outputs.NodeLocalCacheHit, "true");
             return primaryKey;
         }
 
@@ -152,6 +154,7 @@ export async function restoreCache(
         if (!cacheEntry?.archiveLocation) {
             // Cache not found
             core.debug("Cache not found");
+            core.setOutput(Outputs.NodeLocalCacheHit, nodeLocalEnabled ? "false" : "disabled");
             if (cacheContainer && cacheContainer.requiresCreateEmptyCache) {
                 await cacheContainer.createEmptyCache();
                 core.debug(
@@ -166,12 +169,33 @@ export async function restoreCache(
             return cacheEntry.cacheKey;
         }
 
-        // Download the cache from the cache entry
+        // When node-local is enabled, download directly to the HostPath dir
+        // so we avoid a redundant copy. The temp file is committed atomically after download.
+        let downloadPath = archivePath;
+        const nodeLocalTempPath = await cacheContainer.getNodeLocalDownloadPath();
+        if (nodeLocalTempPath) {
+            downloadPath = nodeLocalTempPath;
+            core.info(`[NodeLocal] S3 downloading directly to node-local temp: ${downloadPath}`);
+        }
+
         await cacheHttpClient.downloadCache(
             cacheEntry.archiveLocation,
-            archivePath,
+            downloadPath,
             options
         );
+
+        // If downloaded to node-local temp, commit (atomic mv) and point container at the final path
+        if (nodeLocalTempPath) {
+            const committed = await cacheContainer.commitNodeLocalDownload(nodeLocalTempPath);
+            if (committed) {
+                core.info(`[NodeLocal] Committed download to node-local cache`);
+            } else {
+                core.info(`[NodeLocal] Another runner already committed — using existing`);
+            }
+            // Either way, the file is now at the final node-local path — use it for restore
+            // Update archivePath so restore() reads from the right location
+            archivePath = downloadPath;
+        }
 
         if (core.isDebug()) {
             if (customCompression) {
@@ -181,15 +205,20 @@ export async function restoreCache(
             }
         }
 
-        const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
+        const archiveFileSize = utils.getArchiveFileSizeInBytes(downloadPath);
         core.info(
             `Cache Size: ~${Math.round(
                 archiveFileSize / (1024 * 1024)
             )} MB (${archiveFileSize} B)`
         );
 
+        // Point the container at wherever we downloaded (node-local temp or default)
+        cacheContainer.setArchivePath(downloadPath);
         await cacheContainer.restore();
         core.info("Cache restored successfully from S3");
+
+        // Report node-local cache miss (S3 fallback) or disabled
+        core.setOutput(Outputs.NodeLocalCacheHit, nodeLocalEnabled ? "false" : "disabled");
 
         return cacheEntry.cacheKey;
     } catch (error) {
@@ -337,6 +366,25 @@ export async function saveCache(
 
         await cacheContainer.initialize();
         await cacheContainer.save();
+
+        // After save, persist to node-local if enabled (so subsequent runs on this node get a hit)
+        if (cacheContainer.isNodeLocalEnabled() && !cacheContainer.shouldSkipS3Upload()) {
+            const tempPath = await cacheContainer.getNodeLocalDownloadPath();
+            if (tempPath) {
+                try {
+                    const fsModule = await import("fs/promises");
+                    await fsModule.copyFile(archivePath, tempPath);
+                    const committed = await cacheContainer.commitNodeLocalDownload(tempPath);
+                    if (committed) {
+                        core.info("[NodeLocal] Saved image to node-local cache for future runs");
+                    } else {
+                        core.info("[NodeLocal] Node-local cache already populated by another runner");
+                    }
+                } catch (err) {
+                    core.warning(`[NodeLocal] Failed to persist to node-local: ${err instanceof Error ? err.message : err}`);
+                }
+            }
+        }
 
         // Skip S3 upload if the container was restored from node-local storage (WORM)
         if (cacheContainer.shouldSkipS3Upload()) {

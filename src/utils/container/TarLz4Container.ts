@@ -76,6 +76,18 @@ export class TarLz4Container extends Container {
         return this.restoredFromNodeLocal;
     }
 
+    async getNodeLocalDownloadPath(): Promise<string | null> {
+        return this.nodeLocal.getDownloadPath();
+    }
+
+    async commitNodeLocalDownload(tempPath: string): Promise<boolean> {
+        return this.nodeLocal.commitTempFile(tempPath);
+    }
+
+    isNodeLocalEnabled(): boolean {
+        return this.nodeLocal.enabled;
+    }
+
     protected getLogPrefix(): string {
         return "[TAR-LZ4]";
     }
@@ -86,11 +98,6 @@ export class TarLz4Container extends Container {
 
     async restore(): Promise<void> {
         try {
-            // Persist to node-local cache if enabled (after S3 download)
-            if (this.nodeLocal.enabled && !this.restoredFromNodeLocal) {
-                await this.nodeLocal.persistFromS3Download(this.containerFile);
-            }
-
             if (this.compressionMethod && process.platform !== "win32") {
                 const compressionArgs =
                     this.compressionMethod === "none"

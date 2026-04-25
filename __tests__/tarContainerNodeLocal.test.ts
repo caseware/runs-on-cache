@@ -139,6 +139,47 @@ describe("TarLz4Container node-local support", () => {
             await expect(fs.access(staleTemp)).rejects.toThrow();
         });
     });
+
+    describe("direct download support", () => {
+        it("isNodeLocalEnabled returns false when disabled", () => {
+            const container = createTarLz4Container();
+            expect(container.isNodeLocalEnabled()).toBe(false);
+        });
+
+        it("isNodeLocalEnabled returns true when enabled", () => {
+            const container = createTarLz4Container({ nodeLocalCacheDir: cacheDir });
+            expect(container.isNodeLocalEnabled()).toBe(true);
+        });
+
+        it("getNodeLocalDownloadPath returns null when disabled", async () => {
+            const container = createTarLz4Container();
+            expect(await container.getNodeLocalDownloadPath()).toBeNull();
+        });
+
+        it("getNodeLocalDownloadPath returns temp path when enabled", async () => {
+            const container = createTarLz4Container({ nodeLocalCacheDir: cacheDir });
+            const dlPath = await container.getNodeLocalDownloadPath();
+            expect(dlPath).not.toBeNull();
+            expect(dlPath!).toMatch(/\.temp[0-9a-f]+\.tar\.lz4$/);
+        });
+
+        it("commitNodeLocalDownload commits file to final path", async () => {
+            const container = createTarLz4Container({
+                nodeLocalCacheDir: cacheDir,
+                cacheKey: "commit-test"
+            });
+            const dlPath = await container.getNodeLocalDownloadPath();
+            expect(dlPath).not.toBeNull();
+            await fs.writeFile(dlPath!, "downloaded-data");
+
+            const committed = await container.commitNodeLocalDownload(dlPath!);
+            expect(committed).toBe(true);
+
+            const finalPath = path.join(cacheDir, "commit-test.tar.lz4");
+            const content = await fs.readFile(finalPath, "utf-8");
+            expect(content).toBe("downloaded-data");
+        });
+    });
 });
 
 describe("TarContainer node-local support", () => {
@@ -245,6 +286,47 @@ describe("TarContainer node-local support", () => {
 
             await container.initialize();
             await expect(fs.access(staleTemp)).rejects.toThrow();
+        });
+    });
+
+    describe("direct download support", () => {
+        it("isNodeLocalEnabled returns false when disabled", () => {
+            const container = createTarContainer();
+            expect(container.isNodeLocalEnabled()).toBe(false);
+        });
+
+        it("isNodeLocalEnabled returns true when enabled", () => {
+            const container = createTarContainer({ nodeLocalCacheDir: cacheDir });
+            expect(container.isNodeLocalEnabled()).toBe(true);
+        });
+
+        it("getNodeLocalDownloadPath returns null when disabled", async () => {
+            const container = createTarContainer();
+            expect(await container.getNodeLocalDownloadPath()).toBeNull();
+        });
+
+        it("getNodeLocalDownloadPath returns temp path when enabled", async () => {
+            const container = createTarContainer({ nodeLocalCacheDir: cacheDir });
+            const dlPath = await container.getNodeLocalDownloadPath();
+            expect(dlPath).not.toBeNull();
+            expect(dlPath!).toMatch(/\.temp[0-9a-f]+\.tar$/);
+        });
+
+        it("commitNodeLocalDownload commits file to final path", async () => {
+            const container = createTarContainer({
+                nodeLocalCacheDir: cacheDir,
+                cacheKey: "tar-commit"
+            });
+            const dlPath = await container.getNodeLocalDownloadPath();
+            expect(dlPath).not.toBeNull();
+            await fs.writeFile(dlPath!, "tar-downloaded");
+
+            const committed = await container.commitNodeLocalDownload(dlPath!);
+            expect(committed).toBe(true);
+
+            const finalPath = path.join(cacheDir, "tar-commit.tar");
+            const content = await fs.readFile(finalPath, "utf-8");
+            expect(content).toBe("tar-downloaded");
         });
     });
 });

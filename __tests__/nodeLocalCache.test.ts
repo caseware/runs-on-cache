@@ -141,50 +141,49 @@ describe("NodeLocalCache", () => {
         });
     });
 
-    describe("persistFromS3Download", () => {
-        it("returns false when disabled", async () => {
+    describe("getDownloadPath", () => {
+        it("returns null when disabled", async () => {
             const nlc = new NodeLocalCache("", "key", ".btrfs");
-            expect(await nlc.persistFromS3Download("/some/archive")).toBe(false);
+            expect(await nlc.getDownloadPath()).toBeNull();
         });
 
-        it("copies S3 download to node-local cache", async () => {
-            const nlc = new NodeLocalCache(tempDir, "s3-persist-test", ".btrfs");
+        it("returns a temp path in the cache dir when enabled", async () => {
+            const nlc = new NodeLocalCache(tempDir, "dl-path-test", ".btrfs");
+            const dlPath = await nlc.getDownloadPath();
+            expect(dlPath).not.toBeNull();
+            expect(dlPath!).toMatch(/\.temp[0-9a-f]+\.btrfs$/);
+            expect(path.dirname(dlPath!)).toBe(tempDir);
+        });
 
-            // Create a fake S3 download
-            const s3Path = path.join(tempDir, "s3-download.btrfs");
-            await fs.writeFile(s3Path, "s3-image-data");
+        it("returns null when cache dir creation fails", async () => {
+            // Use a path that can't be created (file exists where dir would be)
+            const blockingFile = path.join(tempDir, "blocker");
+            await fs.writeFile(blockingFile, "I block mkdir");
+            const nlc = new NodeLocalCache(path.join(blockingFile, "subdir"), "key", ".btrfs");
+            const dlPath = await nlc.getDownloadPath();
+            expect(dlPath).toBeNull();
+        });
 
-            const result = await nlc.persistFromS3Download(s3Path);
-            expect(result).toBe(true);
+        it("direct download flow: download to temp, commit, file exists at final path", async () => {
+            const nlc = new NodeLocalCache(tempDir, "direct-dl", ".btrfs");
 
-            // Verify the file was persisted
+            // Step 1: get download path
+            const dlPath = await nlc.getDownloadPath();
+            expect(dlPath).not.toBeNull();
+
+            // Step 2: simulate S3 download writing directly to this path
+            await fs.writeFile(dlPath!, "s3-image-data");
+
+            // Step 3: commit (atomic mv)
+            const won = await nlc.commitTempFile(dlPath!);
+            expect(won).toBe(true);
+
+            // Final file should exist with the downloaded data
             const content = await fs.readFile(nlc.localPath, "utf-8");
             expect(content).toBe("s3-image-data");
-        });
 
-        it("returns false if copy fails (source missing)", async () => {
-            const nlc = new NodeLocalCache(tempDir, "bad-source", ".btrfs");
-            const result = await nlc.persistFromS3Download("/nonexistent/path");
-            expect(result).toBe(false);
-        });
-
-        it("skips if file already exists on node", async () => {
-            const nlc = new NodeLocalCache(tempDir, "already-exists", ".btrfs");
-
-            // Pre-populate the node-local cache
-            await fs.writeFile(nlc.localPath, "existing-node-data");
-
-            // Try to persist from S3
-            const s3Path = path.join(tempDir, "s3-new.btrfs");
-            await fs.writeFile(s3Path, "new-s3-data");
-            const result = await nlc.persistFromS3Download(s3Path);
-
-            // Should return false (didn't win the race)
-            expect(result).toBe(false);
-
-            // Original should remain
-            const content = await fs.readFile(nlc.localPath, "utf-8");
-            expect(content).toBe("existing-node-data");
+            // Temp path should be gone (it was renamed)
+            await expect(fs.access(dlPath!)).rejects.toThrow();
         });
     });
 
@@ -246,21 +245,24 @@ describe("NodeLocalCache", () => {
     });
 
     describe("concurrent access safety", () => {
-        it("subsequent calls return false after first persist succeeds", async () => {
+        it("second download+commit returns false after first succeeds", async () => {
             const nlc = new NodeLocalCache(tempDir, "concurrent-key", ".btrfs");
 
-            const s3Path = path.join(tempDir, "s3-download.btrfs");
-            await fs.writeFile(s3Path, "data-first");
-
-            // First persist succeeds
-            const result1 = await nlc.persistFromS3Download(s3Path);
+            // First runner: getDownloadPath → write → commit
+            const dlPath1 = await nlc.getDownloadPath();
+            expect(dlPath1).not.toBeNull();
+            await fs.writeFile(dlPath1!, "data-first");
+            const result1 = await nlc.commitTempFile(dlPath1!);
             expect(result1).toBe(true);
 
-            // Second persist sees the file exists and skips
-            const result2 = await nlc.persistFromS3Download(s3Path);
+            // Second runner: getDownloadPath → write → commit (should lose)
+            const dlPath2 = await nlc.getDownloadPath();
+            expect(dlPath2).not.toBeNull();
+            await fs.writeFile(dlPath2!, "data-second");
+            const result2 = await nlc.commitTempFile(dlPath2!);
             expect(result2).toBe(false);
 
-            // The file should exist and contain the first runner's data
+            // The file should contain the first runner's data
             const content = await fs.readFile(nlc.localPath, "utf-8");
             expect(content).toBe("data-first");
         });

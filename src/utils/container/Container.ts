@@ -46,6 +46,39 @@ export abstract class Container {
         return false;
     }
 
+    /**
+     * Get the path where S3 should download the archive to.
+     * When node-local caching is enabled, returns a .tempXXX path in the HostPath dir
+     * so the download goes directly there (no copy).
+     * Returns null when node-local is disabled (caller uses default temp dir).
+     */
+    async getNodeLocalDownloadPath(): Promise<string | null> {
+        return null;
+    }
+
+    /**
+     * Commit a node-local download: atomic mv from .tempXXX to final path.
+     * Called after S3 download completes when the download went to a node-local temp path.
+     * Returns true if committed, false if another runner beat us.
+     */
+    async commitNodeLocalDownload(tempPath: string): Promise<boolean> {
+        return false;
+    }
+
+    /**
+     * Whether node-local caching is enabled for this container.
+     */
+    isNodeLocalEnabled(): boolean {
+        return false;
+    }
+
+    /**
+     * Update the archive file path (e.g., when S3 download goes to a different location).
+     */
+    setArchivePath(archivePath: string): void {
+        this.containerFile = archivePath;
+    }
+
     // Common helper methods for all container implementations
     protected wrapError(operation: string, error: unknown): Error {
         return new Error(

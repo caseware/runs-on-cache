@@ -215,11 +215,6 @@ export class BtrfsContainer extends Container {
                 return this.createEmptyCache();
             }
 
-            // If node-local is enabled, persist the S3 download to the node
-            if (this.nodeLocal.enabled) {
-                await this.nodeLocal.persistFromS3Download(this.containerFile);
-            }
-
             if (this.mountMode === "ro") {
                 // Mount the downloaded image read-only
                 await this.mountReadOnly(this.containerFile);
@@ -326,11 +321,6 @@ export class BtrfsContainer extends Container {
         // Clean up loop devices after save
         await this.cleanupLoopDevices(this.containerFile);
 
-        // If node-local is enabled, atomically persist the image to the node
-        if (this.nodeLocal.enabled) {
-            await this.nodeLocal.persistFromS3Download(this.containerFile);
-        }
-
         this.logDebug(
             `Save completed. Container file ready for upload: ${this.containerFile}`
         );
@@ -341,6 +331,18 @@ export class BtrfsContainer extends Container {
      */
     shouldSkipS3Upload(): boolean {
         return this.restoredFromNodeLocal && this.mountMode === "ro";
+    }
+
+    async getNodeLocalDownloadPath(): Promise<string | null> {
+        return this.nodeLocal.getDownloadPath();
+    }
+
+    async commitNodeLocalDownload(tempPath: string): Promise<boolean> {
+        return this.nodeLocal.commitTempFile(tempPath);
+    }
+
+    isNodeLocalEnabled(): boolean {
+        return this.nodeLocal.enabled;
     }
 
     // ── Private helpers ──────────────────────────────────────────────

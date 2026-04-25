@@ -95116,7 +95116,8 @@ var Outputs;
 (function (Outputs) {
     Outputs["CacheHit"] = "cache-hit";
     Outputs["CachePrimaryKey"] = "cache-primary-key";
-    Outputs["CacheMatchedKey"] = "cache-matched-key"; // Output from restore action
+    Outputs["CacheMatchedKey"] = "cache-matched-key";
+    Outputs["NodeLocalCacheHit"] = "node-local-cache-hit"; // Output from restore action: "true" | "false" | "disabled"
 })(Outputs = exports.Outputs || (exports.Outputs = {}));
 var State;
 (function (State) {
@@ -95536,9 +95537,11 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             // Initialize container (prerequisite checks, stale temp cleanup)
             yield cacheContainer.initialize();
             // Try node-local restore first (fast path: ~1-2s on warm node)
+            const nodeLocalEnabled = cacheContainer.isNodeLocalEnabled();
             const restoredFromLocal = yield cacheContainer.tryRestoreFromNodeLocal();
             if (restoredFromLocal) {
                 core.info("Cache restored from node-local storage (fast path)");
+                core.setOutput(constants_1.Outputs.NodeLocalCacheHit, "true");
                 return primaryKey;
             }
             // path are needed to compute version
@@ -95550,6 +95553,7 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             if (!(cacheEntry === null || cacheEntry === void 0 ? void 0 : cacheEntry.archiveLocation)) {
                 // Cache not found
                 core.debug("Cache not found");
+                core.setOutput(constants_1.Outputs.NodeLocalCacheHit, nodeLocalEnabled ? "false" : "disabled");
                 if (cacheContainer && cacheContainer.requiresCreateEmptyCache) {
                     yield cacheContainer.createEmptyCache();
                     core.debug(`Created empty cache container of type ${cacheContainer.constructor.name}`);
@@ -95560,8 +95564,28 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
                 core.info("Lookup only - skipping download");
                 return cacheEntry.cacheKey;
             }
-            // Download the cache from the cache entry
-            yield cacheHttpClient.downloadCache(cacheEntry.archiveLocation, archivePath, options);
+            // When node-local is enabled, download directly to the HostPath dir
+            // so we avoid a redundant copy. The temp file is committed atomically after download.
+            let downloadPath = archivePath;
+            const nodeLocalTempPath = yield cacheContainer.getNodeLocalDownloadPath();
+            if (nodeLocalTempPath) {
+                downloadPath = nodeLocalTempPath;
+                core.info(`[NodeLocal] S3 downloading directly to node-local temp: ${downloadPath}`);
+            }
+            yield cacheHttpClient.downloadCache(cacheEntry.archiveLocation, downloadPath, options);
+            // If downloaded to node-local temp, commit (atomic mv) and point container at the final path
+            if (nodeLocalTempPath) {
+                const committed = yield cacheContainer.commitNodeLocalDownload(nodeLocalTempPath);
+                if (committed) {
+                    core.info(`[NodeLocal] Committed download to node-local cache`);
+                }
+                else {
+                    core.info(`[NodeLocal] Another runner already committed — using existing`);
+                }
+                // Either way, the file is now at the final node-local path — use it for restore
+                // Update archivePath so restore() reads from the right location
+                archivePath = downloadPath;
+            }
             if (core.isDebug()) {
                 if (customCompression) {
                     core.debug("ListTar unavailable with custom compression method");
@@ -95570,10 +95594,14 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
                     yield (0, tar_1.listTar)(archivePath, compressionMethod);
                 }
             }
-            const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
+            const archiveFileSize = utils.getArchiveFileSizeInBytes(downloadPath);
             core.info(`Cache Size: ~${Math.round(archiveFileSize / (1024 * 1024))} MB (${archiveFileSize} B)`);
+            // Point the container at wherever we downloaded (node-local temp or default)
+            cacheContainer.setArchivePath(downloadPath);
             yield cacheContainer.restore();
             core.info("Cache restored successfully from S3");
+            // Report node-local cache miss (S3 fallback) or disabled
+            core.setOutput(constants_1.Outputs.NodeLocalCacheHit, nodeLocalEnabled ? "false" : "disabled");
             return cacheEntry.cacheKey;
         }
         catch (error) {
@@ -95684,6 +95712,26 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
             const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, key, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode });
             yield cacheContainer.initialize();
             yield cacheContainer.save();
+            // After save, persist to node-local if enabled (so subsequent runs on this node get a hit)
+            if (cacheContainer.isNodeLocalEnabled() && !cacheContainer.shouldSkipS3Upload()) {
+                const tempPath = yield cacheContainer.getNodeLocalDownloadPath();
+                if (tempPath) {
+                    try {
+                        const fsModule = yield Promise.resolve().then(() => __importStar(__nccwpck_require__(3292)));
+                        yield fsModule.copyFile(archivePath, tempPath);
+                        const committed = yield cacheContainer.commitNodeLocalDownload(tempPath);
+                        if (committed) {
+                            core.info("[NodeLocal] Saved image to node-local cache for future runs");
+                        }
+                        else {
+                            core.info("[NodeLocal] Node-local cache already populated by another runner");
+                        }
+                    }
+                    catch (err) {
+                        core.warning(`[NodeLocal] Failed to persist to node-local: ${err instanceof Error ? err.message : err}`);
+                    }
+                }
+            }
             // Skip S3 upload if the container was restored from node-local storage (WORM)
             if (cacheContainer.shouldSkipS3Upload()) {
                 core.info("Skipping S3 upload — restored from node-local cache (WORM)");
@@ -96613,10 +96661,6 @@ class BtrfsContainer extends Container_1.Container {
                     this.logInfo("Corrupted image detected — falling back to empty cache");
                     return this.createEmptyCache();
                 }
-                // If node-local is enabled, persist the S3 download to the node
-                if (this.nodeLocal.enabled) {
-                    yield this.nodeLocal.persistFromS3Download(this.containerFile);
-                }
                 if (this.mountMode === "ro") {
                     // Mount the downloaded image read-only
                     yield this.mountReadOnly(this.containerFile);
@@ -96703,10 +96747,6 @@ class BtrfsContainer extends Container_1.Container {
             yield exec.exec("sync", [], { silent: !core.isDebug() });
             // Clean up loop devices after save
             yield this.cleanupLoopDevices(this.containerFile);
-            // If node-local is enabled, atomically persist the image to the node
-            if (this.nodeLocal.enabled) {
-                yield this.nodeLocal.persistFromS3Download(this.containerFile);
-            }
             this.logDebug(`Save completed. Container file ready for upload: ${this.containerFile}`);
         });
     }
@@ -96715,6 +96755,19 @@ class BtrfsContainer extends Container_1.Container {
      */
     shouldSkipS3Upload() {
         return this.restoredFromNodeLocal && this.mountMode === "ro";
+    }
+    getNodeLocalDownloadPath() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.nodeLocal.getDownloadPath();
+        });
+    }
+    commitNodeLocalDownload(tempPath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.nodeLocal.commitTempFile(tempPath);
+        });
+    }
+    isNodeLocalEnabled() {
+        return this.nodeLocal.enabled;
     }
     // ── Private helpers ──────────────────────────────────────────────
     execWithOutput(command, args) {
@@ -97278,6 +97331,39 @@ class Container {
     shouldSkipS3Upload() {
         return false;
     }
+    /**
+     * Get the path where S3 should download the archive to.
+     * When node-local caching is enabled, returns a .tempXXX path in the HostPath dir
+     * so the download goes directly there (no copy).
+     * Returns null when node-local is disabled (caller uses default temp dir).
+     */
+    getNodeLocalDownloadPath() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return null;
+        });
+    }
+    /**
+     * Commit a node-local download: atomic mv from .tempXXX to final path.
+     * Called after S3 download completes when the download went to a node-local temp path.
+     * Returns true if committed, false if another runner beat us.
+     */
+    commitNodeLocalDownload(tempPath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return false;
+        });
+    }
+    /**
+     * Whether node-local caching is enabled for this container.
+     */
+    isNodeLocalEnabled() {
+        return false;
+    }
+    /**
+     * Update the archive file path (e.g., when S3 download goes to a different location).
+     */
+    setArchivePath(archivePath) {
+        this.containerFile = archivePath;
+    }
     // Common helper methods for all container implementations
     wrapError(operation, error) {
         return new Error(`Failed to ${operation}: ${error instanceof Error ? error.message : error}`);
@@ -97495,27 +97581,21 @@ class NodeLocalCache {
         });
     }
     /**
-     * Copy the S3-downloaded archive to the node-local cache directory as a temp file,
-     * then atomically commit it. Returns true if the file was persisted.
+     * Get the path where S3 should download the archive to.
+     * When node-local caching is enabled, returns a .tempXXX path in the HostPath dir
+     * so the download goes directly to the right place (no copy needed).
+     * When disabled, returns null (caller uses default temp dir).
      */
-    persistFromS3Download(s3ArchivePath) {
+    getDownloadPath() {
         return __awaiter(this, void 0, void 0, function* () {
             if (!this.enabled)
-                return false;
-            // Early check: skip if already populated by another runner
-            if (yield this.exists()) {
-                core.info(`[NodeLocal] Already populated by another runner — skipping persist`);
-                return false;
-            }
+                return null;
             try {
-                const tempPath = yield this.createTempFile();
-                yield fs.copyFile(s3ArchivePath, tempPath);
-                core.info(`[NodeLocal] Copied S3 download to temp: ${tempPath}`);
-                return yield this.commitTempFile(tempPath);
+                return yield this.createTempFile();
             }
             catch (error) {
-                core.warning(`[NodeLocal] Failed to persist S3 download: ${error instanceof Error ? error.message : error}`);
-                return false;
+                core.warning(`[NodeLocal] Failed to create download path, falling back to default: ${error instanceof Error ? error.message : error}`);
+                return null;
             }
         });
     }
@@ -97668,6 +97748,19 @@ class TarContainer extends Container_1.Container {
     shouldSkipS3Upload() {
         return this.restoredFromNodeLocal;
     }
+    getNodeLocalDownloadPath() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.nodeLocal.getDownloadPath();
+        });
+    }
+    commitNodeLocalDownload(tempPath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.nodeLocal.commitTempFile(tempPath);
+        });
+    }
+    isNodeLocalEnabled() {
+        return this.nodeLocal.enabled;
+    }
     getLogPrefix() {
         return "[TAR]";
     }
@@ -97677,10 +97770,6 @@ class TarContainer extends Container_1.Container {
     restore() {
         return __awaiter(this, void 0, void 0, function* () {
             try {
-                // Persist to node-local cache if enabled (after S3 download)
-                if (this.nodeLocal.enabled && !this.restoredFromNodeLocal) {
-                    yield this.nodeLocal.persistFromS3Download(this.containerFile);
-                }
                 return (0, tar_1.extractTar)(this.containerFile, this.compressionMethod);
             }
             catch (error) {
@@ -97788,6 +97877,19 @@ class TarLz4Container extends Container_1.Container {
     shouldSkipS3Upload() {
         return this.restoredFromNodeLocal;
     }
+    getNodeLocalDownloadPath() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.nodeLocal.getDownloadPath();
+        });
+    }
+    commitNodeLocalDownload(tempPath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.nodeLocal.commitTempFile(tempPath);
+        });
+    }
+    isNodeLocalEnabled() {
+        return this.nodeLocal.enabled;
+    }
     getLogPrefix() {
         return "[TAR-LZ4]";
     }
@@ -97797,10 +97899,6 @@ class TarLz4Container extends Container_1.Container {
     restore() {
         return __awaiter(this, void 0, void 0, function* () {
             try {
-                // Persist to node-local cache if enabled (after S3 download)
-                if (this.nodeLocal.enabled && !this.restoredFromNodeLocal) {
-                    yield this.nodeLocal.persistFromS3Download(this.containerFile);
-                }
                 if (this.compressionMethod && process.platform !== "win32") {
                     const compressionArgs = this.compressionMethod === "none"
                         ? ""
@@ -98028,6 +98126,19 @@ class VhdxContainer extends Container_1.Container {
     shouldSkipS3Upload() {
         return this.restoredFromNodeLocal;
     }
+    getNodeLocalDownloadPath() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.nodeLocal.getDownloadPath();
+        });
+    }
+    commitNodeLocalDownload(tempPath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.nodeLocal.commitTempFile(tempPath);
+        });
+    }
+    isNodeLocalEnabled() {
+        return this.nodeLocal.enabled;
+    }
     getLogPrefix() {
         return "[VHDX]";
     }
@@ -98197,10 +98308,6 @@ class VhdxContainer extends Container_1.Container {
                     this.logInfo("VHDX image not found — falling back to empty cache");
                     return this.createEmptyCache();
                 }
-                // Persist to node-local cache if enabled
-                if (this.nodeLocal.enabled) {
-                    yield this.nodeLocal.persistFromS3Download(this.containerFile);
-                }
                 this.logInfo(`Mounting VHDX: ${this.containerFile}`);
                 const absPath = path.resolve(this.containerFile);
                 yield this.execWithTimeout(() => this.psExec(`Mount-DiskImage -ImagePath '${absPath}' -Access ReadWrite -PassThru | Out-Null`), MOUNT_TIMEOUT_MS, `mount VHDX ${absPath}`);
@@ -98243,10 +98350,6 @@ class VhdxContainer extends Container_1.Container {
             const absPath = path.resolve(this.containerFile);
             this.logDebug(`Dismounting VHDX: ${absPath}`);
             yield this.psExec(`Dismount-DiskImage -ImagePath '${absPath}' | Out-Null`);
-            // Persist to node-local cache if enabled
-            if (this.nodeLocal.enabled) {
-                yield this.nodeLocal.persistFromS3Download(this.containerFile);
-            }
             this.logDebug(`Save completed. Container file ready for upload: ${this.containerFile}`);
         });
     }

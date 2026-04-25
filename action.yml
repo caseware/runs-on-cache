@@ -67,6 +67,8 @@ inputs:
 outputs:
   cache-hit:
     description: 'A boolean value to indicate an exact match was found for the primary key'
+  node-local-cache-hit:
+    description: 'Whether the cache was restored from node-local storage: "true" (node-local hit), "false" (S3 fallback), or "disabled" (node-local not configured)'
 runs:
   using: 'node20'
   main: 'dist/restore/index.js'

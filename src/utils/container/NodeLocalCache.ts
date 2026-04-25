@@ -131,30 +131,23 @@ export class NodeLocalCache {
     }
 
     /**
-     * Copy the S3-downloaded archive to the node-local cache directory as a temp file,
-     * then atomically commit it. Returns true if the file was persisted.
+     * Get the path where S3 should download the archive to.
+     * When node-local caching is enabled, returns a .tempXXX path in the HostPath dir
+     * so the download goes directly to the right place (no copy needed).
+     * When disabled, returns null (caller uses default temp dir).
      */
-    async persistFromS3Download(s3ArchivePath: string): Promise<boolean> {
-        if (!this.enabled) return false;
-
-        // Early check: skip if already populated by another runner
-        if (await this.exists()) {
-            core.info(`[NodeLocal] Already populated by another runner — skipping persist`);
-            return false;
-        }
+    async getDownloadPath(): Promise<string | null> {
+        if (!this.enabled) return null;
 
         try {
-            const tempPath = await this.createTempFile();
-            await fs.copyFile(s3ArchivePath, tempPath);
-            core.info(`[NodeLocal] Copied S3 download to temp: ${tempPath}`);
-            return await this.commitTempFile(tempPath);
+            return await this.createTempFile();
         } catch (error) {
             core.warning(
-                `[NodeLocal] Failed to persist S3 download: ${
+                `[NodeLocal] Failed to create download path, falling back to default: ${
                     error instanceof Error ? error.message : error
                 }`
             );
-            return false;
+            return null;
         }
     }
 
