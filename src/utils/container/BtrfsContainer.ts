@@ -6,6 +6,9 @@ import * as path from "path";
 import { createCacheKeySpecificTempDirectory } from "../actionUtils";
 import { Container, ContainerOptions } from "./Container";
 
+const MOUNT_TIMEOUT_MS = 30_000;
+const MIN_DISK_HEADROOM_MB = 1024;
+
 export class BtrfsContainer extends Container {
     public requiresCreateEmptyCache = true;
     public requiresKeepArchive = true;
@@ -126,8 +129,15 @@ export class BtrfsContainer extends Container {
         const args = useSudo ? ["mount", ...mountArgs] : mountArgs;
 
         try {
-            await exec.exec(command, args, { silent: !core.isDebug() });
+            await this.execWithTimeout(
+                () =>
+                    exec.exec(command, args, { silent: !core.isDebug() }),
+                MOUNT_TIMEOUT_MS,
+                `mount ${device} at ${mountPath}`
+            );
         } catch (error) {
+            // On mount failure, clean up any loop device that may have been allocated
+            await this.cleanupLoopDevices(device);
             throw this.wrapError(`mount ${device} at ${mountPath}`, error);
         }
     }
@@ -153,13 +163,231 @@ export class BtrfsContainer extends Container {
         }
     }
 
+    /**
+     * Execute a promise with a timeout. If the operation exceeds the timeout,
+     * reject with a descriptive error.
+     */
+    private async execWithTimeout<T>(
+        fn: () => Promise<T>,
+        timeoutMs: number,
+        description: string
+    ): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                reject(
+                    new Error(
+                        `${this.getLogPrefix()} Operation timed out after ${timeoutMs}ms: ${description}`
+                    )
+                );
+            }, timeoutMs);
+
+            fn().then(
+                result => {
+                    clearTimeout(timer);
+                    resolve(result);
+                },
+                err => {
+                    clearTimeout(timer);
+                    reject(err);
+                }
+            );
+        });
+    }
+
+    /**
+     * Clean up any loop devices associated with a given file.
+     * Prevents loop device leaks when mount fails partway through.
+     */
+    private async cleanupLoopDevices(imageFile: string): Promise<void> {
+        try {
+            const output = await this.execWithOutput("losetup", [
+                "-j",
+                imageFile
+            ]);
+            if (!output) return;
+
+            // Output format: /dev/loop0: [0050]:12345 (/path/to/file)
+            const devices = output
+                .split("\n")
+                .map(line => line.split(":")[0])
+                .filter(d => d.startsWith("/dev/loop"));
+
+            for (const device of devices) {
+                this.logDebug(`Cleaning up leaked loop device: ${device}`);
+                try {
+                    await this.execSudo("losetup", ["-d", device]);
+                } catch {
+                    core.warning(
+                        `${this.getLogPrefix()} Failed to detach loop device ${device}`
+                    );
+                }
+            }
+        } catch {
+            // losetup -j may fail if no loop devices exist; that's fine
+        }
+    }
+
+    /**
+     * Check available disk space and warn or fail if insufficient.
+     * Returns available space in bytes.
+     */
+    private async checkDiskSpace(targetPath: string): Promise<number> {
+        try {
+            const output = await this.execWithOutput("df", [
+                "--output=avail",
+                "-B1",
+                targetPath
+            ]);
+            const lines = output.split("\n");
+            // Skip header line
+            const availStr = lines[lines.length - 1]?.trim();
+            if (availStr) {
+                const availBytes = parseInt(availStr, 10);
+                const availMb = Math.floor(availBytes / (1024 * 1024));
+                this.logDebug(`Available disk space: ${availMb} MB`);
+
+                if (availMb < MIN_DISK_HEADROOM_MB) {
+                    core.warning(
+                        `${this.getLogPrefix()} Low disk space: ${availMb} MB available ` +
+                            `(minimum recommended: ${MIN_DISK_HEADROOM_MB} MB). ` +
+                            `BTRFS operations may fail.`
+                    );
+                }
+                return availBytes;
+            }
+        } catch {
+            this.logDebug("Could not check disk space (non-critical)");
+        }
+        return 0;
+    }
+
+    /**
+     * Calculate the optimal sparse file size based on available disk space.
+     * Uses the smaller of: configured fsSize or 80% of available disk.
+     * The sparse file only consumes actual written bytes, so this is a virtual ceiling.
+     */
+    private async calculateSparseSize(): Promise<string> {
+        const availBytes = await this.checkDiskSpace(
+            path.dirname(this.containerFile)
+        );
+
+        if (availBytes === 0) {
+            // Couldn't determine disk space; use configured size
+            return this.fsSize;
+        }
+
+        // Parse configured fsSize to bytes
+        const configuredBytes = this.parseSizeToBytes(this.fsSize);
+
+        // Use 80% of available space as the virtual ceiling
+        const safeMaxBytes = Math.floor(availBytes * 0.8);
+
+        if (configuredBytes > safeMaxBytes && safeMaxBytes > 0) {
+            const safeSizeGb = Math.max(
+                1,
+                Math.floor(safeMaxBytes / (1024 * 1024 * 1024))
+            );
+            this.logInfo(
+                `Reducing sparse file size from ${this.fsSize} to ${safeSizeGb}G ` +
+                    `(80% of ${Math.floor(availBytes / (1024 * 1024 * 1024))}G available)`
+            );
+            return `${safeSizeGb}G`;
+        }
+
+        return this.fsSize;
+    }
+
+    private parseSizeToBytes(size: string): number {
+        const match = size.match(/^(\d+)([KMGT])?$/);
+        if (!match) return 0;
+
+        let bytes = parseInt(match[1], 10);
+        switch (match[2]) {
+            case "K":
+                bytes *= 1024;
+                break;
+            case "M":
+                bytes *= 1024 * 1024;
+                break;
+            case "G":
+                bytes *= 1024 * 1024 * 1024;
+                break;
+            case "T":
+                bytes *= 1024 * 1024 * 1024 * 1024;
+                break;
+        }
+        return bytes;
+    }
+
+    /**
+     * Verify the integrity of a downloaded BTRFS image before mounting.
+     * Runs `btrfs check --readonly` to detect corruption.
+     * Returns true if the image is healthy, false if corrupted.
+     */
+    private async verifyImageIntegrity(imageFile: string): Promise<boolean> {
+        try {
+            this.logDebug(`Checking image integrity: ${imageFile}`);
+            await exec.exec("sudo", ["btrfs", "check", "--readonly", imageFile], {
+                silent: !core.isDebug()
+            });
+            this.logDebug("Image integrity check passed");
+            return true;
+        } catch (error) {
+            core.warning(
+                `${this.getLogPrefix()} Image integrity check failed for ${imageFile}: ${
+                    error instanceof Error ? error.message : error
+                }. Will recreate cache from scratch.`
+            );
+            return false;
+        }
+    }
+
+    /**
+     * Check filesystem health after mounting by reading device stats.
+     * Reports any I/O errors detected by BTRFS.
+     */
+    private async checkFilesystemHealth(): Promise<void> {
+        if (!this.mountPoint) return;
+
+        try {
+            const output = await this.execWithOutput("sudo", [
+                "btrfs",
+                "device",
+                "stats",
+                this.mountPoint
+            ]);
+
+            // Parse stats: look for non-zero error counters
+            const errorLines = output
+                .split("\n")
+                .filter(line => {
+                    const match = line.match(/\.(\w+_errs)\s+(\d+)/);
+                    return match && parseInt(match[2], 10) > 0;
+                });
+
+            if (errorLines.length > 0) {
+                core.warning(
+                    `${this.getLogPrefix()} Filesystem has I/O errors:\n${errorLines.join("\n")}` +
+                        `\nConsider recreating the cache image.`
+                );
+            } else {
+                this.logDebug("Filesystem health check: no errors detected");
+            }
+        } catch {
+            this.logDebug("Could not check filesystem health (non-critical)");
+        }
+    }
+
     async createEmptyCache(): Promise<void> {
         try {
+            // Calculate optimal sparse file size based on available disk space
+            const effectiveSize = await this.calculateSparseSize();
+
             // Create new empty cache image
-            this.logInfo(`Creating sparse image: ${this.containerFile}`);
+            this.logInfo(`Creating sparse image: ${this.containerFile} (virtual size: ${effectiveSize})`);
             await exec.exec("truncate", [
                 "-s",
-                this.fsSize,
+                effectiveSize,
                 this.containerFile
             ]);
 
@@ -172,14 +400,32 @@ export class BtrfsContainer extends Container {
             // Mount the filesystem so workspace operations write directly to it
             return this.mount();
         } catch (error) {
+            // Clean up loop devices on failure
+            await this.cleanupLoopDevices(this.containerFile);
             throw this.wrapError("create empty BTRFS cache", error);
         }
     }
 
     async restore(): Promise<void> {
         try {
-            return this.mount();
+            // Verify image integrity before mounting
+            const isHealthy = await this.verifyImageIntegrity(
+                this.containerFile
+            );
+            if (!isHealthy) {
+                this.logInfo(
+                    "Corrupted image detected — falling back to empty cache"
+                );
+                return this.createEmptyCache();
+            }
+
+            await this.mount();
+
+            // Check filesystem health after mount
+            await this.checkFilesystemHealth();
         } catch (error) {
+            // Clean up any leaked loop devices
+            await this.cleanupLoopDevices(this.containerFile);
             throw this.wrapError("restore BTRFS cache", error);
         }
     }
@@ -236,6 +482,9 @@ export class BtrfsContainer extends Container {
 
         // Additional sync and wait after unmount to ensure file is fully accessible
         await exec.exec("sync", [], { silent: !core.isDebug() });
+
+        // Clean up loop devices after save
+        await this.cleanupLoopDevices(this.containerFile);
 
         this.logDebug(
             `Save completed. Container file ready for upload: ${this.containerFile}`
@@ -455,6 +704,8 @@ export class BtrfsContainer extends Container {
             });
             await Promise.all(promises);
         } catch (error) {
+            // Clean up loop devices on mount failure
+            await this.cleanupLoopDevices(this.containerFile);
             throw new Error(
                 `Failed to mount BTRFS filesystem: ${
                     error instanceof Error ? error.message : error

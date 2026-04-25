@@ -96450,6 +96450,8 @@ const fs = __importStar(__nccwpck_require__(3292));
 const path = __importStar(__nccwpck_require__(1017));
 const actionUtils_1 = __nccwpck_require__(6850);
 const Container_1 = __nccwpck_require__(9620);
+const MOUNT_TIMEOUT_MS = 30000;
+const MIN_DISK_HEADROOM_MB = 1024;
 class BtrfsContainer extends Container_1.Container {
     constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
         var _a;
@@ -96520,9 +96522,11 @@ class BtrfsContainer extends Container_1.Container {
             const command = useSudo ? "sudo" : "mount";
             const args = useSudo ? ["mount", ...mountArgs] : mountArgs;
             try {
-                yield exec.exec(command, args, { silent: !core.isDebug() });
+                yield this.execWithTimeout(() => exec.exec(command, args, { silent: !core.isDebug() }), MOUNT_TIMEOUT_MS, `mount ${device} at ${mountPath}`);
             }
             catch (error) {
+                // On mount failure, clean up any loop device that may have been allocated
+                yield this.cleanupLoopDevices(device);
                 throw this.wrapError(`mount ${device} at ${mountPath}`, error);
             }
         });
@@ -96544,14 +96548,205 @@ class BtrfsContainer extends Container_1.Container {
             }
         });
     }
+    /**
+     * Execute a promise with a timeout. If the operation exceeds the timeout,
+     * reject with a descriptive error.
+     */
+    execWithTimeout(fn, timeoutMs, description) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    reject(new Error(`${this.getLogPrefix()} Operation timed out after ${timeoutMs}ms: ${description}`));
+                }, timeoutMs);
+                fn().then(result => {
+                    clearTimeout(timer);
+                    resolve(result);
+                }, err => {
+                    clearTimeout(timer);
+                    reject(err);
+                });
+            });
+        });
+    }
+    /**
+     * Clean up any loop devices associated with a given file.
+     * Prevents loop device leaks when mount fails partway through.
+     */
+    cleanupLoopDevices(imageFile) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const output = yield this.execWithOutput("losetup", [
+                    "-j",
+                    imageFile
+                ]);
+                if (!output)
+                    return;
+                // Output format: /dev/loop0: [0050]:12345 (/path/to/file)
+                const devices = output
+                    .split("\n")
+                    .map(line => line.split(":")[0])
+                    .filter(d => d.startsWith("/dev/loop"));
+                for (const device of devices) {
+                    this.logDebug(`Cleaning up leaked loop device: ${device}`);
+                    try {
+                        yield this.execSudo("losetup", ["-d", device]);
+                    }
+                    catch (_a) {
+                        core.warning(`${this.getLogPrefix()} Failed to detach loop device ${device}`);
+                    }
+                }
+            }
+            catch (_b) {
+                // losetup -j may fail if no loop devices exist; that's fine
+            }
+        });
+    }
+    /**
+     * Check available disk space and warn or fail if insufficient.
+     * Returns available space in bytes.
+     */
+    checkDiskSpace(targetPath) {
+        var _a;
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const output = yield this.execWithOutput("df", [
+                    "--output=avail",
+                    "-B1",
+                    targetPath
+                ]);
+                const lines = output.split("\n");
+                // Skip header line
+                const availStr = (_a = lines[lines.length - 1]) === null || _a === void 0 ? void 0 : _a.trim();
+                if (availStr) {
+                    const availBytes = parseInt(availStr, 10);
+                    const availMb = Math.floor(availBytes / (1024 * 1024));
+                    this.logDebug(`Available disk space: ${availMb} MB`);
+                    if (availMb < MIN_DISK_HEADROOM_MB) {
+                        core.warning(`${this.getLogPrefix()} Low disk space: ${availMb} MB available ` +
+                            `(minimum recommended: ${MIN_DISK_HEADROOM_MB} MB). ` +
+                            `BTRFS operations may fail.`);
+                    }
+                    return availBytes;
+                }
+            }
+            catch (_b) {
+                this.logDebug("Could not check disk space (non-critical)");
+            }
+            return 0;
+        });
+    }
+    /**
+     * Calculate the optimal sparse file size based on available disk space.
+     * Uses the smaller of: configured fsSize or 80% of available disk.
+     * The sparse file only consumes actual written bytes, so this is a virtual ceiling.
+     */
+    calculateSparseSize() {
+        return __awaiter(this, void 0, void 0, function* () {
+            const availBytes = yield this.checkDiskSpace(path.dirname(this.containerFile));
+            if (availBytes === 0) {
+                // Couldn't determine disk space; use configured size
+                return this.fsSize;
+            }
+            // Parse configured fsSize to bytes
+            const configuredBytes = this.parseSizeToBytes(this.fsSize);
+            // Use 80% of available space as the virtual ceiling
+            const safeMaxBytes = Math.floor(availBytes * 0.8);
+            if (configuredBytes > safeMaxBytes && safeMaxBytes > 0) {
+                const safeSizeGb = Math.max(1, Math.floor(safeMaxBytes / (1024 * 1024 * 1024)));
+                this.logInfo(`Reducing sparse file size from ${this.fsSize} to ${safeSizeGb}G ` +
+                    `(80% of ${Math.floor(availBytes / (1024 * 1024 * 1024))}G available)`);
+                return `${safeSizeGb}G`;
+            }
+            return this.fsSize;
+        });
+    }
+    parseSizeToBytes(size) {
+        const match = size.match(/^(\d+)([KMGT])?$/);
+        if (!match)
+            return 0;
+        let bytes = parseInt(match[1], 10);
+        switch (match[2]) {
+            case "K":
+                bytes *= 1024;
+                break;
+            case "M":
+                bytes *= 1024 * 1024;
+                break;
+            case "G":
+                bytes *= 1024 * 1024 * 1024;
+                break;
+            case "T":
+                bytes *= 1024 * 1024 * 1024 * 1024;
+                break;
+        }
+        return bytes;
+    }
+    /**
+     * Verify the integrity of a downloaded BTRFS image before mounting.
+     * Runs `btrfs check --readonly` to detect corruption.
+     * Returns true if the image is healthy, false if corrupted.
+     */
+    verifyImageIntegrity(imageFile) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                this.logDebug(`Checking image integrity: ${imageFile}`);
+                yield exec.exec("sudo", ["btrfs", "check", "--readonly", imageFile], {
+                    silent: !core.isDebug()
+                });
+                this.logDebug("Image integrity check passed");
+                return true;
+            }
+            catch (error) {
+                core.warning(`${this.getLogPrefix()} Image integrity check failed for ${imageFile}: ${error instanceof Error ? error.message : error}. Will recreate cache from scratch.`);
+                return false;
+            }
+        });
+    }
+    /**
+     * Check filesystem health after mounting by reading device stats.
+     * Reports any I/O errors detected by BTRFS.
+     */
+    checkFilesystemHealth() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.mountPoint)
+                return;
+            try {
+                const output = yield this.execWithOutput("sudo", [
+                    "btrfs",
+                    "device",
+                    "stats",
+                    this.mountPoint
+                ]);
+                // Parse stats: look for non-zero error counters
+                const errorLines = output
+                    .split("\n")
+                    .filter(line => {
+                    const match = line.match(/\.(\w+_errs)\s+(\d+)/);
+                    return match && parseInt(match[2], 10) > 0;
+                });
+                if (errorLines.length > 0) {
+                    core.warning(`${this.getLogPrefix()} Filesystem has I/O errors:\n${errorLines.join("\n")}` +
+                        `\nConsider recreating the cache image.`);
+                }
+                else {
+                    this.logDebug("Filesystem health check: no errors detected");
+                }
+            }
+            catch (_a) {
+                this.logDebug("Could not check filesystem health (non-critical)");
+            }
+        });
+    }
     createEmptyCache() {
         return __awaiter(this, void 0, void 0, function* () {
             try {
+                // Calculate optimal sparse file size based on available disk space
+                const effectiveSize = yield this.calculateSparseSize();
                 // Create new empty cache image
-                this.logInfo(`Creating sparse image: ${this.containerFile}`);
+                this.logInfo(`Creating sparse image: ${this.containerFile} (virtual size: ${effectiveSize})`);
                 yield exec.exec("truncate", [
                     "-s",
-                    this.fsSize,
+                    effectiveSize,
                     this.containerFile
                 ]);
                 // Format with BTRFS
@@ -96563,6 +96758,8 @@ class BtrfsContainer extends Container_1.Container {
                 return this.mount();
             }
             catch (error) {
+                // Clean up loop devices on failure
+                yield this.cleanupLoopDevices(this.containerFile);
                 throw this.wrapError("create empty BTRFS cache", error);
             }
         });
@@ -96570,9 +96767,19 @@ class BtrfsContainer extends Container_1.Container {
     restore() {
         return __awaiter(this, void 0, void 0, function* () {
             try {
-                return this.mount();
+                // Verify image integrity before mounting
+                const isHealthy = yield this.verifyImageIntegrity(this.containerFile);
+                if (!isHealthy) {
+                    this.logInfo("Corrupted image detected — falling back to empty cache");
+                    return this.createEmptyCache();
+                }
+                yield this.mount();
+                // Check filesystem health after mount
+                yield this.checkFilesystemHealth();
             }
             catch (error) {
+                // Clean up any leaked loop devices
+                yield this.cleanupLoopDevices(this.containerFile);
                 throw this.wrapError("restore BTRFS cache", error);
             }
         });
@@ -96611,6 +96818,8 @@ class BtrfsContainer extends Container_1.Container {
             yield exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
             // Additional sync and wait after unmount to ensure file is fully accessible
             yield exec.exec("sync", [], { silent: !core.isDebug() });
+            // Clean up loop devices after save
+            yield this.cleanupLoopDevices(this.containerFile);
             this.logDebug(`Save completed. Container file ready for upload: ${this.containerFile}`);
         });
     }
@@ -96786,6 +96995,8 @@ class BtrfsContainer extends Container_1.Container {
                 yield Promise.all(promises);
             }
             catch (error) {
+                // Clean up loop devices on mount failure
+                yield this.cleanupLoopDevices(this.containerFile);
                 throw new Error(`Failed to mount BTRFS filesystem: ${error instanceof Error ? error.message : error}`);
             }
         });
@@ -96935,8 +97146,10 @@ exports.ContainerFactory = void 0;
 const BtrfsContainer_1 = __nccwpck_require__(3145);
 const TarContainer_1 = __nccwpck_require__(7332);
 const TarLz4Container_1 = __nccwpck_require__(292);
+const VhdxContainer_1 = __nccwpck_require__(5498);
 const SUPPORTED_CLASSES = {
     btrfs: BtrfsContainer_1.BtrfsContainer,
+    vhdx: VhdxContainer_1.VhdxContainer,
     tarLz4: TarLz4Container_1.TarLz4Container,
     tar: TarContainer_1.TarContainer
 };
@@ -97173,6 +97386,430 @@ class TarLz4Container extends Container_1.Container {
     }
 }
 exports.TarLz4Container = TarLz4Container;
+
+
+/***/ }),
+
+/***/ 5498:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.VhdxContainer = void 0;
+const core = __importStar(__nccwpck_require__(2186));
+const exec = __importStar(__nccwpck_require__(1514));
+const fs = __importStar(__nccwpck_require__(3292));
+const path = __importStar(__nccwpck_require__(1017));
+const actionUtils_1 = __nccwpck_require__(6850);
+const Container_1 = __nccwpck_require__(9620);
+const MOUNT_TIMEOUT_MS = 60000;
+const MIN_DISK_HEADROOM_MB = 1024;
+/**
+ * VhdxContainer implements Windows disk-image caching using VHD/VHDX files.
+ *
+ * Strategy: create a dynamically-expanding VHDX → format NTFS with compression
+ * → mount to a drive letter → junction-link workspace paths to the mounted volume.
+ *
+ * Uses `diskpart` for VHD creation (available on all Windows Server images) and
+ * `Mount-DiskImage` / `Dismount-DiskImage` from the built-in Storage PowerShell
+ * module for mount operations (does NOT require Hyper-V).
+ */
+class VhdxContainer extends Container_1.Container {
+    constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
+        var _a;
+        super(containerFile, compressionMethod, compressionLevel !== null && compressionLevel !== void 0 ? compressionLevel : "ntfs", baseDir, pathsToCache, cacheKey, options);
+        this.requiresCreateEmptyCache = true;
+        this.requiresKeepArchive = true;
+        if (!options.fsSize) {
+            throw new Error("fsSize option is required for VhdxContainer");
+        }
+        this.fsSize = options.fsSize;
+        this.bufferBytes = ((_a = options.bufferMb) !== null && _a !== void 0 ? _a : 512) * 1024 * 1024;
+        // Security: validate paths
+        this.checkPathTraversal(this.baseDir, this.containerFile);
+        this.pathsToCache.forEach(p => this.checkPathTraversal(this.baseDir, p));
+        // Validate fsSize format
+        if (!/^[0-9]+[KMGT]?$/.test(this.fsSize)) {
+            throw new Error(`Invalid filesystem size format: ${this.fsSize}. Must be a number followed by optional K, M, G, or T.`);
+        }
+    }
+    isSupportedMethod(method) {
+        return method === "vhdx";
+    }
+    initialize() {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                yield this.checkPrerequisites();
+            }
+            catch (e) {
+                core.setFailed(e.message);
+                process.exit(1);
+            }
+        });
+    }
+    getLogPrefix() {
+        return "[VHDX]";
+    }
+    // ── Helpers ──────────────────────────────────────────────────────
+    psExec(script) {
+        return __awaiter(this, void 0, void 0, function* () {
+            let output = "";
+            yield exec.exec("powershell", ["-NoProfile", "-Command", script], {
+                listeners: {
+                    stdout: (data) => {
+                        output += data.toString();
+                    }
+                },
+                silent: !core.isDebug()
+            });
+            return output.trim();
+        });
+    }
+    execWithTimeout(fn, timeoutMs, description) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    reject(new Error(`${this.getLogPrefix()} Operation timed out after ${timeoutMs}ms: ${description}`));
+                }, timeoutMs);
+                fn().then(result => {
+                    clearTimeout(timer);
+                    resolve(result);
+                }, err => {
+                    clearTimeout(timer);
+                    reject(err);
+                });
+            });
+        });
+    }
+    checkPathTraversal(base, pathToCheck) {
+        const absBase = path.resolve(base);
+        const absPath = path.resolve(path.join(base, pathToCheck));
+        if (!absPath.startsWith(absBase)) {
+            throw new Error(`Path traversal detected: ${pathToCheck} resolves outside base directory`);
+        }
+    }
+    parseSizeToMb(size) {
+        const match = size.match(/^(\d+)([KMGT])?$/);
+        if (!match)
+            return 0;
+        let mb = parseInt(match[1], 10);
+        switch (match[2]) {
+            case "K":
+                mb = Math.ceil(mb / 1024);
+                break;
+            case "M":
+                break;
+            case "G":
+                mb *= 1024;
+                break;
+            case "T":
+                mb *= 1024 * 1024;
+                break;
+            default:
+                mb = Math.ceil(mb / (1024 * 1024));
+                break;
+        }
+        return mb;
+    }
+    checkDiskSpace(targetPath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const driveLetter = path.parse(targetPath).root || "C:\\";
+                const output = yield this.psExec(`(Get-PSDrive -Name '${driveLetter[0]}').Free`);
+                const freeBytes = parseInt(output, 10);
+                if (!isNaN(freeBytes)) {
+                    const freeMb = Math.floor(freeBytes / (1024 * 1024));
+                    this.logDebug(`Available disk space on ${driveLetter}: ${freeMb} MB`);
+                    if (freeMb < MIN_DISK_HEADROOM_MB) {
+                        core.warning(`${this.getLogPrefix()} Low disk space: ${freeMb} MB available ` +
+                            `(minimum recommended: ${MIN_DISK_HEADROOM_MB} MB).`);
+                    }
+                    return freeBytes;
+                }
+            }
+            catch (_a) {
+                this.logDebug("Could not check disk space (non-critical)");
+            }
+            return 0;
+        });
+    }
+    // ── Prerequisites ───────────────────────────────────────────────
+    checkPrerequisites() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (process.platform !== "win32") {
+                throw new Error(`VHDX compression is only supported on Windows platforms. ` +
+                    `Current platform: ${process.platform}. ` +
+                    `Use 'btrfs' on Linux runners instead.`);
+            }
+            // Verify diskpart is available
+            try {
+                yield exec.exec("where", ["diskpart"], {
+                    silent: !core.isDebug()
+                });
+            }
+            catch (_a) {
+                throw new Error("diskpart is required but not found. This should be available on all Windows Server runners.");
+            }
+            // Verify Mount-DiskImage cmdlet (Storage module)
+            try {
+                yield this.psExec("Get-Command Mount-DiskImage -ErrorAction Stop | Out-Null");
+            }
+            catch (_b) {
+                throw new Error("Mount-DiskImage cmdlet not found. The Storage PowerShell module is required.");
+            }
+        });
+    }
+    // ── Create (cache miss) ─────────────────────────────────────────
+    createEmptyCache() {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const sizeMb = this.parseSizeToMb(this.fsSize);
+                yield this.checkDiskSpace(path.dirname(this.containerFile));
+                this.logInfo(`Creating dynamic VHDX: ${this.containerFile} (max ${sizeMb} MB)`);
+                // Use diskpart to create a dynamic VHDX
+                const absPath = path.resolve(this.containerFile);
+                const scriptContent = [
+                    `create vdisk file="${absPath}" maximum=${sizeMb} type=expandable`,
+                    `select vdisk file="${absPath}"`,
+                    `attach vdisk`,
+                    `create partition primary`,
+                    `format fs=ntfs quick compress`,
+                    `assign`
+                ].join("\n");
+                const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
+                const scriptPath = path.join(tempDir, "create-vhdx.txt");
+                yield fs.mkdir(tempDir, { recursive: true });
+                yield fs.writeFile(scriptPath, scriptContent, "utf-8");
+                yield exec.exec("diskpart", ["/s", scriptPath], {
+                    silent: !core.isDebug()
+                });
+                // Discover which drive letter was assigned
+                yield this.discoverMountedDrive();
+                if (!this.mountDriveLetter) {
+                    throw new Error("VHDX created and attached but no drive letter was assigned");
+                }
+                // Enable NTFS compression on the root of the volume
+                yield exec.exec("compact", [
+                    "/c",
+                    "/s",
+                    `/i`,
+                    `${this.mountDriveLetter}:\\`
+                ], { silent: !core.isDebug() });
+                // Create junction points
+                yield this.createJunctions();
+            }
+            catch (error) {
+                yield this.safeDetach();
+                throw this.wrapError("create empty VHDX cache", error);
+            }
+        });
+    }
+    // ── Restore (cache hit) ─────────────────────────────────────────
+    restore() {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                // Verify image exists
+                try {
+                    yield fs.access(this.containerFile);
+                }
+                catch (_a) {
+                    this.logInfo("VHDX image not found — falling back to empty cache");
+                    return this.createEmptyCache();
+                }
+                this.logInfo(`Mounting VHDX: ${this.containerFile}`);
+                const absPath = path.resolve(this.containerFile);
+                yield this.execWithTimeout(() => this.psExec(`Mount-DiskImage -ImagePath '${absPath}' -Access ReadWrite -PassThru | Out-Null`), MOUNT_TIMEOUT_MS, `mount VHDX ${absPath}`);
+                yield this.discoverMountedDrive();
+                if (!this.mountDriveLetter) {
+                    core.warning(`${this.getLogPrefix()} VHDX mounted but no drive letter found — falling back to empty cache`);
+                    yield this.safeDetach();
+                    return this.createEmptyCache();
+                }
+                // Run NTFS chkdsk (readonly) to detect corruption
+                yield this.checkVolumeHealth();
+                yield this.createJunctions();
+            }
+            catch (error) {
+                yield this.safeDetach();
+                throw this.wrapError("restore VHDX cache", error);
+            }
+        });
+    }
+    // ── Save ────────────────────────────────────────────────────────
+    save() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.mountDriveLetter) {
+                yield this.discoverMountedDrive();
+            }
+            if (!this.mountDriveLetter) {
+                throw this.createError("No mounted drive letter found for save");
+            }
+            // Remove junction points before dismount
+            yield this.removeJunctions();
+            // Compact the volume to reclaim space
+            this.logDebug("Compacting NTFS volume");
+            try {
+                yield exec.exec("compact", ["/c", "/s", "/i", `${this.mountDriveLetter}:\\`], { silent: !core.isDebug() });
+            }
+            catch (_a) {
+                this.logDebug("Compact failed (non-critical)");
+            }
+            // Dismount the VHDX (this also detaches)
+            const absPath = path.resolve(this.containerFile);
+            this.logDebug(`Dismounting VHDX: ${absPath}`);
+            yield this.psExec(`Dismount-DiskImage -ImagePath '${absPath}' | Out-Null`);
+            this.logDebug(`Save completed. Container file ready for upload: ${this.containerFile}`);
+        });
+    }
+    // ── Junction management ─────────────────────────────────────────
+    createJunctions() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.mountDriveLetter) {
+                throw new Error("Drive letter not set");
+            }
+            for (const p of this.pathsToCache) {
+                const absPath = path.join(this.baseDir, p);
+                const vhdxPath = path.join(`${this.mountDriveLetter}:\\`, p);
+                this.logDebug(`Creating junction: ${absPath} → ${vhdxPath}`);
+                // Ensure the target directory exists on the VHDX volume
+                yield fs.mkdir(vhdxPath, { recursive: true });
+                // Remove existing directory/junction at the workspace path
+                try {
+                    const stat = yield fs.lstat(absPath);
+                    if (stat.isSymbolicLink() || stat.isDirectory()) {
+                        // For junctions/symlinks, just remove the link
+                        yield this.psExec(`if (Test-Path '${absPath}') { ` +
+                            `$item = Get-Item '${absPath}' -Force; ` +
+                            `if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { ` +
+                            `  [IO.Directory]::Delete('${absPath}'); ` +
+                            `} else { Remove-Item '${absPath}' -Recurse -Force } }`);
+                    }
+                }
+                catch (_a) {
+                    // Path doesn't exist yet — that's fine
+                }
+                // Create NTFS junction point
+                yield exec.exec("cmd", ["/c", "mklink", "/J", absPath, vhdxPath], {
+                    silent: !core.isDebug()
+                });
+            }
+        });
+    }
+    removeJunctions() {
+        return __awaiter(this, void 0, void 0, function* () {
+            for (const p of this.pathsToCache) {
+                const absPath = path.join(this.baseDir, p);
+                try {
+                    const stat = yield fs.lstat(absPath);
+                    if (stat.isSymbolicLink() || stat.isDirectory()) {
+                        yield this.psExec(`$item = Get-Item '${absPath}' -Force; ` +
+                            `if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { ` +
+                            `  [IO.Directory]::Delete('${absPath}') }`);
+                        this.logDebug(`Removed junction: ${absPath}`);
+                    }
+                }
+                catch (_a) {
+                    // Not a junction or doesn't exist
+                }
+            }
+        });
+    }
+    // ── Drive discovery ─────────────────────────────────────────────
+    discoverMountedDrive() {
+        return __awaiter(this, void 0, void 0, function* () {
+            const absPath = path.resolve(this.containerFile);
+            // Get the drive letter via PowerShell
+            const output = yield this.psExec(`$disk = Get-DiskImage -ImagePath '${absPath}' | Get-Disk; ` +
+                `$disk | Get-Partition | Where-Object { $_.DriveLetter } | ` +
+                `Select-Object -ExpandProperty DriveLetter -First 1`);
+            const letter = output.trim();
+            if (/^[A-Z]$/i.test(letter)) {
+                this.mountDriveLetter = letter.toUpperCase();
+                this.logDebug(`Discovered drive letter: ${this.mountDriveLetter}`);
+            }
+            else {
+                this.logDebug(`Could not discover drive letter. Output: ${output}`);
+                this.mountDriveLetter = undefined;
+            }
+        });
+    }
+    // ── Health checks ───────────────────────────────────────────────
+    checkVolumeHealth() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.mountDriveLetter)
+                return;
+            try {
+                // Run chkdsk in read-only scan mode
+                let output = "";
+                yield exec.exec("chkdsk", [`${this.mountDriveLetter}:`, "/scan"], {
+                    ignoreReturnCode: true,
+                    silent: !core.isDebug(),
+                    listeners: {
+                        stdout: (data) => {
+                            output += data.toString();
+                        }
+                    }
+                });
+                if (output.includes("found problems")) {
+                    core.warning(`${this.getLogPrefix()} Volume health check found issues on ${this.mountDriveLetter}:. ` +
+                        `Consider recreating the cache.`);
+                }
+                else {
+                    this.logDebug("Volume health check: clean");
+                }
+            }
+            catch (_a) {
+                this.logDebug("Could not check volume health (non-critical)");
+            }
+        });
+    }
+    // ── Cleanup ─────────────────────────────────────────────────────
+    safeDetach() {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const absPath = path.resolve(this.containerFile);
+                yield this.psExec(`Dismount-DiskImage -ImagePath '${absPath}' -ErrorAction SilentlyContinue | Out-Null`);
+            }
+            catch (_a) {
+                // Best-effort cleanup
+            }
+        });
+    }
+}
+exports.VhdxContainer = VhdxContainer;
 
 
 /***/ }),
