@@ -69,7 +69,7 @@ export class BtrfsContainer extends Container {
         // Use higher compression for save (upload) to minimize image size.
         // Restore decompresses on-demand, so higher save compression = smaller image + same read perf.
         this.saveCompressionLevel = options.saveCompressionLevel || "zstd:9";
-        this.mountMode = options.mountMode || "ro";
+        this.mountMode = options.mountMode || "rw";
         this.nodeLocal = new NodeLocalCache(
             options.nodeLocalCacheDir || "",
             cacheKey,

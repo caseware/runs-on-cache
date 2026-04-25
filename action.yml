@@ -61,8 +61,8 @@ inputs:
     default: ''
     required: false
   mount-mode:
-    description: 'Mount mode for restored cache: "ro" (read-only, default — shared BTRFS image mounted read-only, safe for node_modules) or "rw" (read-write — image copied to job-local dir before mounting, for mutable caches like git repos)'
-    default: 'ro'
+    description: 'Mount mode for restored cache: "rw" (read-write, default — image is mounted read-write, supports both exact and partial cache hits) or "ro" (read-only — shared BTRFS image mounted read-only, only for exact hits with node-local HostPath caching)'
+    default: 'rw'
     required: false
 outputs:
   cache-hit:

@@ -95526,7 +95526,7 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
         core.debug(`Using bufferMb: ${bufferMb}`);
         const saveCompressionLevel = core.getInput(constants_1.Inputs.SaveCompressionLevel) || undefined;
         const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
-        const mountMode = (core.getInput(constants_1.Inputs.MountMode) || "ro");
+        const mountMode = (core.getInput(constants_1.Inputs.MountMode) || "rw");
         let cacheContainer = undefined;
         try {
             const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
@@ -95708,7 +95708,7 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
             const bufferMb = parseInt(core.getInput(constants_1.Inputs.FsBufferMB) || "2048");
             const saveCompressionLevel = core.getInput(constants_1.Inputs.SaveCompressionLevel) || undefined;
             const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
-            const mountMode = (core.getInput(constants_1.Inputs.MountMode) || "ro");
+            const mountMode = (core.getInput(constants_1.Inputs.MountMode) || "rw");
             const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, key, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode });
             yield cacheContainer.initialize();
             yield cacheContainer.save();
@@ -96531,7 +96531,7 @@ class BtrfsContainer extends Container_1.Container {
         // Use higher compression for save (upload) to minimize image size.
         // Restore decompresses on-demand, so higher save compression = smaller image + same read perf.
         this.saveCompressionLevel = options.saveCompressionLevel || "zstd:9";
-        this.mountMode = options.mountMode || "ro";
+        this.mountMode = options.mountMode || "rw";
         this.nodeLocal = new NodeLocalCache_1.NodeLocalCache(options.nodeLocalCacheDir || "", cacheKey, ".btrfs");
         // Security input validations
         this.checkPathTraversal(this.baseDir, this.containerFile);
