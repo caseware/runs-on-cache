@@ -96435,6 +96435,7 @@ const actionUtils_1 = __nccwpck_require__(6850);
 const Container_1 = __nccwpck_require__(9620);
 class BtrfsContainer extends Container_1.Container {
     constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
+        var _a;
         if (!compressionLevel) {
             // Default to zstd default with compression level 3.
             compressionLevel = "zstd:3";
@@ -96446,7 +96447,7 @@ class BtrfsContainer extends Container_1.Container {
             throw new Error("fsSize option is required for BtrfsContainer");
         }
         this.fsSize = options.fsSize;
-        this.bufferBytes = (options.bufferMb || 512) * 1024 * 1024; // Convert MB to bytes
+        this.bufferBytes = ((_a = options.bufferMb) !== null && _a !== void 0 ? _a : 512) * 1024 * 1024; // Convert MB to bytes
         // Security input validations
         this.checkPathTraversal(this.baseDir, this.containerFile);
         this.pathsToCache.forEach(pathToCheck => this.checkPathTraversal(this.baseDir, pathToCheck));

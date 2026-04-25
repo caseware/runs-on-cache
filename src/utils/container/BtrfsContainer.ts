@@ -48,7 +48,7 @@ export class BtrfsContainer extends Container {
         }
 
         this.fsSize = options.fsSize;
-        this.bufferBytes = (options.bufferMb || 512) * 1024 * 1024; // Convert MB to bytes
+        this.bufferBytes = (options.bufferMb ?? 512) * 1024 * 1024; // Convert MB to bytes
 
         // Security input validations
         this.checkPathTraversal(this.baseDir, this.containerFile);
