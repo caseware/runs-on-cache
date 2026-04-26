@@ -96861,6 +96861,29 @@ class BtrfsContainer extends Container_1.Container {
                 yield this.execWithTimeout(() => exec.exec(command, args, { silent: !core.isDebug() }), MOUNT_TIMEOUT_MS, `mount ${device} at ${mountPath}`);
             }
             catch (error) {
+                // Collect diagnostic info to help debug mount failures
+                try {
+                    const diag = [];
+                    const collect = (label, cmd, cmdArgs) => __awaiter(this, void 0, void 0, function* () {
+                        try {
+                            let out = "";
+                            yield exec.exec(cmd, cmdArgs, {
+                                silent: true,
+                                listeners: { stdout: (d) => { out += d.toString(); } }
+                            });
+                            diag.push(`${label}: ${out.trim()}`);
+                        }
+                        catch (_b) {
+                            diag.push(`${label}: <unavailable>`);
+                        }
+                    });
+                    yield collect("file type", "file", [device]);
+                    yield collect("file size", "stat", ["--format=%s", device]);
+                    yield collect("btrfs module", "lsmod", []);
+                    yield collect("loop devices", "ls", ["-la", "/dev/loop*"]);
+                    core.warning(`[BTRFS] Mount diagnostic for ${device}:\n${diag.join("\n")}`);
+                }
+                catch ( /* diagnostic collection is best-effort */_a) { /* diagnostic collection is best-effort */ }
                 // On mount failure, clean up any loop device that may have been allocated
                 yield this.cleanupLoopDevices(device);
                 throw this.wrapError(`mount ${device} at ${mountPath}`, error);
@@ -97110,6 +97133,18 @@ class BtrfsContainer extends Container_1.Container {
             catch (error) {
                 throw new Error(`sudo access is required for BTRFS mounting operations but sudo is not available or requires a password. ` +
                     `Please ensure the runner has passwordless sudo access or use a different compression method.`);
+            }
+            // Ensure btrfs kernel module is loaded — required for mount -t btrfs.
+            // On fresh K8s nodes the module may not be auto-loaded until something triggers it,
+            // causing mount to fail with exit code 32.
+            try {
+                yield exec.exec("sudo", ["modprobe", "btrfs"], {
+                    silent: !core.isDebug()
+                });
+            }
+            catch (error) {
+                core.warning(`${this.getLogPrefix()} Failed to load btrfs kernel module (modprobe btrfs). ` +
+                    `Mount may fail if the module is not already loaded. Error: ${error instanceof Error ? error.message : error}`);
             }
         });
     }

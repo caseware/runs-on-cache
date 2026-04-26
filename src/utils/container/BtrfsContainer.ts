@@ -467,6 +467,26 @@ export class BtrfsContainer extends Container {
                 `mount ${device} at ${mountPath}`
             );
         } catch (error) {
+            // Collect diagnostic info to help debug mount failures
+            try {
+                const diag: string[] = [];
+                const collect = async (label: string, cmd: string, cmdArgs: string[]) => {
+                    try {
+                        let out = "";
+                        await exec.exec(cmd, cmdArgs, {
+                            silent: true,
+                            listeners: { stdout: (d: Buffer) => { out += d.toString(); } }
+                        });
+                        diag.push(`${label}: ${out.trim()}`);
+                    } catch { diag.push(`${label}: <unavailable>`); }
+                };
+                await collect("file type", "file", [device]);
+                await collect("file size", "stat", ["--format=%s", device]);
+                await collect("btrfs module", "lsmod", []);
+                await collect("loop devices", "ls", ["-la", "/dev/loop*"]);
+                core.warning(`[BTRFS] Mount diagnostic for ${device}:\n${diag.join("\n")}`);
+            } catch { /* diagnostic collection is best-effort */ }
+
             // On mount failure, clean up any loop device that may have been allocated
             await this.cleanupLoopDevices(device);
             throw this.wrapError(`mount ${device} at ${mountPath}`, error);
@@ -759,6 +779,22 @@ export class BtrfsContainer extends Container {
             throw new Error(
                 `sudo access is required for BTRFS mounting operations but sudo is not available or requires a password. ` +
                     `Please ensure the runner has passwordless sudo access or use a different compression method.`
+            );
+        }
+
+        // Ensure btrfs kernel module is loaded — required for mount -t btrfs.
+        // On fresh K8s nodes the module may not be auto-loaded until something triggers it,
+        // causing mount to fail with exit code 32.
+        try {
+            await exec.exec("sudo", ["modprobe", "btrfs"], {
+                silent: !core.isDebug()
+            });
+        } catch (error) {
+            core.warning(
+                `${this.getLogPrefix()} Failed to load btrfs kernel module (modprobe btrfs). ` +
+                    `Mount may fail if the module is not already loaded. Error: ${
+                        error instanceof Error ? error.message : error
+                    }`
             );
         }
     }
