@@ -532,27 +532,21 @@ export class BtrfsContainer extends Container {
                         diag.push(`${label}: ${out.trim()}`);
                     } catch { diag.push(`${label}: <unavailable>`); }
                 };
-                await collect("file type", "file", [device]);
                 await collect("file size", "stat", ["--format=%s", device]);
-                await collect("loaded modules", "sudo", ["lsmod"]);
                 await collect("loop devices", "sudo", ["losetup", "-a"]);
-                await collect("/dev/loop-control", "ls", ["-la", "/dev/loop-control"]);
                 // Kernel log — the definitive source for why mount failed
-                await collect("dmesg (last 30 lines)", "sudo", ["dmesg", "--time-format=reltime", "-T"]);
-                // If we have a loop device, run BTRFS-specific diagnostics
+                // Use `dmesg -T` (human timestamps) with tail; avoid --time-format which may not exist
+                await collect("dmesg (last 40 lines)", "bash", ["-c", "sudo dmesg -T 2>/dev/null | tail -40 || sudo dmesg 2>/dev/null | tail -40 || echo unavailable"]);
+                // Ensure btrfs-progs is available for diagnostics
                 if (actualDevice.startsWith("/dev/loop")) {
+                    await exec.exec("bash", ["-c", "command -v btrfs >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs 2>/dev/null) || true"], { silent: true });
                     await collect("btrfs check --readonly", "sudo", ["btrfs", "check", "--readonly", actualDevice]);
-                    await collect("btrfs superblock (compat flags)", "sudo", [
-                        "btrfs", "inspect-internal", "dump-super", actualDevice
-                    ]);
+                    await collect("btrfs superblock (compat flags)", "bash", ["-c", `sudo btrfs inspect-internal dump-super ${actualDevice} 2>&1 | grep -iE 'compat|magic|generation|sectorsize|nodesize|root_level'`]);
                 }
-                // Truncate dmesg to last 30 lines to avoid noise
-                const dmesgIdx = diag.findIndex(d => d.startsWith("dmesg"));
-                if (dmesgIdx >= 0) {
-                    const lines = diag[dmesgIdx].split("\n");
-                    diag[dmesgIdx] = lines.slice(0, 1).concat(lines.slice(-30)).join("\n");
+                // Log each diagnostic as a separate warning to avoid GitHub Actions truncation
+                for (const d of diag) {
+                    core.warning(`[BTRFS] ${d}`);
                 }
-                core.warning(`[BTRFS] Mount diagnostic for ${device}:\n${diag.join("\n")}`);
             } catch { /* diagnostic collection is best-effort */ }
 
             // On mount failure, clean up any loop device that may have been allocated

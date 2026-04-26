@@ -96796,6 +96796,29 @@ class BtrfsContainer extends Container_1.Container {
             yield exec.exec("sync", [], { silent: !core.isDebug() });
             // Unmount filesystem - the containerFile now points to the actual file with all data
             yield this.unmount();
+            // Verify filesystem integrity before upload — ensures every S3 image is clean.
+            // Run btrfs check on the unmounted image via a temporary loop device.
+            try {
+                const checkLoopDev = yield this.setupLoopDevice(this.containerFile);
+                try {
+                    yield exec.exec("sudo", ["btrfs", "check", "--readonly", checkLoopDev], {
+                        silent: !core.isDebug()
+                    });
+                    this.logInfo("BTRFS integrity check passed");
+                }
+                catch (checkError) {
+                    core.warning(`BTRFS integrity check failed — image may not mount on restore: ${checkError instanceof Error ? checkError.message : checkError}`);
+                }
+                finally {
+                    try {
+                        yield this.execSudo("losetup", ["-d", checkLoopDev]);
+                    }
+                    catch ( /* best-effort cleanup */_b) { /* best-effort cleanup */ }
+                }
+            }
+            catch (loopError) {
+                core.warning(`Could not attach loop device for integrity check: ${loopError}`);
+            }
             // Resize backing file — best-effort, skip on failure
             this.logDebug(`Resizing backing file to ${targetMb} MB`);
             try {
@@ -96897,12 +96920,21 @@ class BtrfsContainer extends Container_1.Container {
                             diag.push(`${label}: <unavailable>`);
                         }
                     });
-                    yield collect("file type", "file", [device]);
                     yield collect("file size", "stat", ["--format=%s", device]);
-                    yield collect("loaded modules", "sudo", ["lsmod"]);
                     yield collect("loop devices", "sudo", ["losetup", "-a"]);
-                    yield collect("/dev/loop-control", "ls", ["-la", "/dev/loop-control"]);
-                    core.warning(`[BTRFS] Mount diagnostic for ${device}:\n${diag.join("\n")}`);
+                    // Kernel log — the definitive source for why mount failed
+                    // Use `dmesg -T` (human timestamps) with tail; avoid --time-format which may not exist
+                    yield collect("dmesg (last 40 lines)", "bash", ["-c", "sudo dmesg -T 2>/dev/null | tail -40 || sudo dmesg 2>/dev/null | tail -40 || echo unavailable"]);
+                    // Ensure btrfs-progs is available for diagnostics
+                    if (actualDevice.startsWith("/dev/loop")) {
+                        yield exec.exec("bash", ["-c", "command -v btrfs >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs 2>/dev/null) || true"], { silent: true });
+                        yield collect("btrfs check --readonly", "sudo", ["btrfs", "check", "--readonly", actualDevice]);
+                        yield collect("btrfs superblock (compat flags)", "bash", ["-c", `sudo btrfs inspect-internal dump-super ${actualDevice} 2>&1 | grep -iE 'compat|magic|generation|sectorsize|nodesize|root_level'`]);
+                    }
+                    // Log each diagnostic as a separate warning to avoid GitHub Actions truncation
+                    for (const d of diag) {
+                        core.warning(`[BTRFS] ${d}`);
+                    }
                 }
                 catch ( /* diagnostic collection is best-effort */_a) { /* diagnostic collection is best-effort */ }
                 // On mount failure, clean up any loop device that may have been allocated
