@@ -112,7 +112,6 @@ export async function restoreCache(
     const saveCompressionLevel = core.getInput(Inputs.SaveCompressionLevel) || undefined;
     const nodeLocalCacheDir = core.getInput(Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
     const mountMode = (core.getInput(Inputs.MountMode) || "rw") as "ro" | "rw";
-    const previousVersionMount = core.getInput(Inputs.PreviousVersionMount) === "true";
     let cacheContainer: Container | undefined = undefined;
     try {
         const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
@@ -130,7 +129,7 @@ export async function restoreCache(
             baseDir, 
             paths, 
             primaryKey, 
-            { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode, previousVersionMount }
+            { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode }
         );
 
         // Initialize container (prerequisite checks, stale temp cleanup)
@@ -216,24 +215,7 @@ export async function restoreCache(
         // Point the container at wherever we downloaded (node-local temp or default)
         cacheContainer.setArchivePath(downloadPath);
 
-        // Check if this is a partial hit with previous-version-mount enabled
-        const isPartialHit = cacheEntry.cacheKey !== primaryKey;
-        if (isPartialHit && previousVersionMount) {
-            // Mount the downloaded (old) image RO as previous-version reference
-            core.info(`Partial hit with previous-version-mount: mounting ${cacheEntry.cacheKey} RO as reference`);
-            const prevMountPoint = await cacheContainer.mountPreviousVersion(downloadPath);
-            if (prevMountPoint) {
-                core.setOutput(Outputs.PreviousVersionPath, prevMountPoint);
-                core.info(`Previous version mounted at: ${prevMountPoint}`);
-            }
-            // Create a fresh empty cache for the exact key (consumer populates from scratch using previous as reference)
-            if (cacheContainer.requiresCreateEmptyCache) {
-                await cacheContainer.createEmptyCache();
-                core.info("Created fresh empty cache for new key (previous version available RO)");
-            }
-        } else {
-            await cacheContainer.restore();
-        }
+        await cacheContainer.restore();
         core.info("Cache restored successfully from S3");
 
         // Report node-local cache miss (S3 fallback) or disabled

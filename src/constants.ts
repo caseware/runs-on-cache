@@ -16,16 +16,14 @@ export enum Inputs {
     FsBufferMB = "fs-buffer-mb", // Input for btrfs filesystem buffer size
     SaveCompressionLevel = "save-compression-level", // Input for btrfs defrag compression before upload
     NodeLocalCacheDir = "node-local-cache-dir", // Input for node-local persistent cache directory (HostPath mount)
-    MountMode = "mount-mode", // Input for mount mode: "ro" (read-only, default for node_modules) or "rw" (read-write, for mutable caches)
-    PreviousVersionMount = "previous-version-mount" // When true, mount the closest partial-hit image read-only at a secondary path (git alternates pattern)
+    MountMode = "mount-mode" // Input for mount mode: "ro" (read-only, default for node_modules) or "rw" (read-write, for mutable caches)
 }
 
 export enum Outputs {
     CacheHit = "cache-hit", // Output from cache, restore action
     CachePrimaryKey = "cache-primary-key", // Output from restore action
     CacheMatchedKey = "cache-matched-key", // Output from restore action
-    NodeLocalCacheHit = "node-local-cache-hit", // Output from restore action: "true" | "false" | "disabled"
-    PreviousVersionPath = "previous-version-path" // Output from restore action: path to the RO-mounted previous version (empty if not applicable)
+    NodeLocalCacheHit = "node-local-cache-hit" // Output from restore action: "true" | "false" | "disabled"
 }
 
 export enum State {

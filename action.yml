@@ -72,23 +72,11 @@ inputs:
           The image is shared across all jobs on the same node (WORM pattern).
     default: 'rw'
     required: false
-  previous-version-mount:
-    description: |
-      When "true" and a PARTIAL cache hit occurs, mount the closest matching image
-      read-only at a secondary mount point (exposed via previous-version-path output).
-      The primary cache gets a fresh empty BTRFS image for population.
-      Use this for the "git alternates" pattern: reference old .git/objects via
-      GIT_ALTERNATE_OBJECT_DIRECTORIES while building a new clone.
-      When "false" (default), partial hits use the copy+augment pattern instead.
-    default: 'false'
-    required: false
 outputs:
   cache-hit:
     description: 'A boolean value to indicate an exact match was found for the primary key'
   node-local-cache-hit:
     description: 'Whether the cache was restored from node-local storage: "true" (node-local hit), "false" (S3 fallback), or "disabled" (node-local not configured)'
-  previous-version-path:
-    description: 'When previous-version-mount is "true" and a partial hit occurred, the mount point where the previous version is accessible read-only. Empty string if not applicable (exact hit, miss, or previous-version-mount disabled).'
 runs:
   using: 'node20'
   main: 'dist/restore/index.js'
