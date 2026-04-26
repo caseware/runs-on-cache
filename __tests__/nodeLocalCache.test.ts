@@ -76,23 +76,25 @@ describe("NodeLocalCache", () => {
     });
 
     describe("createTempFile", () => {
-        it("throws when disabled", async () => {
+        it("returns null when disabled", async () => {
             const nlc = new NodeLocalCache("", "key", ".btrfs");
-            await expect(nlc.createTempFile()).rejects.toThrow("node-local caching is disabled");
+            expect(await nlc.createTempFile()).toBeNull();
         });
 
         it("creates temp file path in cache dir", async () => {
             const nlc = new NodeLocalCache(tempDir, "key", ".btrfs");
             const tempPath = await nlc.createTempFile();
-            expect(tempPath).toMatch(/\.temp[0-9a-f]+\.btrfs$/);
-            expect(path.dirname(tempPath)).toBe(tempDir);
+            expect(tempPath).not.toBeNull();
+            expect(tempPath!).toMatch(/\.temp[0-9a-f]+\.btrfs$/);
+            expect(path.dirname(tempPath!)).toBe(tempDir);
         });
 
         it("creates cache dir if missing", async () => {
             const nestedDir = path.join(tempDir, "nested", "cache");
             const nlc = new NodeLocalCache(nestedDir, "key", ".btrfs");
             const tempPath = await nlc.createTempFile();
-            expect(tempPath).toContain(nestedDir);
+            expect(tempPath).not.toBeNull();
+            expect(tempPath!).toContain(nestedDir);
             const stat = await fs.stat(nestedDir);
             expect(stat.isDirectory()).toBe(true);
         });
@@ -107,9 +109,10 @@ describe("NodeLocalCache", () => {
         it("moves temp file to final location", async () => {
             const nlc = new NodeLocalCache(tempDir, "commit-test", ".btrfs");
             const tempPath = await nlc.createTempFile();
-            await fs.writeFile(tempPath, "test-data");
+            expect(tempPath).not.toBeNull();
+            await fs.writeFile(tempPath!, "test-data");
 
-            const won = await nlc.commitTempFile(tempPath);
+            const won = await nlc.commitTempFile(tempPath!);
             expect(won).toBe(true);
 
             // Final file should exist
@@ -117,7 +120,7 @@ describe("NodeLocalCache", () => {
             expect(content).toBe("test-data");
 
             // Temp file should be gone
-            await expect(fs.access(tempPath)).rejects.toThrow();
+            await expect(fs.access(tempPath!)).rejects.toThrow();
         });
 
         it("returns false and cleans up when another runner already placed the file", async () => {
@@ -127,9 +130,10 @@ describe("NodeLocalCache", () => {
             await fs.writeFile(nlc.localPath, "existing-data");
 
             const tempPath = await nlc.createTempFile();
-            await fs.writeFile(tempPath, "our-data");
+            expect(tempPath).not.toBeNull();
+            await fs.writeFile(tempPath!, "our-data");
 
-            const won = await nlc.commitTempFile(tempPath);
+            const won = await nlc.commitTempFile(tempPath!);
             expect(won).toBe(false);
 
             // Original file should remain unchanged
@@ -137,7 +141,7 @@ describe("NodeLocalCache", () => {
             expect(content).toBe("existing-data");
 
             // Temp file should be cleaned up
-            await expect(fs.access(tempPath)).rejects.toThrow();
+            await expect(fs.access(tempPath!)).rejects.toThrow();
         });
     });
 
@@ -274,9 +278,10 @@ describe("NodeLocalCache", () => {
             await fs.writeFile(nlc.localPath, "existing");
 
             const tempPath = await nlc.createTempFile();
-            await fs.writeFile(tempPath, "ours");
+            expect(tempPath).not.toBeNull();
+            await fs.writeFile(tempPath!, "ours");
 
-            const won = await nlc.commitTempFile(tempPath);
+            const won = await nlc.commitTempFile(tempPath!);
             expect(won).toBe(false);
 
             // Original content preserved

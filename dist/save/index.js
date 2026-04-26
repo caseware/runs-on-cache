@@ -96573,12 +96573,17 @@ class BtrfsContainer extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             try {
                 yield this.checkPrerequisites();
-                // Clean up stale temp files at the start of every job
-                yield this.nodeLocal.cleanupStaleTempFiles();
             }
             catch (e) {
                 core.setFailed(e.message);
                 process.exit(1);
+            }
+            // Clean up stale temp files — non-fatal if it fails (e.g., EACCES on HostPath dir)
+            try {
+                yield this.nodeLocal.cleanupStaleTempFiles();
+            }
+            catch (e) {
+                core.warning(`${this.getLogPrefix()} Stale temp cleanup failed (non-fatal): ${e.message}`);
             }
         });
     }
@@ -97571,18 +97576,32 @@ class NodeLocalCache {
      */
     createTempFile() {
         return __awaiter(this, void 0, void 0, function* () {
-            if (!this.enabled) {
-                throw new Error("[NodeLocal] Cannot create temp file — node-local caching is disabled");
+            if (!this.enabled)
+                return null;
+            try {
+                // Ensure the cache directory exists and is writable by the current user.
+                // HostPath volumes are created as root by kubelet; runners run as UID 1001.
+                // Try without sudo first; fall back to sudo if permission denied.
+                try {
+                    yield fs.mkdir(this.cacheDir, { recursive: true });
+                    yield fs.access(this.cacheDir, (yield Promise.resolve().then(() => __importStar(__nccwpck_require__(7147)))).constants.W_OK);
+                }
+                catch (_a) {
+                    // mkdir or access failed — try with sudo (runners have privileged: true)
+                    const { exec: execCmd } = yield Promise.resolve().then(() => __importStar(__nccwpck_require__(1514)));
+                    yield execCmd("sudo", ["mkdir", "-p", this.cacheDir], { silent: true });
+                    yield execCmd("sudo", ["chown", `${process.getuid()}:${process.getgid()}`, this.cacheDir], { silent: true });
+                    yield fs.access(this.cacheDir, (yield Promise.resolve().then(() => __importStar(__nccwpck_require__(7147)))).constants.W_OK);
+                }
+                const randomSuffix = crypto.randomBytes(8).toString("hex");
+                const tempPath = path.join(this.cacheDir, `.temp${randomSuffix}${this.extension}`);
+                core.debug(`[NodeLocal] Created temp path: ${tempPath}`);
+                return tempPath;
             }
-            // Verify the cache directory exists and is writable.
-            // On runners without the HostPath mount, this will fail fast
-            // instead of returning a path that S3 download can't write to.
-            yield fs.mkdir(this.cacheDir, { recursive: true });
-            yield fs.access(this.cacheDir, (yield Promise.resolve().then(() => __importStar(__nccwpck_require__(7147)))).constants.W_OK);
-            const randomSuffix = crypto.randomBytes(8).toString("hex");
-            const tempPath = path.join(this.cacheDir, `.temp${randomSuffix}${this.extension}`);
-            core.debug(`[NodeLocal] Created temp path: ${tempPath}`);
-            return tempPath;
+            catch (error) {
+                core.warning(`[NodeLocal] Cannot write to cache dir ${this.cacheDir}: ${error instanceof Error ? error.message : error}. Falling back to S3-only mode.`);
+                return null;
+            }
         });
     }
     /**
@@ -97820,7 +97839,12 @@ class TarContainer extends Container_1.Container {
     }
     initialize() {
         return __awaiter(this, void 0, void 0, function* () {
-            yield this.nodeLocal.cleanupStaleTempFiles();
+            try {
+                yield this.nodeLocal.cleanupStaleTempFiles();
+            }
+            catch (e) {
+                core.warning(`[Tar] Stale temp cleanup failed (non-fatal): ${e.message}`);
+            }
         });
     }
     tryRestoreFromNodeLocal(restoreKeys) {
@@ -97956,7 +97980,12 @@ class TarLz4Container extends Container_1.Container {
     }
     initialize() {
         return __awaiter(this, void 0, void 0, function* () {
-            yield this.nodeLocal.cleanupStaleTempFiles();
+            try {
+                yield this.nodeLocal.cleanupStaleTempFiles();
+            }
+            catch (e) {
+                core.warning(`[TarLz4] Stale temp cleanup failed (non-fatal): ${e.message}`);
+            }
         });
     }
     tryRestoreFromNodeLocal(restoreKeys) {
@@ -98205,11 +98234,17 @@ class VhdxContainer extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             try {
                 yield this.checkPrerequisites();
-                yield this.nodeLocal.cleanupStaleTempFiles();
             }
             catch (e) {
                 core.setFailed(e.message);
                 process.exit(1);
+            }
+            // Clean up stale temp files — non-fatal if it fails (e.g., EACCES on HostPath dir)
+            try {
+                yield this.nodeLocal.cleanupStaleTempFiles();
+            }
+            catch (e) {
+                core.warning(`[VHDX] Stale temp cleanup failed (non-fatal): ${e.message}`);
             }
         });
     }

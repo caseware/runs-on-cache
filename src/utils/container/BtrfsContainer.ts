@@ -110,11 +110,20 @@ export class BtrfsContainer extends Container {
     async initialize(): Promise<void> {
         try {
             await this.checkPrerequisites();
-            // Clean up stale temp files at the start of every job
-            await this.nodeLocal.cleanupStaleTempFiles();
         } catch (e) {
             core.setFailed((e as Error).message);
             process.exit(1);
+        }
+
+        // Clean up stale temp files — non-fatal if it fails (e.g., EACCES on HostPath dir)
+        try {
+            await this.nodeLocal.cleanupStaleTempFiles();
+        } catch (e) {
+            core.warning(
+                `${this.getLogPrefix()} Stale temp cleanup failed (non-fatal): ${
+                    (e as Error).message
+                }`
+            );
         }
     }
 

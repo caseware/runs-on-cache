@@ -67,24 +67,39 @@ export class NodeLocalCache {
      * Create a temp file path for atomic population.
      * Returns the path to write to before calling commitTempFile().
      */
-    async createTempFile(): Promise<string> {
-        if (!this.enabled) {
-            throw new Error("[NodeLocal] Cannot create temp file — node-local caching is disabled");
+    async createTempFile(): Promise<string | null> {
+        if (!this.enabled) return null;
+
+        try {
+            // Ensure the cache directory exists and is writable by the current user.
+            // HostPath volumes are created as root by kubelet; runners run as UID 1001.
+            // Try without sudo first; fall back to sudo if permission denied.
+            try {
+                await fs.mkdir(this.cacheDir, { recursive: true });
+                await fs.access(this.cacheDir, (await import("fs")).constants.W_OK);
+            } catch {
+                // mkdir or access failed — try with sudo (runners have privileged: true)
+                const { exec: execCmd } = await import("@actions/exec");
+                await execCmd("sudo", ["mkdir", "-p", this.cacheDir], { silent: true });
+                await execCmd("sudo", ["chown", `${process.getuid()}:${process.getgid()}`, this.cacheDir], { silent: true });
+                await fs.access(this.cacheDir, (await import("fs")).constants.W_OK);
+            }
+
+            const randomSuffix = crypto.randomBytes(8).toString("hex");
+            const tempPath = path.join(
+                this.cacheDir,
+                `.temp${randomSuffix}${this.extension}`
+            );
+            core.debug(`[NodeLocal] Created temp path: ${tempPath}`);
+            return tempPath;
+        } catch (error) {
+            core.warning(
+                `[NodeLocal] Cannot write to cache dir ${this.cacheDir}: ${
+                    error instanceof Error ? error.message : error
+                }. Falling back to S3-only mode.`
+            );
+            return null;
         }
-
-        // Verify the cache directory exists and is writable.
-        // On runners without the HostPath mount, this will fail fast
-        // instead of returning a path that S3 download can't write to.
-        await fs.mkdir(this.cacheDir, { recursive: true });
-        await fs.access(this.cacheDir, (await import("fs")).constants.W_OK);
-
-        const randomSuffix = crypto.randomBytes(8).toString("hex");
-        const tempPath = path.join(
-            this.cacheDir,
-            `.temp${randomSuffix}${this.extension}`
-        );
-        core.debug(`[NodeLocal] Created temp path: ${tempPath}`);
-        return tempPath;
     }
 
     /**

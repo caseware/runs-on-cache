@@ -82,10 +82,18 @@ export class VhdxContainer extends Container {
     async initialize(): Promise<void> {
         try {
             await this.checkPrerequisites();
-            await this.nodeLocal.cleanupStaleTempFiles();
         } catch (e) {
             core.setFailed((e as Error).message);
             process.exit(1);
+        }
+
+        // Clean up stale temp files — non-fatal if it fails (e.g., EACCES on HostPath dir)
+        try {
+            await this.nodeLocal.cleanupStaleTempFiles();
+        } catch (e) {
+            core.warning(
+                `[VHDX] Stale temp cleanup failed (non-fatal): ${(e as Error).message}`
+            );
         }
     }
 

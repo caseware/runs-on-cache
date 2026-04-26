@@ -44,7 +44,11 @@ export class TarLz4Container extends Container {
     }
 
     async initialize(): Promise<void> {
-        await this.nodeLocal.cleanupStaleTempFiles();
+        try {
+            await this.nodeLocal.cleanupStaleTempFiles();
+        } catch (e) {
+            core.warning(`[TarLz4] Stale temp cleanup failed (non-fatal): ${(e as Error).message}`);
+        }
     }
 
     async tryRestoreFromNodeLocal(restoreKeys?: string[]): Promise<boolean> {
