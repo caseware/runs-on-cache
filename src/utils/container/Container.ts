@@ -35,7 +35,7 @@ export abstract class Container {
      * Returns true if restored from node-local, false if S3 download is needed.
      * Default implementation returns false (no node-local support).
      */
-    async tryRestoreFromNodeLocal(): Promise<boolean> {
+    async tryRestoreFromNodeLocal(_restoreKeys?: string[]): Promise<boolean> {
         return false;
     }
 

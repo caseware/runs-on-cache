@@ -284,4 +284,71 @@ describe("NodeLocalCache", () => {
             expect(content).toBe("existing");
         });
     });
+
+    describe("findClosestMatch", () => {
+        it("returns null when disabled", async () => {
+            const nlc = new NodeLocalCache("", "my-key", ".btrfs");
+            const result = await nlc.findClosestMatch(["prefix-"]);
+            expect(result).toBeNull();
+        });
+
+        it("returns null when no restore keys provided", async () => {
+            const nlc = new NodeLocalCache(tempDir, "my-key", ".btrfs");
+            const result = await nlc.findClosestMatch([]);
+            expect(result).toBeNull();
+        });
+
+        it("returns null when no files match restore keys", async () => {
+            const nlc = new NodeLocalCache(tempDir, "my-key", ".btrfs");
+            await fs.writeFile(path.join(tempDir, "unrelated-key.btrfs"), "data");
+            const result = await nlc.findClosestMatch(["nodemodules-"]);
+            expect(result).toBeNull();
+        });
+
+        it("finds a file matching restore-key prefix", async () => {
+            const nlc = new NodeLocalCache(tempDir, "nodemodules-abc123", ".btrfs");
+            const matchFile = path.join(tempDir, "nodemodules-old-hash.btrfs");
+            await fs.writeFile(matchFile, "cached-data");
+            const result = await nlc.findClosestMatch(["nodemodules-"]);
+            expect(result).toBe(matchFile);
+        });
+
+        it("returns newest file when multiple matches exist", async () => {
+            const nlc = new NodeLocalCache(tempDir, "nm-exact", ".btrfs");
+
+            const oldFile = path.join(tempDir, "nm-hash1.btrfs");
+            const newFile = path.join(tempDir, "nm-hash2.btrfs");
+            await fs.writeFile(oldFile, "old-data");
+            // Ensure newFile has a later mtime
+            await new Promise(r => setTimeout(r, 50));
+            await fs.writeFile(newFile, "new-data");
+
+            const result = await nlc.findClosestMatch(["nm-"]);
+            expect(result).toBe(newFile);
+        });
+
+        it("ignores temp files", async () => {
+            const nlc = new NodeLocalCache(tempDir, "my-key", ".btrfs");
+            await fs.writeFile(path.join(tempDir, ".tempabc.btrfs"), "temp-data");
+            const result = await nlc.findClosestMatch(["my-"]);
+            expect(result).toBeNull();
+        });
+
+        it("ignores files with wrong extension", async () => {
+            const nlc = new NodeLocalCache(tempDir, "my-key", ".btrfs");
+            await fs.writeFile(path.join(tempDir, "my-key-old.tar.lz4"), "tar-data");
+            const result = await nlc.findClosestMatch(["my-key-"]);
+            expect(result).toBeNull();
+        });
+
+        it("matches multiple restore-key prefixes", async () => {
+            const nlc = new NodeLocalCache(tempDir, "nm-exact-hash", ".btrfs");
+            const fallbackFile = path.join(tempDir, "nm-fallback.btrfs");
+            await fs.writeFile(fallbackFile, "fallback-data");
+
+            // First prefix doesn't match, second does
+            const result = await nlc.findClosestMatch(["nm-exact-", "nm-"]);
+            expect(result).toBe(fallbackFile);
+        });
+    });
 });

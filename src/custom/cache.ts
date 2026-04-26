@@ -137,7 +137,7 @@ export async function restoreCache(
 
         // Try node-local restore first (fast path: ~1-2s on warm node)
         const nodeLocalEnabled = cacheContainer.isNodeLocalEnabled();
-        const restoredFromLocal = await cacheContainer.tryRestoreFromNodeLocal();
+        const restoredFromLocal = await cacheContainer.tryRestoreFromNodeLocal(restoreKeys);
         if (restoredFromLocal) {
             core.info("Cache restored from node-local storage (fast path)");
             core.setOutput(Outputs.NodeLocalCacheHit, "true");

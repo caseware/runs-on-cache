@@ -207,6 +207,62 @@ export class NodeLocalCache {
     }
 
     /**
+     * Find the closest matching cache image in the node-local dir.
+     * Scans for files matching any of the restore-key prefixes and returns the
+     * most recently modified one (newest = most likely to be closest to current state).
+     *
+     * Returns the full path to the closest match, or null if none found.
+     */
+    async findClosestMatch(restoreKeys: string[]): Promise<string | null> {
+        if (!this.enabled || restoreKeys.length === 0) return null;
+
+        try {
+            const entries = await fs.readdir(this.cacheDir);
+            const sanitizedPrefixes = restoreKeys.map(k => this.sanitizeKey(k));
+
+            // Find all files matching any restore-key prefix (non-temp files only)
+            const candidates: { path: string; mtime: number }[] = [];
+            for (const entry of entries) {
+                if (entry.startsWith(".temp")) continue;
+                if (!entry.endsWith(this.extension)) continue;
+
+                const baseName = entry.slice(0, -this.extension.length);
+                const matchesPrefix = sanitizedPrefixes.some(prefix =>
+                    baseName.startsWith(prefix)
+                );
+
+                if (matchesPrefix) {
+                    const fullPath = path.join(this.cacheDir, entry);
+                    try {
+                        const stat = await fs.stat(fullPath);
+                        candidates.push({ path: fullPath, mtime: stat.mtimeMs });
+                    } catch {
+                        // File may have been removed by another runner
+                    }
+                }
+            }
+
+            if (candidates.length === 0) {
+                core.debug("[NodeLocal] No partial match found for restore-keys");
+                return null;
+            }
+
+            // Return the most recently modified match (newest = closest to current)
+            candidates.sort((a, b) => b.mtime - a.mtime);
+            core.info(
+                `[NodeLocal] Partial match found: ${path.basename(candidates[0].path)} ` +
+                `(${candidates.length} candidate(s), using newest)`
+            );
+            return candidates[0].path;
+        } catch (error) {
+            core.debug(
+                `[NodeLocal] findClosestMatch failed: ${error instanceof Error ? error.message : error}`
+            );
+            return null;
+        }
+    }
+
+    /**
      * Safely remove a file, ignoring ENOENT.
      */
     private async removeSafe(filePath: string): Promise<void> {

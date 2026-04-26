@@ -95538,7 +95538,7 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             yield cacheContainer.initialize();
             // Try node-local restore first (fast path: ~1-2s on warm node)
             const nodeLocalEnabled = cacheContainer.isNodeLocalEnabled();
-            const restoredFromLocal = yield cacheContainer.tryRestoreFromNodeLocal();
+            const restoredFromLocal = yield cacheContainer.tryRestoreFromNodeLocal(restoreKeys);
             if (restoredFromLocal) {
                 core.info("Cache restored from node-local storage (fast path)");
                 core.setOutput(constants_1.Outputs.NodeLocalCacheHit, "true");
@@ -96591,37 +96591,58 @@ class BtrfsContainer extends Container_1.Container {
      * Check if a node-local BTRFS image exists for this cache key.
      * This is the fast path: mount directly from the node's HostPath volume (~1-2s).
      */
-    tryRestoreFromNodeLocal() {
+    tryRestoreFromNodeLocal(restoreKeys) {
         return __awaiter(this, void 0, void 0, function* () {
             if (!this.nodeLocal.enabled)
                 return false;
+            // 1. Try exact key match first (fastest path)
             const localExists = yield this.nodeLocal.exists();
-            if (!localExists)
-                return false;
-            const localPath = this.nodeLocal.localPath;
-            this.logInfo(`Node-local cache hit — mounting from ${localPath}`);
-            // Verify integrity before mounting
-            const isHealthy = yield this.verifyImageIntegrity(localPath);
-            if (!isHealthy) {
-                this.logInfo("Node-local image corrupted — falling back to S3");
-                return false;
-            }
-            try {
-                if (this.mountMode === "rw") {
-                    // Copy to job-local location before mounting read-write
-                    yield this.copyAndMountReadWrite(localPath);
+            if (localExists) {
+                const localPath = this.nodeLocal.localPath;
+                this.logInfo(`Node-local exact hit — mounting from ${localPath}`);
+                const isHealthy = yield this.verifyImageIntegrity(localPath);
+                if (!isHealthy) {
+                    this.logInfo("Node-local image corrupted — falling back to S3");
+                    return false;
                 }
-                else {
-                    // Mount read-only directly from the shared node-local image
-                    yield this.mountReadOnly(localPath);
+                try {
+                    if (this.mountMode === "rw") {
+                        yield this.copyAndMountReadWrite(localPath);
+                    }
+                    else {
+                        yield this.mountReadOnly(localPath);
+                    }
+                    this.restoredFromNodeLocal = true;
+                    return true;
                 }
-                this.restoredFromNodeLocal = true;
-                return true;
+                catch (error) {
+                    core.warning(`${this.getLogPrefix()} Node-local mount failed, falling back to S3: ${error instanceof Error ? error.message : error}`);
+                    return false;
+                }
             }
-            catch (error) {
-                core.warning(`${this.getLogPrefix()} Node-local mount failed, falling back to S3: ${error instanceof Error ? error.message : error}`);
-                return false;
+            // 2. Try partial match: find closest cache key on this node, copy to .tmpXXX, mount RW for augmentation
+            if (restoreKeys && restoreKeys.length > 0) {
+                const closestMatch = yield this.nodeLocal.findClosestMatch(restoreKeys);
+                if (closestMatch) {
+                    this.logInfo(`Node-local partial hit — copying ${path.basename(closestMatch)} for RW augmentation`);
+                    const isHealthy = yield this.verifyImageIntegrity(closestMatch);
+                    if (!isHealthy) {
+                        this.logInfo("Node-local partial image corrupted — falling back to S3");
+                        return false;
+                    }
+                    try {
+                        // Always copy + mount RW for partial hits so yarn can augment
+                        yield this.copyAndMountReadWrite(closestMatch);
+                        this.restoredFromNodeLocal = true;
+                        return true;
+                    }
+                    catch (error) {
+                        core.warning(`${this.getLogPrefix()} Node-local partial mount failed, falling back to S3: ${error instanceof Error ? error.message : error}`);
+                        return false;
+                    }
+                }
             }
+            return false;
         });
     }
     /**
@@ -97381,7 +97402,7 @@ class Container {
      * Returns true if restored from node-local, false if S3 download is needed.
      * Default implementation returns false (no node-local support).
      */
-    tryRestoreFromNodeLocal() {
+    tryRestoreFromNodeLocal(_restoreKeys) {
         return __awaiter(this, void 0, void 0, function* () {
             return false;
         });
@@ -97712,6 +97733,56 @@ class NodeLocalCache {
         return key.replace(/[/\\:*?"<>|]/g, "-");
     }
     /**
+     * Find the closest matching cache image in the node-local dir.
+     * Scans for files matching any of the restore-key prefixes and returns the
+     * most recently modified one (newest = most likely to be closest to current state).
+     *
+     * Returns the full path to the closest match, or null if none found.
+     */
+    findClosestMatch(restoreKeys) {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.enabled || restoreKeys.length === 0)
+                return null;
+            try {
+                const entries = yield fs.readdir(this.cacheDir);
+                const sanitizedPrefixes = restoreKeys.map(k => this.sanitizeKey(k));
+                // Find all files matching any restore-key prefix (non-temp files only)
+                const candidates = [];
+                for (const entry of entries) {
+                    if (entry.startsWith(".temp"))
+                        continue;
+                    if (!entry.endsWith(this.extension))
+                        continue;
+                    const baseName = entry.slice(0, -this.extension.length);
+                    const matchesPrefix = sanitizedPrefixes.some(prefix => baseName.startsWith(prefix));
+                    if (matchesPrefix) {
+                        const fullPath = path.join(this.cacheDir, entry);
+                        try {
+                            const stat = yield fs.stat(fullPath);
+                            candidates.push({ path: fullPath, mtime: stat.mtimeMs });
+                        }
+                        catch (_a) {
+                            // File may have been removed by another runner
+                        }
+                    }
+                }
+                if (candidates.length === 0) {
+                    core.debug("[NodeLocal] No partial match found for restore-keys");
+                    return null;
+                }
+                // Return the most recently modified match (newest = closest to current)
+                candidates.sort((a, b) => b.mtime - a.mtime);
+                core.info(`[NodeLocal] Partial match found: ${path.basename(candidates[0].path)} ` +
+                    `(${candidates.length} candidate(s), using newest)`);
+                return candidates[0].path;
+            }
+            catch (error) {
+                core.debug(`[NodeLocal] findClosestMatch failed: ${error instanceof Error ? error.message : error}`);
+                return null;
+            }
+        });
+    }
+    /**
      * Safely remove a file, ignoring ENOENT.
      */
     removeSafe(filePath) {
@@ -97789,14 +97860,22 @@ class TarContainer extends Container_1.Container {
             yield this.nodeLocal.cleanupStaleTempFiles();
         });
     }
-    tryRestoreFromNodeLocal() {
+    tryRestoreFromNodeLocal(restoreKeys) {
         return __awaiter(this, void 0, void 0, function* () {
             if (!this.nodeLocal.enabled)
                 return false;
+            // 1. Try exact key match
             const localExists = yield this.nodeLocal.exists();
-            if (!localExists)
+            let localPath = localExists ? this.nodeLocal.localPath : null;
+            // 2. Try partial match from restore-keys
+            if (!localPath && restoreKeys && restoreKeys.length > 0) {
+                localPath = yield this.nodeLocal.findClosestMatch(restoreKeys);
+                if (localPath) {
+                    this.logInfo(`Node-local partial hit — using ${localPath}`);
+                }
+            }
+            if (!localPath)
                 return false;
-            const localPath = this.nodeLocal.localPath;
             this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
             try {
                 this.containerFile = localPath;
@@ -97917,14 +97996,22 @@ class TarLz4Container extends Container_1.Container {
             yield this.nodeLocal.cleanupStaleTempFiles();
         });
     }
-    tryRestoreFromNodeLocal() {
+    tryRestoreFromNodeLocal(restoreKeys) {
         return __awaiter(this, void 0, void 0, function* () {
             if (!this.nodeLocal.enabled)
                 return false;
+            // 1. Try exact key match
             const localExists = yield this.nodeLocal.exists();
-            if (!localExists)
+            let localPath = localExists ? this.nodeLocal.localPath : null;
+            // 2. Try partial match from restore-keys
+            if (!localPath && restoreKeys && restoreKeys.length > 0) {
+                localPath = yield this.nodeLocal.findClosestMatch(restoreKeys);
+                if (localPath) {
+                    this.logInfo(`Node-local partial hit — using ${localPath}`);
+                }
+            }
+            if (!localPath)
                 return false;
-            const localPath = this.nodeLocal.localPath;
             this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
             try {
                 // Point containerFile to the node-local archive and restore from it
@@ -98163,14 +98250,22 @@ class VhdxContainer extends Container_1.Container {
             }
         });
     }
-    tryRestoreFromNodeLocal() {
+    tryRestoreFromNodeLocal(restoreKeys) {
         return __awaiter(this, void 0, void 0, function* () {
             if (!this.nodeLocal.enabled)
                 return false;
+            // 1. Try exact key match
             const localExists = yield this.nodeLocal.exists();
-            if (!localExists)
+            let localPath = localExists ? this.nodeLocal.localPath : null;
+            // 2. Try partial match from restore-keys
+            if (!localPath && restoreKeys && restoreKeys.length > 0) {
+                localPath = yield this.nodeLocal.findClosestMatch(restoreKeys);
+                if (localPath) {
+                    this.logInfo(`Node-local partial hit — using ${localPath}`);
+                }
+            }
+            if (!localPath)
                 return false;
-            const localPath = this.nodeLocal.localPath;
             this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
             try {
                 // Copy to job-local location (VHDX mount always needs write access for junction setup)

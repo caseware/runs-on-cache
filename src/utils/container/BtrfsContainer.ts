@@ -129,41 +129,69 @@ export class BtrfsContainer extends Container {
      * Check if a node-local BTRFS image exists for this cache key.
      * This is the fast path: mount directly from the node's HostPath volume (~1-2s).
      */
-    async tryRestoreFromNodeLocal(): Promise<boolean> {
+    async tryRestoreFromNodeLocal(restoreKeys?: string[]): Promise<boolean> {
         if (!this.nodeLocal.enabled) return false;
 
+        // 1. Try exact key match first (fastest path)
         const localExists = await this.nodeLocal.exists();
-        if (!localExists) return false;
+        if (localExists) {
+            const localPath = this.nodeLocal.localPath;
+            this.logInfo(`Node-local exact hit — mounting from ${localPath}`);
 
-        const localPath = this.nodeLocal.localPath;
-        this.logInfo(`Node-local cache hit — mounting from ${localPath}`);
-
-        // Verify integrity before mounting
-        const isHealthy = await this.verifyImageIntegrity(localPath);
-        if (!isHealthy) {
-            this.logInfo("Node-local image corrupted — falling back to S3");
-            return false;
-        }
-
-        try {
-            if (this.mountMode === "rw") {
-                // Copy to job-local location before mounting read-write
-                await this.copyAndMountReadWrite(localPath);
-            } else {
-                // Mount read-only directly from the shared node-local image
-                await this.mountReadOnly(localPath);
+            const isHealthy = await this.verifyImageIntegrity(localPath);
+            if (!isHealthy) {
+                this.logInfo("Node-local image corrupted — falling back to S3");
+                return false;
             }
 
-            this.restoredFromNodeLocal = true;
-            return true;
-        } catch (error) {
-            core.warning(
-                `${this.getLogPrefix()} Node-local mount failed, falling back to S3: ${
-                    error instanceof Error ? error.message : error
-                }`
-            );
-            return false;
+            try {
+                if (this.mountMode === "rw") {
+                    await this.copyAndMountReadWrite(localPath);
+                } else {
+                    await this.mountReadOnly(localPath);
+                }
+
+                this.restoredFromNodeLocal = true;
+                return true;
+            } catch (error) {
+                core.warning(
+                    `${this.getLogPrefix()} Node-local mount failed, falling back to S3: ${
+                        error instanceof Error ? error.message : error
+                    }`
+                );
+                return false;
+            }
         }
+
+        // 2. Try partial match: find closest cache key on this node, copy to .tmpXXX, mount RW for augmentation
+        if (restoreKeys && restoreKeys.length > 0) {
+            const closestMatch = await this.nodeLocal.findClosestMatch(restoreKeys);
+            if (closestMatch) {
+                this.logInfo(`Node-local partial hit — copying ${path.basename(closestMatch)} for RW augmentation`);
+
+                const isHealthy = await this.verifyImageIntegrity(closestMatch);
+                if (!isHealthy) {
+                    this.logInfo("Node-local partial image corrupted — falling back to S3");
+                    return false;
+                }
+
+                try {
+                    // Always copy + mount RW for partial hits so yarn can augment
+                    await this.copyAndMountReadWrite(closestMatch);
+                    this.restoredFromNodeLocal = true;
+                    return true;
+                } catch (error) {
+                    core.warning(
+                        `${this.getLogPrefix()} Node-local partial mount failed, falling back to S3: ${
+                            error instanceof Error ? error.message : error
+                        }`
+                    );
+                    return false;
+                }
+            }
+        }
+
+        return false;
     }
 
     /**

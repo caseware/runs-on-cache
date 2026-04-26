@@ -47,13 +47,23 @@ export class TarLz4Container extends Container {
         await this.nodeLocal.cleanupStaleTempFiles();
     }
 
-    async tryRestoreFromNodeLocal(): Promise<boolean> {
+    async tryRestoreFromNodeLocal(restoreKeys?: string[]): Promise<boolean> {
         if (!this.nodeLocal.enabled) return false;
 
+        // 1. Try exact key match
         const localExists = await this.nodeLocal.exists();
-        if (!localExists) return false;
+        let localPath: string | null = localExists ? this.nodeLocal.localPath : null;
 
-        const localPath = this.nodeLocal.localPath;
+        // 2. Try partial match from restore-keys
+        if (!localPath && restoreKeys && restoreKeys.length > 0) {
+            localPath = await this.nodeLocal.findClosestMatch(restoreKeys);
+            if (localPath) {
+                this.logInfo(`Node-local partial hit — using ${localPath}`);
+            }
+        }
+
+        if (!localPath) return false;
+
         this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
 
         try {
