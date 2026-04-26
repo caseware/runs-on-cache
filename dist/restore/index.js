@@ -96752,7 +96752,7 @@ class BtrfsContainer extends Container_1.Container {
             }
             this.logDebug(`Syncing and calculating used space`);
             yield exec.exec("sync", [], { silent: !core.isDebug() });
-            // Get used space and resize filesystem
+            // Get used space and resize filesystem — resize is best-effort
             let usedBytes = 0;
             try {
                 const usageOutput = yield this.getBtrfsUsage();
@@ -96765,14 +96765,24 @@ class BtrfsContainer extends Container_1.Container {
             const targetSize = usedBytes + this.bufferBytes;
             const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
             core.debug(`Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
-            yield exec.exec("sudo", ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint], { silent: !core.isDebug() });
+            try {
+                yield exec.exec("sudo", ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint], { silent: !core.isDebug() });
+            }
+            catch (resizeError) {
+                core.warning(`Filesystem resize failed (will upload at original size): ${resizeError instanceof Error ? resizeError.message : resizeError}`);
+            }
             // Ensure all changes are written to disk before unmounting
             yield exec.exec("sync", [], { silent: !core.isDebug() });
             // Unmount filesystem - the containerFile now points to the actual file with all data
             yield this.unmount();
-            // Resize backing file
+            // Resize backing file — best-effort, skip on failure
             this.logDebug(`Resizing backing file to ${targetMb} MB`);
-            yield exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
+            try {
+                yield exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
+            }
+            catch (truncateError) {
+                core.warning(`Backing file truncate failed (will upload at original size): ${truncateError instanceof Error ? truncateError.message : truncateError}`);
+            }
             // Additional sync and wait after unmount to ensure file is fully accessible
             yield exec.exec("sync", [], { silent: !core.isDebug() });
             // Clean up loop devices after save

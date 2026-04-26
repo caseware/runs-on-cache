@@ -343,7 +343,7 @@ export class BtrfsContainer extends Container {
         this.logDebug(`Syncing and calculating used space`);
         await exec.exec("sync", [], { silent: !core.isDebug() });
 
-        // Get used space and resize filesystem
+        // Get used space and resize filesystem — resize is best-effort
         let usedBytes = 0;
         try {
             const usageOutput = await this.getBtrfsUsage();
@@ -359,11 +359,19 @@ export class BtrfsContainer extends Container {
         const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
 
         core.debug(`Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
-        await exec.exec(
-            "sudo",
-            ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint],
-            { silent: !core.isDebug() }
-        );
+        try {
+            await exec.exec(
+                "sudo",
+                ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint],
+                { silent: !core.isDebug() }
+            );
+        } catch (resizeError) {
+            core.warning(
+                `Filesystem resize failed (will upload at original size): ${
+                    resizeError instanceof Error ? resizeError.message : resizeError
+                }`
+            );
+        }
 
         // Ensure all changes are written to disk before unmounting
         await exec.exec("sync", [], { silent: !core.isDebug() });
@@ -371,9 +379,17 @@ export class BtrfsContainer extends Container {
         // Unmount filesystem - the containerFile now points to the actual file with all data
         await this.unmount();
 
-        // Resize backing file
+        // Resize backing file — best-effort, skip on failure
         this.logDebug(`Resizing backing file to ${targetMb} MB`);
-        await exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
+        try {
+            await exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
+        } catch (truncateError) {
+            core.warning(
+                `Backing file truncate failed (will upload at original size): ${
+                    truncateError instanceof Error ? truncateError.message : truncateError
+                }`
+            );
+        }
 
         // Additional sync and wait after unmount to ensure file is fully accessible
         await exec.exec("sync", [], { silent: !core.isDebug() });
