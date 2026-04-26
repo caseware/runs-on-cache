@@ -96555,7 +96555,7 @@ class BtrfsContainer extends Container_1.Container {
             throw new Error("fsSize option is required for BtrfsContainer");
         }
         this.fsSize = options.fsSize;
-        this.bufferBytes = ((_a = options.bufferMb) !== null && _a !== void 0 ? _a : 512) * 1024 * 1024; // Convert MB to bytes
+        this.bufferBytes = ((_a = options.bufferMb) !== null && _a !== void 0 ? _a : 256) * 1024 * 1024; // Convert MB to bytes
         // Use higher compression for save (upload) to minimize image size.
         // Restore decompresses on-demand, so higher save compression = smaller image + same read perf.
         this.saveCompressionLevel = options.saveCompressionLevel || "zstd:3";
@@ -96797,7 +96797,7 @@ class BtrfsContainer extends Container_1.Container {
             }
             const targetSize = usedBytes + this.bufferBytes;
             const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
-            core.debug(`Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
+            this.logInfo(`Resize target: ${targetMb} MB (effective usage: ${Math.ceil(usedBytes / (1024 * 1024))} MB + ${Math.ceil(this.bufferBytes / (1024 * 1024))} MB buffer)`);
             try {
                 yield exec.exec("sudo", ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint], { cwd: this.safeCwd, silent: !core.isDebug() });
                 fsResizeSucceeded = true;
@@ -97284,15 +97284,38 @@ class BtrfsContainer extends Container_1.Container {
             ]);
         });
     }
+    /**
+     * Parse `btrfs filesystem usage -b` output and return the effective bytes
+     * that the image must accommodate.
+     *
+     * BTRFS allocates space in chunks (typically 256 MB data + 256 MB metadata +
+     * 8 MB system). `Device allocated:` is always >= `Used:` because it includes
+     * chunk overhead. Using just `Used:` would undersize the image, causing
+     * resize failures when BTRFS can't relocate chunks.
+     *
+     * Returns `max(Used, Device allocated)` so the truncate target is always
+     * large enough for what the filesystem actually occupies on disk.
+     */
     parseUsedBytes(usageOutput) {
         const lines = usageOutput.split("\n");
+        let used = 0;
+        let deviceAllocated = 0;
         for (const line of lines) {
-            const match = line.match(/^\s*Used:\s*(\d+)$/);
-            if (match) {
-                return parseInt(match[1], 10);
+            const usedMatch = line.match(/^\s*Used:\s*(\d+)$/);
+            if (usedMatch) {
+                used = parseInt(usedMatch[1], 10);
+            }
+            const allocMatch = line.match(/^\s*Device allocated:\s*(\d+)$/);
+            if (allocMatch) {
+                deviceAllocated = parseInt(allocMatch[1], 10);
             }
         }
-        throw new Error("Could not parse BTRFS usage output");
+        if (used === 0 && deviceAllocated === 0) {
+            throw new Error("Could not parse BTRFS usage output");
+        }
+        const effective = Math.max(used, deviceAllocated);
+        this.logDebug(`BTRFS usage — Used: ${used} bytes, Device allocated: ${deviceAllocated} bytes, effective: ${effective} bytes`);
+        return effective;
     }
     discoverMountInfo() {
         return __awaiter(this, void 0, void 0, function* () {

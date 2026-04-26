@@ -80,7 +80,7 @@ export class BtrfsContainer extends Container {
         }
 
         this.fsSize = options.fsSize;
-        this.bufferBytes = (options.bufferMb ?? 512) * 1024 * 1024; // Convert MB to bytes
+        this.bufferBytes = (options.bufferMb ?? 256) * 1024 * 1024; // Convert MB to bytes
         // Use higher compression for save (upload) to minimize image size.
         // Restore decompresses on-demand, so higher save compression = smaller image + same read perf.
         this.saveCompressionLevel = options.saveCompressionLevel || "zstd:3";
@@ -381,7 +381,9 @@ export class BtrfsContainer extends Container {
         const targetSize = usedBytes + this.bufferBytes;
         const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
 
-        core.debug(`Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
+        this.logInfo(
+            `Resize target: ${targetMb} MB (effective usage: ${Math.ceil(usedBytes / (1024 * 1024))} MB + ${Math.ceil(this.bufferBytes / (1024 * 1024))} MB buffer)`
+        );
         try {
             await exec.exec(
                 "sudo",
@@ -949,15 +951,40 @@ export class BtrfsContainer extends Container {
         ]);
     }
 
+    /**
+     * Parse `btrfs filesystem usage -b` output and return the effective bytes
+     * that the image must accommodate.
+     *
+     * BTRFS allocates space in chunks (typically 256 MB data + 256 MB metadata +
+     * 8 MB system). `Device allocated:` is always >= `Used:` because it includes
+     * chunk overhead. Using just `Used:` would undersize the image, causing
+     * resize failures when BTRFS can't relocate chunks.
+     *
+     * Returns `max(Used, Device allocated)` so the truncate target is always
+     * large enough for what the filesystem actually occupies on disk.
+     */
     private parseUsedBytes(usageOutput: string): number {
         const lines = usageOutput.split("\n");
+        let used = 0;
+        let deviceAllocated = 0;
         for (const line of lines) {
-            const match = line.match(/^\s*Used:\s*(\d+)$/);
-            if (match) {
-                return parseInt(match[1], 10);
+            const usedMatch = line.match(/^\s*Used:\s*(\d+)$/);
+            if (usedMatch) {
+                used = parseInt(usedMatch[1], 10);
+            }
+            const allocMatch = line.match(/^\s*Device allocated:\s*(\d+)$/);
+            if (allocMatch) {
+                deviceAllocated = parseInt(allocMatch[1], 10);
             }
         }
-        throw new Error("Could not parse BTRFS usage output");
+        if (used === 0 && deviceAllocated === 0) {
+            throw new Error("Could not parse BTRFS usage output");
+        }
+        const effective = Math.max(used, deviceAllocated);
+        this.logDebug(
+            `BTRFS usage — Used: ${used} bytes, Device allocated: ${deviceAllocated} bytes, effective: ${effective} bytes`
+        );
+        return effective;
     }
 
     private async discoverMountInfo(): Promise<void> {
