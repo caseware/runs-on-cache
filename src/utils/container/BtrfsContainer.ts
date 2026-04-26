@@ -1197,12 +1197,5 @@ export class BtrfsContainer extends Container {
         } catch (error) {
             core.debug(`Cleanup mount point failed (non-critical): ${error}`);
         }
-
-        // Clean up the per-run sudo CWD temp dir
-        if (this.safeCwd) {
-            try {
-                await fs.rm(this.safeCwd, { recursive: true, force: true });
-            } catch { /* best-effort */ }
-        }
     }
 }
