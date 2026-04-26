@@ -357,7 +357,7 @@ describe("BtrfsContainer.save", () => {
                 (call[1]?.[2] as string)?.startsWith("remount,compress-force=")
         );
         expect(remountCall).toBeDefined();
-        expect(remountCall?.[1]?.[2]).toBe("remount,compress-force=zstd:9");
+        expect(remountCall?.[1]?.[2]).toBe("remount,compress-force=zstd:3");
 
         // Should defrag with sudo (algorithm only, no level)
         const defragCall = execCalls.find(
@@ -602,84 +602,8 @@ describe("ContainerFactory BTRFS selection", () => {
 });
 
 describe("BtrfsContainer edge case improvements", () => {
-    test("restore verifies image integrity before mounting", async () => {
-        // Mock btrfs check --readonly to succeed
-        mockedExec.exec.mockImplementation(async (cmd, args, options) => {
-            if (
-                cmd === "sudo" &&
-                args?.[0] === "btrfs" &&
-                args?.[1] === "check" &&
-                args?.[2] === "--readonly"
-            ) {
-                return 0;
-            }
-            return 0;
-        });
-
-        const container = createBtrfsContainer();
-        await container.restore();
-
-        // Should call btrfs check --readonly
-        const checkCall = mockedExec.exec.mock.calls.find(
-            call =>
-                call[0] === "sudo" &&
-                call[1]?.[0] === "btrfs" &&
-                call[1]?.[1] === "check" &&
-                call[1]?.[2] === "--readonly"
-        );
-        expect(checkCall).toBeDefined();
-    });
-
-    test("restore falls back to empty cache on corrupted image", async () => {
-        let checkedIntegrity = false;
-
-        mockedExec.exec.mockImplementation(async (cmd, args, options) => {
-            if (
-                cmd === "sudo" &&
-                args?.[0] === "btrfs" &&
-                args?.[1] === "check" &&
-                args?.[2] === "--readonly"
-            ) {
-                checkedIntegrity = true;
-                throw new Error("filesystem has errors");
-            }
-            // losetup -j for cleanup
-            if (cmd === "losetup") {
-                if (options?.listeners?.stdout) {
-                    options.listeners.stdout(Buffer.from(""));
-                }
-                return 0;
-            }
-            return 0;
-        });
-
-        const container = createBtrfsContainer();
-        await container.restore();
-
-        expect(checkedIntegrity).toBe(true);
-
-        // Should warn about corruption
-        expect(mockedCore.warning).toHaveBeenCalledWith(
-            expect.stringContaining("integrity check failed")
-        );
-
-        // Should create a new sparse image (fallback to createEmptyCache)
-        const truncateCall = mockedExec.exec.mock.calls.find(
-            call => call[0] === "truncate"
-        );
-        expect(truncateCall).toBeDefined();
-    });
-
     test("restore checks filesystem health after mount", async () => {
         mockedExec.exec.mockImplementation(async (cmd, args, options) => {
-            // Mock btrfs check passing
-            if (
-                cmd === "sudo" &&
-                args?.[0] === "btrfs" &&
-                args?.[1] === "check"
-            ) {
-                return 0;
-            }
             // Mock btrfs device stats
             if (
                 cmd === "sudo" &&
@@ -719,13 +643,6 @@ describe("BtrfsContainer edge case improvements", () => {
 
     test("restore warns on filesystem I/O errors", async () => {
         mockedExec.exec.mockImplementation(async (cmd, args, options) => {
-            if (
-                cmd === "sudo" &&
-                args?.[0] === "btrfs" &&
-                args?.[1] === "check"
-            ) {
-                return 0;
-            }
             if (
                 cmd === "sudo" &&
                 args?.[0] === "btrfs" &&

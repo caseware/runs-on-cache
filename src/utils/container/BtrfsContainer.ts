@@ -68,7 +68,7 @@ export class BtrfsContainer extends Container {
         this.bufferBytes = (options.bufferMb ?? 512) * 1024 * 1024; // Convert MB to bytes
         // Use higher compression for save (upload) to minimize image size.
         // Restore decompresses on-demand, so higher save compression = smaller image + same read perf.
-        this.saveCompressionLevel = options.saveCompressionLevel || "zstd:9";
+        this.saveCompressionLevel = options.saveCompressionLevel || "zstd:3";
         this.mountMode = options.mountMode || "rw";
         this.nodeLocal = new NodeLocalCache(
             options.nodeLocalCacheDir || "",
@@ -138,12 +138,6 @@ export class BtrfsContainer extends Container {
             const localPath = this.nodeLocal.localPath;
             this.logInfo(`Node-local exact hit — mounting from ${localPath}`);
 
-            const isHealthy = await this.verifyImageIntegrity(localPath);
-            if (!isHealthy) {
-                this.logInfo("Node-local image corrupted — falling back to S3");
-                return false;
-            }
-
             try {
                 if (this.mountMode === "rw") {
                     await this.copyAndMountReadWrite(localPath);
@@ -168,12 +162,6 @@ export class BtrfsContainer extends Container {
             const closestMatch = await this.nodeLocal.findClosestMatch(restoreKeys);
             if (closestMatch) {
                 this.logInfo(`Node-local partial hit — copying ${path.basename(closestMatch)} for RW augmentation`);
-
-                const isHealthy = await this.verifyImageIntegrity(closestMatch);
-                if (!isHealthy) {
-                    this.logInfo("Node-local partial image corrupted — falling back to S3");
-                    return false;
-                }
 
                 try {
                     // Always copy + mount RW for partial hits so yarn can augment
@@ -246,17 +234,6 @@ export class BtrfsContainer extends Container {
 
     async restore(): Promise<void> {
         try {
-            // Verify image integrity before mounting
-            const isHealthy = await this.verifyImageIntegrity(
-                this.containerFile
-            );
-            if (!isHealthy) {
-                this.logInfo(
-                    "Corrupted image detected — falling back to empty cache"
-                );
-                return this.createEmptyCache();
-            }
-
             if (this.mountMode === "ro") {
                 // Mount the downloaded image read-only
                 await this.mountReadOnly(this.containerFile);
@@ -641,28 +618,7 @@ export class BtrfsContainer extends Container {
         return bytes;
     }
 
-    /**
-     * Verify the integrity of a downloaded BTRFS image before mounting.
-     * Runs `btrfs check --readonly` to detect corruption.
-     * Returns true if the image is healthy, false if corrupted.
-     */
-    private async verifyImageIntegrity(imageFile: string): Promise<boolean> {
-        try {
-            this.logDebug(`Checking image integrity: ${imageFile}`);
-            await exec.exec("sudo", ["btrfs", "check", "--readonly", imageFile], {
-                silent: !core.isDebug()
-            });
-            this.logDebug("Image integrity check passed");
-            return true;
-        } catch (error) {
-            core.warning(
-                `${this.getLogPrefix()} Image integrity check failed for ${imageFile}: ${
-                    error instanceof Error ? error.message : error
-                }. Will recreate cache from scratch.`
-            );
-            return false;
-        }
-    }
+
 
     /**
      * Check filesystem health after mounting by reading device stats.
