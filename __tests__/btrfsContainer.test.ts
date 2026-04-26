@@ -862,6 +862,13 @@ describe("BtrfsContainer edge case improvements", () => {
                 return 0;
             }
             if (cmd === "mountpoint") return 0;
+            // setupLoopDevice during verifyImageMountable
+            if (cmd === "sudo" && args?.[0] === "losetup" && args?.[1] === "--find") {
+                if (options?.listeners?.stdout) {
+                    options.listeners.stdout(Buffer.from("/dev/loop1\n"));
+                }
+                return 0;
+            }
             if (cmd === "losetup" && args?.[0] === "-j") {
                 losetupCleanupCalled = true;
                 if (options?.listeners?.stdout) {

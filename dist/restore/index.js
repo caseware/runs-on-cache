@@ -96524,6 +96524,10 @@ class BtrfsContainer extends Container_1.Container {
          */
         this.restoredFromNodeLocal = false;
         /**
+         * Set to true if save verification fails — prevents uploading an unmountable image.
+         */
+        this.saveAborted = false;
+        /**
          * Detected at discoverMountInfo() time — true if the current BTRFS mount is read-only.
          */
         this.mountIsReadOnly = false;
@@ -96781,29 +96785,6 @@ class BtrfsContainer extends Container_1.Container {
             yield exec.exec("sync", [], { silent: !core.isDebug() });
             // Unmount filesystem - the containerFile now points to the actual file with all data
             yield this.unmount();
-            // Verify filesystem integrity before upload — ensures every S3 image is clean.
-            // Run btrfs check on the unmounted image via a temporary loop device.
-            try {
-                const checkLoopDev = yield this.setupLoopDevice(this.containerFile);
-                try {
-                    yield exec.exec("sudo", ["btrfs", "check", "--readonly", checkLoopDev], {
-                        silent: !core.isDebug()
-                    });
-                    this.logInfo("BTRFS integrity check passed");
-                }
-                catch (checkError) {
-                    core.warning(`BTRFS integrity check failed — image may not mount on restore: ${checkError instanceof Error ? checkError.message : checkError}`);
-                }
-                finally {
-                    try {
-                        yield this.execSudo("losetup", ["-d", checkLoopDev]);
-                    }
-                    catch ( /* best-effort cleanup */_b) { /* best-effort cleanup */ }
-                }
-            }
-            catch (loopError) {
-                core.warning(`Could not attach loop device for integrity check: ${loopError}`);
-            }
             // Only truncate the backing file if the BTRFS filesystem resize succeeded.
             // If resize failed, the superblock still claims the original size (e.g. 256MB).
             // Truncating to a smaller size would make the file smaller than the superblock
@@ -96821,18 +96802,19 @@ class BtrfsContainer extends Container_1.Container {
             else {
                 this.logInfo("Skipping backing file truncation — filesystem resize did not succeed");
             }
-            // Additional sync and wait after unmount to ensure file is fully accessible
             yield exec.exec("sync", [], { silent: !core.isDebug() });
-            // Clean up loop devices after save
-            yield this.cleanupLoopDevices(this.containerFile);
+            // Verification mount: prove the image is mountable before uploading to S3.
+            // Never push an unmountable image — that would poison every future restore.
+            yield this.verifyImageMountable(this.containerFile);
             this.logDebug(`Save completed. Container file ready for upload: ${this.containerFile}`);
         });
     }
     /**
-     * Whether the S3 upload should be skipped because the node already has the image.
+     * Whether the S3 upload should be skipped because the node already has the image
+     * or because the save verification failed (never push an unmountable image).
      */
     shouldSkipS3Upload() {
-        return this.mountIsReadOnly;
+        return this.mountIsReadOnly || this.saveAborted;
     }
     getNodeLocalDownloadPath() {
         return __awaiter(this, void 0, void 0, function* () {
@@ -96964,6 +96946,33 @@ class BtrfsContainer extends Container_1.Container {
             }
             this.logInfo(`Attached ${imageFile} → ${loopDev}`);
             return loopDev;
+        });
+    }
+    /**
+     * Verify the image file is mountable by doing a read-only losetup + mount + unmount cycle.
+     * If the mount fails, sets saveAborted = true to prevent uploading a broken image.
+     */
+    verifyImageMountable(imageFile) {
+        return __awaiter(this, void 0, void 0, function* () {
+            this.logInfo("Verifying image is mountable before upload...");
+            const verifyDir = `${imageFile}.verify-mount`;
+            try {
+                const loopDev = yield this.setupLoopDevice(imageFile);
+                try {
+                    yield exec.exec("mkdir", ["-p", verifyDir]);
+                    yield exec.exec("sudo", ["mount", "-t", "btrfs", "-o", "ro", loopDev, verifyDir]);
+                    yield exec.exec("sudo", ["umount", verifyDir]);
+                    this.logInfo("Verification mount succeeded — image is safe to upload");
+                }
+                finally {
+                    yield this.cleanupLoopDevices(imageFile);
+                    yield exec.exec("rm", ["-rf", verifyDir]).catch(() => { });
+                }
+            }
+            catch (verifyError) {
+                core.error(`Verification mount FAILED — aborting S3 upload to prevent poisoning cache: ${verifyError instanceof Error ? verifyError.message : verifyError}`);
+                this.saveAborted = true;
+            }
         });
     }
     execSudo(command, args = []) {
