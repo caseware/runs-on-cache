@@ -385,6 +385,30 @@ export class BtrfsContainer extends Container {
         // Unmount filesystem - the containerFile now points to the actual file with all data
         await this.unmount();
 
+        // Verify filesystem integrity before upload — ensures every S3 image is clean.
+        // Run btrfs check on the unmounted image via a temporary loop device.
+        try {
+            const checkLoopDev = await this.setupLoopDevice(this.containerFile);
+            try {
+                await exec.exec("sudo", ["btrfs", "check", "--readonly", checkLoopDev], {
+                    silent: !core.isDebug()
+                });
+                this.logInfo("BTRFS integrity check passed");
+            } catch (checkError) {
+                core.warning(
+                    `BTRFS integrity check failed — image may not mount on restore: ${
+                        checkError instanceof Error ? checkError.message : checkError
+                    }`
+                );
+            } finally {
+                try {
+                    await this.execSudo("losetup", ["-d", checkLoopDev]);
+                } catch { /* best-effort cleanup */ }
+            }
+        } catch (loopError) {
+            core.warning(`Could not attach loop device for integrity check: ${loopError}`);
+        }
+
         // Resize backing file — best-effort, skip on failure
         this.logDebug(`Resizing backing file to ${targetMb} MB`);
         try {
@@ -513,6 +537,21 @@ export class BtrfsContainer extends Container {
                 await collect("loaded modules", "sudo", ["lsmod"]);
                 await collect("loop devices", "sudo", ["losetup", "-a"]);
                 await collect("/dev/loop-control", "ls", ["-la", "/dev/loop-control"]);
+                // Kernel log — the definitive source for why mount failed
+                await collect("dmesg (last 30 lines)", "sudo", ["dmesg", "--time-format=reltime", "-T"]);
+                // If we have a loop device, run BTRFS-specific diagnostics
+                if (actualDevice.startsWith("/dev/loop")) {
+                    await collect("btrfs check --readonly", "sudo", ["btrfs", "check", "--readonly", actualDevice]);
+                    await collect("btrfs superblock (compat flags)", "sudo", [
+                        "btrfs", "inspect-internal", "dump-super", actualDevice
+                    ]);
+                }
+                // Truncate dmesg to last 30 lines to avoid noise
+                const dmesgIdx = diag.findIndex(d => d.startsWith("dmesg"));
+                if (dmesgIdx >= 0) {
+                    const lines = diag[dmesgIdx].split("\n");
+                    diag[dmesgIdx] = lines.slice(0, 1).concat(lines.slice(-30)).join("\n");
+                }
                 core.warning(`[BTRFS] Mount diagnostic for ${device}:\n${diag.join("\n")}`);
             } catch { /* diagnostic collection is best-effort */ }
 
