@@ -348,7 +348,18 @@ describe("BtrfsContainer.save", () => {
 
         const execCalls = mockedExec.exec.mock.calls;
 
-        // Should defrag with sudo and save compression level (default zstd:9)
+        // Should remount with compress-force=<saveLevel> before defrag
+        const remountCall = execCalls.find(
+            call =>
+                call[0] === "sudo" &&
+                call[1]?.[0] === "mount" &&
+                call[1]?.[1] === "-o" &&
+                (call[1]?.[2] as string)?.startsWith("remount,compress-force=")
+        );
+        expect(remountCall).toBeDefined();
+        expect(remountCall?.[1]?.[2]).toBe("remount,compress-force=zstd:9");
+
+        // Should defrag with sudo (algorithm only, no level)
         const defragCall = execCalls.find(
             call =>
                 call[0] === "sudo" &&
@@ -359,6 +370,11 @@ describe("BtrfsContainer.save", () => {
         expect(defragCall).toBeDefined();
         // Verify defrag strips level and uses just -czstd (defrag doesn't accept levels)
         expect(defragCall?.[1]).toContain("-czstd");
+
+        // Verify remount happens before defrag
+        const remountIdx = execCalls.indexOf(remountCall!);
+        const defragIdx = execCalls.indexOf(defragCall!);
+        expect(remountIdx).toBeLessThan(defragIdx);
 
         // Should resize with sudo
         const resizeCall = execCalls.find(

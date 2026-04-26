@@ -96739,9 +96739,17 @@ class BtrfsContainer extends Container_1.Container {
                 this.logInfo("Skipping save — mount is read-only, nothing to persist");
                 return;
             }
-            // btrfs defrag -c only accepts algorithm name (zstd, lzo, zlib) — NOT levels.
-            // Strip level suffix (e.g. "zstd:9" → "zstd") for the defrag command.
+            // Remount with higher compression before defrag so rewritten blocks use save-level compression.
+            // btrfs defrag -c only sets the algorithm (zstd/lzo/zlib), not the level.
+            // The actual compression level comes from the mount option, so we remount with compress-force=<saveLevel>.
             const defragAlgo = this.saveCompressionLevel.split(":")[0];
+            this.logInfo(`Remounting with compress-force=${this.saveCompressionLevel} before defrag`);
+            try {
+                yield exec.exec("sudo", ["mount", "-o", `remount,compress-force=${this.saveCompressionLevel}`, this.mountPoint]);
+            }
+            catch (remountError) {
+                core.warning(`Remount with save compression failed, defrag will use mount-time level: ${remountError instanceof Error ? remountError.message : remountError}`);
+            }
             this.logInfo(`Defragmenting + recompressing with ${defragAlgo} (save-compression-level: ${this.saveCompressionLevel})`);
             try {
                 yield exec.exec("sudo", ["btrfs", "filesystem", "defragment", "-r", `-c${defragAlgo}`, this.mountPoint]);
