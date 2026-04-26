@@ -96260,6 +96260,7 @@ function run() {
                     core.setOutput("matched-key", "");
                     core.setOutput("cache-hit-type", "miss");
                     core.setOutput("cache-hit", "false");
+                    core.setOutput(constants_1.Outputs.PreviousVersionPath, "");
                     return;
                 }
             }
@@ -96283,6 +96284,7 @@ function run() {
                 core.setOutput("matched-key", "");
                 core.setOutput("cache-hit-type", "miss");
                 core.setOutput("cache-hit", "false");
+                core.setOutput(constants_1.Outputs.PreviousVersionPath, "");
                 return;
             }
             // Determine if this was an exact or partial hit
@@ -96292,12 +96294,18 @@ function run() {
             core.setOutput("matched-key", cacheKey);
             core.setOutput("cache-hit-type", hitType);
             core.setOutput("cache-hit", "true");
+            // previous-version-path is set by restoreCache when previous-version-mount is enabled
+            // and a partial hit occurred. For exact hits, ensure it's explicitly empty.
+            if (isExact) {
+                core.setOutput(constants_1.Outputs.PreviousVersionPath, "");
+            }
         }
         catch (error) {
             core.warning(`Cache restore failed: ${error.message}`);
             core.setOutput("matched-key", "");
             core.setOutput("cache-hit-type", "miss");
             core.setOutput("cache-hit", "false");
+            core.setOutput(constants_1.Outputs.PreviousVersionPath, "");
         }
         process.exit(0);
     });

@@ -1,7 +1,7 @@
 import * as core from "@actions/core";
 import * as custom from "./custom/cache";
 import * as utils from "./utils/actionUtils";
-import { Inputs } from "./constants";
+import { Inputs, Outputs } from "./constants";
 import { StateProvider } from "./stateProvider";
 
 const canSaveToS3 = process.env["RUNS_ON_S3_BUCKET_CACHE"] !== undefined;
@@ -147,6 +147,7 @@ async function run(): Promise<void> {
                 core.setOutput("matched-key", "");
                 core.setOutput("cache-hit-type", "miss");
                 core.setOutput("cache-hit", "false");
+                core.setOutput(Outputs.PreviousVersionPath, "");
                 return;
             }
         } else {
@@ -184,6 +185,7 @@ async function run(): Promise<void> {
             core.setOutput("matched-key", "");
             core.setOutput("cache-hit-type", "miss");
             core.setOutput("cache-hit", "false");
+            core.setOutput(Outputs.PreviousVersionPath, "");
             return;
         }
 
@@ -195,6 +197,12 @@ async function run(): Promise<void> {
         core.setOutput("matched-key", cacheKey);
         core.setOutput("cache-hit-type", hitType);
         core.setOutput("cache-hit", "true");
+
+        // previous-version-path is set by restoreCache when previous-version-mount is enabled
+        // and a partial hit occurred. For exact hits, ensure it's explicitly empty.
+        if (isExact) {
+            core.setOutput(Outputs.PreviousVersionPath, "");
+        }
     } catch (error) {
         core.warning(
             `Cache restore failed: ${(error as Error).message}`
@@ -202,6 +210,7 @@ async function run(): Promise<void> {
         core.setOutput("matched-key", "");
         core.setOutput("cache-hit-type", "miss");
         core.setOutput("cache-hit", "false");
+        core.setOutput(Outputs.PreviousVersionPath, "");
     }
 
     process.exit(0);

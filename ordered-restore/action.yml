@@ -18,6 +18,12 @@ description: |
 
   Returns which key matched and whether it was an exact or partial hit.
   The first key (Mode 1) or HEAD hash (Mode 2) is the "exact" key — all others are "partial".
+
+  When `previous-version-mount` is "true" and a PARTIAL hit occurs, the matched (old)
+  image stays mounted READ-ONLY at a secondary path exposed via `previous-version-path`.
+  The primary cache path gets a fresh empty BTRFS image for population. Use this for the
+  "git alternates" pattern: reference old .git/objects via GIT_ALTERNATE_OBJECT_DIRECTORIES
+  while building a new clone, then save the new image under the exact requested key.
 inputs:
   # --- Mode 1: Explicit key list ---
   cache-keys:
@@ -78,6 +84,27 @@ inputs:
     description: 'Additional buffer size for btrfs format (e.g., 2048) after image resize.'
     default: '2048'
     required: false
+  node-local-cache-dir:
+    description: 'Path to node-local persistent cache directory (HostPath mount on EKS). When set, images are cached on the node for instant restore. Falls back to S3 on miss.'
+    default: ''
+    required: false
+  mount-mode:
+    description: |
+      Mount mode for restored cache:
+        "rw" (read-write, default) — image is copied and mounted read-write for augmentation.
+        "ro" (read-only) — shared image mounted read-only from node-local HostPath.
+    default: 'rw'
+    required: false
+  previous-version-mount:
+    description: |
+      When "true" and a PARTIAL cache hit occurs, mount the closest matching image
+      read-only at a secondary mount point (exposed via previous-version-path output).
+      The primary cache gets a fresh empty BTRFS image for population.
+      Use this for the "git alternates" pattern: reference old .git/objects via
+      GIT_ALTERNATE_OBJECT_DIRECTORIES while building a new clone.
+      When "false" (default), partial hits use the copy+augment pattern instead.
+    default: 'false'
+    required: false
 outputs:
   matched-key:
     description: 'The cache key that was matched, or empty string if miss'
@@ -85,6 +112,14 @@ outputs:
     description: 'exact if the first key matched, partial if a fallback matched, miss if none matched'
   cache-hit:
     description: 'true if any key matched (exact or partial), false if miss'
+  node-local-cache-hit:
+    description: 'Whether the cache was restored from node-local storage: "true" (node-local hit), "false" (S3 fallback), or "disabled" (node-local not configured)'
+  previous-version-path:
+    description: |
+      When previous-version-mount is "true" and a partial hit occurred, the mount point
+      where the previous version is accessible read-only. Empty string if not applicable
+      (exact hit, miss, or previous-version-mount disabled).
+      Consumer can use this for GIT_ALTERNATE_OBJECT_DIRECTORIES or to reference old LFS objects.
 runs:
   using: 'node20'
   main: '../dist/ordered-restore/index.js'

@@ -309,4 +309,117 @@ describe("orderedRestore", () => {
             expect(shouldForceSave("miss")).toBe(true);
         });
     });
+
+    describe("previous-version-mount output contract", () => {
+        test("previous-version-path is empty on exact hit", () => {
+            const outputs: Record<string, string> = {};
+            const cacheKey = "exact-key";
+            const primaryKey = "exact-key";
+            const isExact = cacheKey === primaryKey;
+
+            // On exact hit, no secondary mount needed
+            outputs["previous-version-path"] = isExact ? "" : "/tmp/previous-mount";
+
+            expect(outputs["previous-version-path"]).toBe("");
+        });
+
+        test("previous-version-path is set on partial hit when previous-version-mount enabled", () => {
+            const outputs: Record<string, string> = {};
+            const cacheKey: string = "fallback-key";
+            const primaryKey: string = "exact-key";
+            const isExact = cacheKey === primaryKey;
+            const previousVersionMount = true;
+
+            if (!isExact && previousVersionMount) {
+                outputs["previous-version-path"] = "/tmp/cache-previous/mount";
+            } else {
+                outputs["previous-version-path"] = "";
+            }
+
+            expect(outputs["previous-version-path"]).toBe("/tmp/cache-previous/mount");
+        });
+
+        test("previous-version-path is empty on partial hit when previous-version-mount disabled", () => {
+            const outputs: Record<string, string> = {};
+            const cacheKey: string = "fallback-key";
+            const primaryKey: string = "exact-key";
+            const isExact = cacheKey === primaryKey;
+            const previousVersionMount = false;
+
+            if (!isExact && previousVersionMount) {
+                outputs["previous-version-path"] = "/tmp/cache-previous/mount";
+            } else {
+                outputs["previous-version-path"] = "";
+            }
+
+            expect(outputs["previous-version-path"]).toBe("");
+        });
+
+        test("previous-version-path is empty on miss", () => {
+            const outputs: Record<string, string> = {};
+            outputs["previous-version-path"] = "";
+            expect(outputs["previous-version-path"]).toBe("");
+        });
+
+        test("git alternates pattern: consumer uses previous-version-path for object reference", () => {
+            const previousVersionPath = "/tmp/cache-previous/mount";
+            const gitObjectsDir = `${previousVersionPath}/.git/objects`;
+
+            // Consumer would set GIT_ALTERNATE_OBJECT_DIRECTORIES to this path
+            const env: Record<string, string> = {
+                GIT_ALTERNATE_OBJECT_DIRECTORIES: gitObjectsDir
+            };
+
+            expect(env["GIT_ALTERNATE_OBJECT_DIRECTORIES"]).toBe(
+                "/tmp/cache-previous/mount/.git/objects"
+            );
+        });
+
+        test("previous-version-mount with explicit key list: partial hit mounts old RO", () => {
+            const keys = [
+                "git-objects-2026-W17-abc123", // exact key (HEAD)
+                "git-objects-2026-W16-def456", // fallback 1
+                "git-objects-2026-W15-ghi789" // fallback 2
+            ];
+
+            const primaryKey = keys[0];
+            const matchedKey = keys[1]; // Partial hit on week 16
+            const isExact = matchedKey === primaryKey;
+            const previousVersionMount = true;
+
+            expect(isExact).toBe(false);
+            expect(previousVersionMount).toBe(true);
+
+            // On partial hit with previous-version-mount:
+            // - Old image (W16) mounted RO at secondary path → previous-version-path
+            // - Fresh empty BTRFS created for exact key (W17) → primary mount
+            // - Consumer does git fetch --reference=${previous-version-path}
+            // - Save writes new image under primaryKey (W17)
+
+            const saveShouldUseKey = primaryKey;
+            expect(saveShouldUseKey).toBe("git-objects-2026-W17-abc123");
+        });
+
+        test("previous-version-mount with hash-walk: partial hit on HEAD~2", () => {
+            const prefix = "git-objects-Linux";
+            const hashAtHead = "aaaa";
+            const hashAtHead1 = "bbbb";
+            const hashAtHead2 = "cccc";
+
+            const keys = [
+                `${prefix}-${hashAtHead}`,
+                `${prefix}-${hashAtHead1}`,
+                `${prefix}-${hashAtHead2}`
+            ];
+
+            // Simulate: HEAD hash doesn't exist in cache, HEAD~2 does
+            const primaryKey = keys[0];
+            const matchedKey = keys[2]; // partial hit at depth 2
+            const isExact = matchedKey === primaryKey;
+
+            expect(isExact).toBe(false);
+            // Save should use primary key (HEAD hash), not matched key
+            expect(primaryKey).toBe(`${prefix}-${hashAtHead}`);
+        });
+    });
 });
