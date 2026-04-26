@@ -66,6 +66,14 @@ export abstract class Container {
     }
 
     /**
+     * The final committed path for this cache key on the node.
+     * Returns null when node-local is disabled.
+     */
+    getNodeLocalFinalPath(): string | null {
+        return null;
+    }
+
+    /**
      * Whether node-local caching is enabled for this container.
      */
     isNodeLocalEnabled(): boolean {

@@ -95582,9 +95582,13 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
                 else {
                     core.info(`[NodeLocal] Another runner already committed — using existing`);
                 }
-                // Either way, the file is now at the final node-local path — use it for restore
-                // Update archivePath so restore() reads from the right location
-                archivePath = downloadPath;
+                // After commit, the temp file has been renamed to the final path.
+                // Use the final committed path (not the temp path which no longer exists).
+                const finalPath = cacheContainer.getNodeLocalFinalPath();
+                if (finalPath) {
+                    downloadPath = finalPath;
+                    archivePath = finalPath;
+                }
             }
             if (core.isDebug()) {
                 if (customCompression) {
@@ -96853,6 +96857,9 @@ class BtrfsContainer extends Container_1.Container {
             return this.nodeLocal.commitTempFile(tempPath);
         });
     }
+    getNodeLocalFinalPath() {
+        return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
+    }
     isNodeLocalEnabled() {
         return this.nodeLocal.enabled;
     }
@@ -97444,6 +97451,13 @@ class Container {
         });
     }
     /**
+     * The final committed path for this cache key on the node.
+     * Returns null when node-local is disabled.
+     */
+    getNodeLocalFinalPath() {
+        return null;
+    }
+    /**
      * Whether node-local caching is enabled for this container.
      */
     isNodeLocalEnabled() {
@@ -97930,6 +97944,9 @@ class TarContainer extends Container_1.Container {
             return this.nodeLocal.commitTempFile(tempPath);
         });
     }
+    getNodeLocalFinalPath() {
+        return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
+    }
     isNodeLocalEnabled() {
         return this.nodeLocal.enabled;
     }
@@ -98071,6 +98088,9 @@ class TarLz4Container extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             return this.nodeLocal.commitTempFile(tempPath);
         });
+    }
+    getNodeLocalFinalPath() {
+        return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
     }
     isNodeLocalEnabled() {
         return this.nodeLocal.enabled;
@@ -98334,6 +98354,9 @@ class VhdxContainer extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             return this.nodeLocal.commitTempFile(tempPath);
         });
+    }
+    getNodeLocalFinalPath() {
+        return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
     }
     isNodeLocalEnabled() {
         return this.nodeLocal.enabled;

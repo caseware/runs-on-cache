@@ -148,6 +148,10 @@ export class VhdxContainer extends Container {
         return this.nodeLocal.commitTempFile(tempPath);
     }
 
+    getNodeLocalFinalPath(): string | null {
+        return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
+    }
+
     isNodeLocalEnabled(): boolean {
         return this.nodeLocal.enabled;
     }

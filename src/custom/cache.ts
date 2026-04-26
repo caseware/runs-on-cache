@@ -192,9 +192,13 @@ export async function restoreCache(
             } else {
                 core.info(`[NodeLocal] Another runner already committed — using existing`);
             }
-            // Either way, the file is now at the final node-local path — use it for restore
-            // Update archivePath so restore() reads from the right location
-            archivePath = downloadPath;
+            // After commit, the temp file has been renamed to the final path.
+            // Use the final committed path (not the temp path which no longer exists).
+            const finalPath = cacheContainer.getNodeLocalFinalPath();
+            if (finalPath) {
+                downloadPath = finalPath;
+                archivePath = finalPath;
+            }
         }
 
         if (core.isDebug()) {
