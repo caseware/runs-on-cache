@@ -96261,8 +96261,9 @@ function saveRun(earlyExit) {
         try {
             // Only attempt save if the restore step completed successfully.
             // The main step sets CACHE_SAVE_ENABLED on successful restore.
-            // With post-if: "!cancelled()", the post step runs even on job failure,
-            // but we skip the S3 upload when restore didn't complete.
+            // With post-if: "always()", the post step runs on success, failure,
+            // AND cancellation — but we skip the S3 upload when restore didn't
+            // complete. BTRFS cleanup always runs in the finally block below.
             const saveEnabled = core.getState("CACHE_SAVE_ENABLED") === "true";
             if (saveEnabled) {
                 yield saveImpl(new stateProvider_1.StateProvider());
