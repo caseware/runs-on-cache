@@ -96722,8 +96722,16 @@ class BtrfsContainer extends Container_1.Container {
                 this.logInfo("Skipping save — mount is read-only, nothing to persist");
                 return;
             }
-            this.logDebug(`Defragmenting + recompressing with ${this.saveCompressionLevel}`);
-            yield exec.exec("sudo", ["btrfs", "filesystem", "defragment", "-r", `-c${this.saveCompressionLevel}`, this.mountPoint], { silent: !core.isDebug() });
+            // btrfs defrag -c only accepts algorithm name (zstd, lzo, zlib) — NOT levels.
+            // Strip level suffix (e.g. "zstd:9" → "zstd") for the defrag command.
+            const defragAlgo = this.saveCompressionLevel.split(":")[0];
+            this.logInfo(`Defragmenting + recompressing with ${defragAlgo} (save-compression-level: ${this.saveCompressionLevel})`);
+            try {
+                yield exec.exec("sudo", ["btrfs", "filesystem", "defragment", "-r", `-c${defragAlgo}`, this.mountPoint]);
+            }
+            catch (defragError) {
+                core.warning(`Defrag failed (image will upload at mount-time compression): ${defragError instanceof Error ? defragError.message : defragError}`);
+            }
             this.logDebug(`Syncing and calculating used space`);
             yield exec.exec("sync", [], { silent: !core.isDebug() });
             // Get used space and resize filesystem

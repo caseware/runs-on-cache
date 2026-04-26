@@ -357,8 +357,8 @@ describe("BtrfsContainer.save", () => {
                 call[1]?.[2] === "defragment"
         );
         expect(defragCall).toBeDefined();
-        // Verify defrag uses -czstd:9 for max compression before upload
-        expect(defragCall?.[1]).toContain("-czstd:9");
+        // Verify defrag strips level and uses just -czstd (defrag doesn't accept levels)
+        expect(defragCall?.[1]).toContain("-czstd");
 
         // Should resize with sudo
         const resizeCall = execCalls.find(
@@ -532,7 +532,9 @@ describe("BtrfsContainer.save", () => {
                 call[1]?.[2] === "defragment"
         );
         expect(defragCall).toBeDefined();
-        expect(defragCall?.[1]).toContain("-czstd:6");
+        // Verify defrag strips level suffix: "zstd:6" → "-czstd"
+        expect(defragCall?.[1]).toContain("-czstd");
+        expect(defragCall?.[1]).not.toContain("-czstd:6");
     });
 
     test("rejects invalid saveCompressionLevel", () => {
