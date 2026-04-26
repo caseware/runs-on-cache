@@ -1,12 +1,23 @@
 name: 'Ordered Cache Restore'
 description: |
   Restores cache by trying an ordered list of cache keys. Supports two modes:
-  1. Explicit key list (cache-keys): Pass a newline-separated list of keys to try in order.
-     Useful for time-based keys, manual ordering, or any non-hash-based pattern.
-  2. Hash-walk (hash-file + key-prefix): Walks git history commit-by-commit, hashing the
-     specified file at each depth level, and tries "{key-prefix}-{hash}" as the cache key.
-     Stops at the first hit. Useful for lockfile-based caching (yarn.lock, package-lock.json).
+
+  **Mode 1 — Explicit key list** (`cache-keys`):
+    Pass a newline-separated list of keys to try in order.
+    Useful for time-based keys, week/year patterns, or any non-hash-based ordering.
+    Example (week-based node_modules):
+      nodemodules-2026-W17-abc123
+      nodemodules-2026-W16-def456
+      nodemodules-2026-W15-789012
+
+  **Mode 2 — Hash-walk** (`hash-file` + `key-prefix`):
+    Walks git history commit-by-commit, hashing the specified file at each depth.
+    Generates keys as "{key-prefix}-{sha256(file@HEAD~N)}".
+    Stops at the first S3 hit. Deduplicates identical hashes across commits.
+    Useful for lockfile-based caching (yarn.lock, package-lock.json, Gemfile.lock).
+
   Returns which key matched and whether it was an exact or partial hit.
+  The first key (Mode 1) or HEAD hash (Mode 2) is the "exact" key — all others are "partial".
 inputs:
   # --- Mode 1: Explicit key list ---
   cache-keys:
@@ -16,6 +27,16 @@ inputs:
       Subsequent keys are fallbacks. If one matches, cache-hit-type is "partial".
       If none match, cache-hit-type is "miss".
       Mutually exclusive with hash-file/key-prefix.
+
+      Example — week-based yarn cache:
+        yarn-cache-2026-W17-${{ hashFiles('yarn.lock') }}
+        yarn-cache-2026-W16-${{ hashFiles('yarn.lock') }}
+        yarn-cache-2026-W15-${{ hashFiles('yarn.lock') }}
+
+      Example — branch-priority ordering:
+        cache-${{ github.head_ref }}-${{ hashFiles('yarn.lock') }}
+        cache-develop-${{ hashFiles('yarn.lock') }}
+        cache-main-${{ hashFiles('yarn.lock') }}
     required: false
   # --- Mode 2: Git history hash walk ---
   hash-file:
@@ -23,6 +44,7 @@ inputs:
       Path to a file to hash at each git commit (e.g., yarn.lock).
       Used with key-prefix to generate cache keys: "{key-prefix}-{sha256(file@HEAD~N)}".
       Walks one depth level at a time to minimize hashing cost.
+      Stops early if the file doesn't exist at a given ref.
     required: false
   key-prefix:
     description: |
@@ -59,13 +81,10 @@ inputs:
 outputs:
   matched-key:
     description: 'The cache key that was matched, or empty string if miss'
-    value: '${{ steps.resolve.outputs.matched-key }}'
   cache-hit-type:
     description: 'exact if the first key matched, partial if a fallback matched, miss if none matched'
-    value: '${{ steps.resolve.outputs.cache-hit-type }}'
   cache-hit:
     description: 'true if any key matched (exact or partial), false if miss'
-    value: '${{ steps.resolve.outputs.cache-hit }}'
 runs:
   using: 'node20'
   main: '../dist/ordered-restore/index.js'

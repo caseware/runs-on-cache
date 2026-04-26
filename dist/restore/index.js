@@ -95110,14 +95110,16 @@ var Inputs;
     Inputs["FsBufferMB"] = "fs-buffer-mb";
     Inputs["SaveCompressionLevel"] = "save-compression-level";
     Inputs["NodeLocalCacheDir"] = "node-local-cache-dir";
-    Inputs["MountMode"] = "mount-mode"; // Input for mount mode: "ro" (read-only, default for node_modules) or "rw" (read-write, for mutable caches)
+    Inputs["MountMode"] = "mount-mode";
+    Inputs["PreviousVersionMount"] = "previous-version-mount"; // When true, mount the closest partial-hit image read-only at a secondary path (git alternates pattern)
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {
     Outputs["CacheHit"] = "cache-hit";
     Outputs["CachePrimaryKey"] = "cache-primary-key";
     Outputs["CacheMatchedKey"] = "cache-matched-key";
-    Outputs["NodeLocalCacheHit"] = "node-local-cache-hit"; // Output from restore action: "true" | "false" | "disabled"
+    Outputs["NodeLocalCacheHit"] = "node-local-cache-hit";
+    Outputs["PreviousVersionPath"] = "previous-version-path"; // Output from restore action: path to the RO-mounted previous version (empty if not applicable)
 })(Outputs = exports.Outputs || (exports.Outputs = {}));
 var State;
 (function (State) {
@@ -95527,13 +95529,14 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
         const saveCompressionLevel = core.getInput(constants_1.Inputs.SaveCompressionLevel) || undefined;
         const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
         const mountMode = (core.getInput(constants_1.Inputs.MountMode) || "rw");
+        const previousVersionMount = core.getInput(constants_1.Inputs.PreviousVersionMount) === "true";
         let cacheContainer = undefined;
         try {
             const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
             core.debug(`Using baseDir: ${baseDir}`);
             archivePath = path.join(yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(primaryKey), (0, actionUtils_1.getCacheFileName)(compressionMethod));
             core.debug(`Archive Path: ${archivePath}`);
-            cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode });
+            cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode, previousVersionMount });
             // Initialize container (prerequisite checks, stale temp cleanup)
             yield cacheContainer.initialize();
             // Try node-local restore first (fast path: ~1-2s on warm node)
@@ -95598,7 +95601,25 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             core.info(`Cache Size: ~${Math.round(archiveFileSize / (1024 * 1024))} MB (${archiveFileSize} B)`);
             // Point the container at wherever we downloaded (node-local temp or default)
             cacheContainer.setArchivePath(downloadPath);
-            yield cacheContainer.restore();
+            // Check if this is a partial hit with previous-version-mount enabled
+            const isPartialHit = cacheEntry.cacheKey !== primaryKey;
+            if (isPartialHit && previousVersionMount) {
+                // Mount the downloaded (old) image RO as previous-version reference
+                core.info(`Partial hit with previous-version-mount: mounting ${cacheEntry.cacheKey} RO as reference`);
+                const prevMountPoint = yield cacheContainer.mountPreviousVersion(downloadPath);
+                if (prevMountPoint) {
+                    core.setOutput(constants_1.Outputs.PreviousVersionPath, prevMountPoint);
+                    core.info(`Previous version mounted at: ${prevMountPoint}`);
+                }
+                // Create a fresh empty cache for the exact key (consumer populates from scratch using previous as reference)
+                if (cacheContainer.requiresCreateEmptyCache) {
+                    yield cacheContainer.createEmptyCache();
+                    core.info("Created fresh empty cache for new key (previous version available RO)");
+                }
+            }
+            else {
+                yield cacheContainer.restore();
+            }
             core.info("Cache restored successfully from S3");
             // Report node-local cache miss (S3 fallback) or disabled
             core.setOutput(constants_1.Outputs.NodeLocalCacheHit, nodeLocalEnabled ? "false" : "disabled");
@@ -96532,6 +96553,7 @@ class BtrfsContainer extends Container_1.Container {
         // Restore decompresses on-demand, so higher save compression = smaller image + same read perf.
         this.saveCompressionLevel = options.saveCompressionLevel || "zstd:3";
         this.mountMode = options.mountMode || "rw";
+        this.previousVersionMountEnabled = options.previousVersionMount || false;
         this.nodeLocal = new NodeLocalCache_1.NodeLocalCache(options.nodeLocalCacheDir || "", cacheKey, ".btrfs");
         // Security input validations
         this.checkPathTraversal(this.baseDir, this.containerFile);
@@ -96603,14 +96625,26 @@ class BtrfsContainer extends Container_1.Container {
                     return false;
                 }
             }
-            // 2. Try partial match: find closest cache key on this node, copy to .tmpXXX, mount RW for augmentation
+            // 2. Try partial match: find closest cache key on this node
             if (restoreKeys && restoreKeys.length > 0) {
                 const closestMatch = yield this.nodeLocal.findClosestMatch(restoreKeys);
                 if (closestMatch) {
-                    this.logInfo(`Node-local partial hit — copying ${path.basename(closestMatch)} for RW augmentation`);
                     try {
-                        // Always copy + mount RW for partial hits so yarn can augment
-                        yield this.copyAndMountReadWrite(closestMatch);
+                        if (this.previousVersionMountEnabled) {
+                            // Previous-version-mount mode: mount old RO, create fresh empty for new key
+                            this.logInfo(`Node-local partial hit (previous-version mode) — mounting ${path.basename(closestMatch)} RO`);
+                            const prevMountPoint = yield this.mountPreviousVersion(closestMatch);
+                            if (prevMountPoint) {
+                                core.setOutput("previous-version-path", prevMountPoint);
+                            }
+                            // Create a fresh empty BTRFS image for the new key
+                            yield this.createEmptyCache();
+                        }
+                        else {
+                            // Standard augmentation mode: copy old, mount RW, yarn augments delta
+                            this.logInfo(`Node-local partial hit — copying ${path.basename(closestMatch)} for RW augmentation`);
+                            yield this.copyAndMountReadWrite(closestMatch);
+                        }
                         this.restoredFromNodeLocal = true;
                         return true;
                     }
@@ -96714,6 +96748,10 @@ class BtrfsContainer extends Container_1.Container {
     }
     save() {
         return __awaiter(this, void 0, void 0, function* () {
+            // Clean up previous-version RO mount if one was created during this container's restore
+            if (this.previousVersionMountPoint) {
+                yield this.unmountPreviousVersion();
+            }
             // Discover all mount information once
             try {
                 yield this.discoverMountInfo();
@@ -96798,6 +96836,88 @@ class BtrfsContainer extends Container_1.Container {
     }
     isNodeLocalEnabled() {
         return this.nodeLocal.enabled;
+    }
+    // ── Previous-version mount (git alternates pattern) ──────────────
+    /**
+     * Mount a previous version of the cache image read-only at a secondary mount point.
+     * The consumer can reference this path (e.g., GIT_ALTERNATE_OBJECT_DIRECTORIES) while
+     * populating a new cache image.
+     *
+     * @param imagePath Absolute path to the previous version's BTRFS image
+     * @returns The mount point where the previous version's content is accessible
+     */
+    mountPreviousVersion(imagePath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(`${this.cacheKey}-previous`);
+                const mountPoint = path.join(tempDir, "mount");
+                yield fs.mkdir(mountPoint, { recursive: true });
+                this.logInfo(`Mounting previous version read-only: ${imagePath} → ${mountPoint}`);
+                yield this.mountWithErrorHandling(imagePath, mountPoint, ["loop", "ro", `compress=${this.compressionLevel}`]);
+                this.previousVersionMountPoint = mountPoint;
+                this.previousVersionImageFile = imagePath;
+                // Bind-mount each cached path to a parallel directory so consumers can reference them
+                const previousPaths = [];
+                for (const p of this.pathsToCache) {
+                    const btrfsPath = path.join(mountPoint, p);
+                    // Verify the path exists in the image
+                    try {
+                        yield exec.exec("test", ["-d", btrfsPath], {
+                            ignoreReturnCode: false,
+                            silent: true
+                        });
+                        previousPaths.push(btrfsPath);
+                    }
+                    catch (_a) {
+                        this.logDebug(`Previous version does not contain path: ${p}`);
+                    }
+                }
+                if (previousPaths.length === 0) {
+                    this.logInfo("Previous version contains none of the cached paths — unmounting");
+                    yield this.unmountPreviousVersion();
+                    return null;
+                }
+                // Return the mount point — consumer accesses paths relative to it
+                return mountPoint;
+            }
+            catch (error) {
+                core.warning(`${this.getLogPrefix()} Failed to mount previous version: ${error instanceof Error ? error.message : error}`);
+                yield this.unmountPreviousVersion();
+                return null;
+            }
+        });
+    }
+    /**
+     * Unmount and clean up the previous-version read-only mount.
+     */
+    unmountPreviousVersion() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.previousVersionMountPoint)
+                return;
+            try {
+                const mountCheck = yield exec.exec("mountpoint", [this.previousVersionMountPoint], { ignoreReturnCode: true, silent: true });
+                if (mountCheck === 0) {
+                    this.logDebug(`Unmounting previous version: ${this.previousVersionMountPoint}`);
+                    yield this.umountWithErrorHandling(this.previousVersionMountPoint);
+                }
+            }
+            catch (_a) {
+                // Non-fatal
+            }
+            // Clean up loop devices
+            if (this.previousVersionImageFile) {
+                yield this.cleanupLoopDevices(this.previousVersionImageFile);
+            }
+            // Clean up mount point directory
+            try {
+                yield fs.rm(this.previousVersionMountPoint, { recursive: true, force: true });
+            }
+            catch (_b) {
+                // Non-fatal
+            }
+            this.previousVersionMountPoint = undefined;
+            this.previousVersionImageFile = undefined;
+        });
     }
     // ── Private helpers ──────────────────────────────────────────────
     execWithOutput(command, args) {
@@ -97390,6 +97510,28 @@ class Container {
      */
     isNodeLocalEnabled() {
         return false;
+    }
+    /**
+     * Mount a previous version of the cache read-only at a secondary mount point.
+     * Used for the "git alternates" pattern: the old content is available RO while
+     * the new key is being populated RW.
+     *
+     * @param imagePath Path to the previous version's image file
+     * @returns The mount point where the previous version is accessible, or null if unsupported
+     */
+    mountPreviousVersion(_imagePath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return null;
+        });
+    }
+    /**
+     * Unmount and clean up the previous-version read-only mount (if any).
+     * Called during save cleanup.
+     */
+    unmountPreviousVersion() {
+        return __awaiter(this, void 0, void 0, function* () {
+            // Default no-op — subclasses override if they support previous-version-mount
+        });
     }
     /**
      * Update the archive file path (e.g., when S3 download goes to a different location).

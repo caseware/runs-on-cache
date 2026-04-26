@@ -6,6 +6,7 @@ export interface ContainerOptions {
     saveCompressionLevel?: string;
     nodeLocalCacheDir?: string;
     mountMode?: "ro" | "rw";
+    previousVersionMount?: boolean;
 }
 
 export abstract class Container {
@@ -70,6 +71,26 @@ export abstract class Container {
      */
     isNodeLocalEnabled(): boolean {
         return false;
+    }
+
+    /**
+     * Mount a previous version of the cache read-only at a secondary mount point.
+     * Used for the "git alternates" pattern: the old content is available RO while
+     * the new key is being populated RW.
+     *
+     * @param imagePath Path to the previous version's image file
+     * @returns The mount point where the previous version is accessible, or null if unsupported
+     */
+    async mountPreviousVersion(_imagePath: string): Promise<string | null> {
+        return null;
+    }
+
+    /**
+     * Unmount and clean up the previous-version read-only mount (if any).
+     * Called during save cleanup.
+     */
+    async unmountPreviousVersion(): Promise<void> {
+        // Default no-op — subclasses override if they support previous-version-mount
     }
 
     /**

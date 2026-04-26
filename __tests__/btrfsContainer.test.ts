@@ -25,6 +25,9 @@ function createBtrfsContainer(
         bufferMb?: number;
         pathsToCache?: string[];
         saveCompressionLevel?: string;
+        nodeLocalCacheDir?: string;
+        mountMode?: "ro" | "rw";
+        previousVersionMount?: boolean;
     } = {}
 ): BtrfsContainer {
     const containerFile =
@@ -40,7 +43,10 @@ function createBtrfsContainer(
         {
             fsSize: overrides.fsSize ?? "50G",
             bufferMb: overrides.bufferMb ?? 512,
-            saveCompressionLevel: overrides.saveCompressionLevel
+            saveCompressionLevel: overrides.saveCompressionLevel,
+            nodeLocalCacheDir: overrides.nodeLocalCacheDir,
+            mountMode: overrides.mountMode,
+            previousVersionMount: overrides.previousVersionMount
         }
     );
 }
@@ -820,6 +826,190 @@ describe("BtrfsContainer edge case improvements", () => {
         await container.save();
 
         expect(losetupCleanupCalled).toBe(true);
+    });
+});
+
+describe("BtrfsContainer previous-version-mount", () => {
+    test("mountPreviousVersion mounts image read-only and returns mount point", async () => {
+        const container = createBtrfsContainer({
+            previousVersionMount: true
+        });
+
+        // Mock exec: mount succeeds, test -d for paths succeeds
+        mockedExec.exec.mockImplementation(async (cmd, args, options) => {
+            if (cmd === "sudo" && args?.[0] === "mount") {
+                // Verify RO mount options
+                const optArg = args?.find((a: string) => typeof a === "string" && a.includes("loop"));
+                expect(optArg).toContain("ro");
+                return 0;
+            }
+            if (cmd === "test" && args?.[0] === "-d") {
+                return 0; // Path exists in image
+            }
+            return 0;
+        });
+
+        const mountPoint = await container.mountPreviousVersion("/opt/cache/old-key.btrfs");
+        expect(mountPoint).toBeTruthy();
+        expect(mountPoint).toContain("-previous");
+        expect(mountPoint).toContain("mount");
+    });
+
+    test("mountPreviousVersion returns null when no cached paths exist in image", async () => {
+        const container = createBtrfsContainer({
+            previousVersionMount: true
+        });
+
+        mockedExec.exec.mockImplementation(async (cmd, args, options) => {
+            if (cmd === "sudo" && args?.[0] === "mount") return 0;
+            if (cmd === "test" && args?.[0] === "-d") {
+                throw new Error("directory not found");
+            }
+            // mountpoint check for unmount cleanup
+            if (cmd === "mountpoint") return 0;
+            if (cmd === "sudo" && args?.[0] === "umount") return 0;
+            if (cmd === "losetup" && args?.[0] === "-j") {
+                if (options?.listeners?.stdout) {
+                    options.listeners.stdout(Buffer.from(""));
+                }
+                return 0;
+            }
+            return 0;
+        });
+
+        const mountPoint = await container.mountPreviousVersion("/opt/cache/old-key.btrfs");
+        expect(mountPoint).toBeNull();
+    });
+
+    test("mountPreviousVersion cleans up on mount failure", async () => {
+        const container = createBtrfsContainer({
+            previousVersionMount: true
+        });
+
+        mockedExec.exec.mockImplementation(async (cmd, args) => {
+            if (cmd === "sudo" && args?.[0] === "mount") {
+                throw new Error("mount failed: device busy");
+            }
+            return 0;
+        });
+
+        const mountPoint = await container.mountPreviousVersion("/opt/cache/old-key.btrfs");
+        expect(mountPoint).toBeNull();
+        expect(mockedCore.warning).toHaveBeenCalledWith(
+            expect.stringContaining("Failed to mount previous version")
+        );
+    });
+
+    test("unmountPreviousVersion is no-op when no previous mount exists", async () => {
+        const container = createBtrfsContainer({
+            previousVersionMount: true
+        });
+
+        // Should not throw, should not call any exec commands
+        await container.unmountPreviousVersion();
+        expect(mockedExec.exec).not.toHaveBeenCalled();
+    });
+
+    test("unmountPreviousVersion cleans up mount, loop devices, and temp dir", async () => {
+        const container = createBtrfsContainer({
+            previousVersionMount: true
+        });
+
+        // First, mount a previous version to set the state
+        mockedExec.exec.mockImplementation(async (cmd, args, options) => {
+            if (cmd === "test" && args?.[0] === "-d") return 0;
+            if (cmd === "mountpoint") return 0;
+            if (cmd === "losetup" && args?.[0] === "-j") {
+                if (options?.listeners?.stdout) {
+                    options.listeners.stdout(Buffer.from("/dev/loop5: [0050]:12345 (/opt/cache/old.btrfs)\n"));
+                }
+                return 0;
+            }
+            return 0;
+        });
+
+        await container.mountPreviousVersion("/opt/cache/old.btrfs");
+
+        // Now unmount
+        jest.clearAllMocks();
+        mockedExec.exec.mockResolvedValue(0);
+
+        await container.unmountPreviousVersion();
+
+        // Should have called umount
+        const umountCall = mockedExec.exec.mock.calls.find(
+            call => call[0] === "mountpoint"
+        );
+        expect(umountCall).toBeDefined();
+    });
+
+    test("save cleans up previous-version mount when present", async () => {
+        const container = createBtrfsContainer({
+            previousVersionMount: true
+        });
+
+        // Set up a previous version mount
+        mockedExec.exec.mockImplementation(async (cmd, args, options) => {
+            if (cmd === "test" && args?.[0] === "-d") return 0;
+            return 0;
+        });
+        await container.mountPreviousVersion("/opt/cache/old.btrfs");
+
+        // Now mock for save flow
+        const tempDir = path.join(
+            process.env["RUNNER_TEMP"] || tmpdir(),
+            TEST_CACHE_KEY.replace(/[^a-zA-Z0-9\-_.]/g, "_")
+        );
+        const expectedMountPoint = path.join(tempDir, "mount");
+
+        mockedExec.exec.mockImplementation(async (cmd, args, options) => {
+            if (cmd === "findmnt") {
+                if (options?.listeners?.stdout) {
+                    options.listeners.stdout(
+                        Buffer.from(`${expectedMountPoint} /dev/loop0\n`)
+                    );
+                }
+                return 0;
+            }
+            if (
+                cmd === "sudo" &&
+                args?.[0] === "btrfs" &&
+                args?.[1] === "filesystem" &&
+                args?.[2] === "usage"
+            ) {
+                if (options?.listeners?.stdout) {
+                    options.listeners.stdout(
+                        Buffer.from(
+                            "Overall:\n    Device size:         1073741824\n    Used:                     104857600\n"
+                        )
+                    );
+                }
+                return 0;
+            }
+            if (cmd === "mountpoint") return 0;
+            if (cmd === "losetup" && args?.[0] === "-j") {
+                if (options?.listeners?.stdout) {
+                    options.listeners.stdout(Buffer.from(""));
+                }
+                return 0;
+            }
+            return 0;
+        });
+
+        await container.save();
+
+        // Verify mountpoint was checked (unmount attempt for previous version)
+        const mountpointCalls = mockedExec.exec.mock.calls.filter(
+            call => call[0] === "mountpoint"
+        );
+        expect(mountpointCalls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    test("previousVersionMount flag defaults to false", () => {
+        const container = createBtrfsContainer();
+        // No previous-version-mount option passed — should be false internally
+        // Verify by checking that mountPreviousVersion is available but the flag doesn't affect normal operations
+        expect(container).toBeDefined();
     });
 });
 

@@ -25,6 +25,7 @@ export class BtrfsContainer extends Container {
     private bufferBytes: number;
     private saveCompressionLevel: string;
     private readonly mountMode: "ro" | "rw";
+    private readonly previousVersionMountEnabled: boolean;
     private readonly nodeLocal: NodeLocalCache;
 
     /**
@@ -36,6 +37,17 @@ export class BtrfsContainer extends Container {
      * Detected at discoverMountInfo() time — true if the current BTRFS mount is read-only.
      */
     private mountIsReadOnly = false;
+
+    /**
+     * Secondary mount point for the previous-version (read-only) image.
+     * Used for the git alternates pattern: old content available RO while new key populates RW.
+     */
+    private previousVersionMountPoint: string | undefined;
+
+    /**
+     * The image file backing the previous-version mount (needed for loop device cleanup).
+     */
+    private previousVersionImageFile: string | undefined;
 
     constructor(
         containerFile: string,
@@ -70,6 +82,7 @@ export class BtrfsContainer extends Container {
         // Restore decompresses on-demand, so higher save compression = smaller image + same read perf.
         this.saveCompressionLevel = options.saveCompressionLevel || "zstd:3";
         this.mountMode = options.mountMode || "rw";
+        this.previousVersionMountEnabled = options.previousVersionMount || false;
         this.nodeLocal = new NodeLocalCache(
             options.nodeLocalCacheDir || "",
             cacheKey,
@@ -166,15 +179,29 @@ export class BtrfsContainer extends Container {
             }
         }
 
-        // 2. Try partial match: find closest cache key on this node, copy to .tmpXXX, mount RW for augmentation
+        // 2. Try partial match: find closest cache key on this node
         if (restoreKeys && restoreKeys.length > 0) {
             const closestMatch = await this.nodeLocal.findClosestMatch(restoreKeys);
             if (closestMatch) {
-                this.logInfo(`Node-local partial hit — copying ${path.basename(closestMatch)} for RW augmentation`);
-
                 try {
-                    // Always copy + mount RW for partial hits so yarn can augment
-                    await this.copyAndMountReadWrite(closestMatch);
+                    if (this.previousVersionMountEnabled) {
+                        // Previous-version-mount mode: mount old RO, create fresh empty for new key
+                        this.logInfo(
+                            `Node-local partial hit (previous-version mode) — mounting ${path.basename(closestMatch)} RO`
+                        );
+                        const prevMountPoint = await this.mountPreviousVersion(closestMatch);
+                        if (prevMountPoint) {
+                            core.setOutput("previous-version-path", prevMountPoint);
+                        }
+                        // Create a fresh empty BTRFS image for the new key
+                        await this.createEmptyCache();
+                    } else {
+                        // Standard augmentation mode: copy old, mount RW, yarn augments delta
+                        this.logInfo(
+                            `Node-local partial hit — copying ${path.basename(closestMatch)} for RW augmentation`
+                        );
+                        await this.copyAndMountReadWrite(closestMatch);
+                    }
                     this.restoredFromNodeLocal = true;
                     return true;
                 } catch (error) {
@@ -287,6 +314,11 @@ export class BtrfsContainer extends Container {
     }
 
     async save(): Promise<void> {
+        // Clean up previous-version RO mount if one was created during this container's restore
+        if (this.previousVersionMountPoint) {
+            await this.unmountPreviousVersion();
+        }
+
         // Discover all mount information once
         try {
             await this.discoverMountInfo();
@@ -402,6 +434,106 @@ export class BtrfsContainer extends Container {
 
     isNodeLocalEnabled(): boolean {
         return this.nodeLocal.enabled;
+    }
+
+    // ── Previous-version mount (git alternates pattern) ──────────────
+
+    /**
+     * Mount a previous version of the cache image read-only at a secondary mount point.
+     * The consumer can reference this path (e.g., GIT_ALTERNATE_OBJECT_DIRECTORIES) while
+     * populating a new cache image.
+     *
+     * @param imagePath Absolute path to the previous version's BTRFS image
+     * @returns The mount point where the previous version's content is accessible
+     */
+    async mountPreviousVersion(imagePath: string): Promise<string | null> {
+        try {
+            const tempDir = await createCacheKeySpecificTempDirectory(
+                `${this.cacheKey}-previous`
+            );
+            const mountPoint = path.join(tempDir, "mount");
+            await fs.mkdir(mountPoint, { recursive: true });
+
+            this.logInfo(`Mounting previous version read-only: ${imagePath} → ${mountPoint}`);
+
+            await this.mountWithErrorHandling(
+                imagePath,
+                mountPoint,
+                ["loop", "ro", `compress=${this.compressionLevel}`]
+            );
+
+            this.previousVersionMountPoint = mountPoint;
+            this.previousVersionImageFile = imagePath;
+
+            // Bind-mount each cached path to a parallel directory so consumers can reference them
+            const previousPaths: string[] = [];
+            for (const p of this.pathsToCache) {
+                const btrfsPath = path.join(mountPoint, p);
+                // Verify the path exists in the image
+                try {
+                    await exec.exec("test", ["-d", btrfsPath], {
+                        ignoreReturnCode: false,
+                        silent: true
+                    });
+                    previousPaths.push(btrfsPath);
+                } catch {
+                    this.logDebug(`Previous version does not contain path: ${p}`);
+                }
+            }
+
+            if (previousPaths.length === 0) {
+                this.logInfo("Previous version contains none of the cached paths — unmounting");
+                await this.unmountPreviousVersion();
+                return null;
+            }
+
+            // Return the mount point — consumer accesses paths relative to it
+            return mountPoint;
+        } catch (error) {
+            core.warning(
+                `${this.getLogPrefix()} Failed to mount previous version: ${
+                    error instanceof Error ? error.message : error
+                }`
+            );
+            await this.unmountPreviousVersion();
+            return null;
+        }
+    }
+
+    /**
+     * Unmount and clean up the previous-version read-only mount.
+     */
+    async unmountPreviousVersion(): Promise<void> {
+        if (!this.previousVersionMountPoint) return;
+
+        try {
+            const mountCheck = await exec.exec(
+                "mountpoint",
+                [this.previousVersionMountPoint],
+                { ignoreReturnCode: true, silent: true }
+            );
+            if (mountCheck === 0) {
+                this.logDebug(`Unmounting previous version: ${this.previousVersionMountPoint}`);
+                await this.umountWithErrorHandling(this.previousVersionMountPoint);
+            }
+        } catch {
+            // Non-fatal
+        }
+
+        // Clean up loop devices
+        if (this.previousVersionImageFile) {
+            await this.cleanupLoopDevices(this.previousVersionImageFile);
+        }
+
+        // Clean up mount point directory
+        try {
+            await fs.rm(this.previousVersionMountPoint, { recursive: true, force: true });
+        } catch {
+            // Non-fatal
+        }
+
+        this.previousVersionMountPoint = undefined;
+        this.previousVersionImageFile = undefined;
     }
 
     // ── Private helpers ──────────────────────────────────────────────
