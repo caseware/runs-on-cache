@@ -97281,8 +97281,7 @@ class BtrfsContainer extends Container_1.Container {
                     });
                 }
                 catch (error) {
-                    core.warning(`${this.getLogPrefix()} Failed to load ${mod} kernel module. ` +
-                        `Mount may fail. Error: ${error instanceof Error ? error.message : error}`);
+                    core.debug(`${this.getLogPrefix()} modprobe ${mod} failed (module likely built-in): ${error instanceof Error ? error.message : error}`);
                 }
             }
         });

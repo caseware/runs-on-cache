@@ -909,9 +909,8 @@ export class BtrfsContainer extends Container {
                     silent: !core.isDebug()
                 });
             } catch (error) {
-                core.warning(
-                    `${this.getLogPrefix()} Failed to load ${mod} kernel module. ` +
-                        `Mount may fail. Error: ${
+                core.debug(
+                    `${this.getLogPrefix()} modprobe ${mod} failed (module likely built-in): ${
                             error instanceof Error ? error.message : error
                         }`
                 );
