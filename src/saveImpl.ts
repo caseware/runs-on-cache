@@ -69,10 +69,8 @@ export async function saveImpl(
 
         const sync = utils.getInputAsBool(Inputs.Sync);
 
-        const customCompression = core.getInput(Inputs.CustomCompression);
-        const customCompressionLevel = core.getInput(
-            Inputs.CustomCompressionLevel
-        );
+        const customCompression = core.getState("CUSTOM_COMPRESSION") || core.getInput(Inputs.CustomCompression) || undefined;
+        const customCompressionLevel = core.getState("CUSTOM_COMPRESSION_LEVEL") || core.getInput(Inputs.CustomCompressionLevel) || undefined;
 
         if (canSaveToS3) {
             core.info(

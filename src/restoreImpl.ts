@@ -54,6 +54,11 @@ export async function restoreImpl(
             Inputs.CustomCompressionLevel
         );
 
+        // Persist compression settings to state so the post step can read them
+        // (INPUT_* env vars may not be reliably set in post steps)
+        core.saveState("CUSTOM_COMPRESSION", customCompression);
+        core.saveState("CUSTOM_COMPRESSION_LEVEL", customCompressionLevel);
+
         let cacheKey: string | undefined;
 
         if (canSaveToS3) {

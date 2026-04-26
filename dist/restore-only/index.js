@@ -95110,7 +95110,8 @@ var Inputs;
     Inputs["FsBufferMB"] = "fs-buffer-mb";
     Inputs["SaveCompressionLevel"] = "save-compression-level";
     Inputs["NodeLocalCacheDir"] = "node-local-cache-dir";
-    Inputs["MountMode"] = "mount-mode"; // Input for mount mode: "ro" (read-only, default for node_modules) or "rw" (read-write, for mutable caches)
+    Inputs["MountMode"] = "mount-mode";
+    Inputs["FailOnSaveError"] = "fail-on-save-error"; // Input for failing the action on save errors (useful for cache validation tests)
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {
@@ -95761,7 +95762,17 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
                 core.info(`Failed to save: ${typedError.message}`);
             }
             else {
-                core.warning(`Failed to save: ${typedError.message}`);
+                let failOnError = false;
+                try {
+                    failOnError = core.getBooleanInput(constants_1.Inputs.FailOnSaveError, { required: false });
+                }
+                catch ( /* input not set */_a) { /* input not set */ }
+                if (failOnError) {
+                    core.setFailed(`Cache save failed: ${typedError.message}`);
+                }
+                else {
+                    core.warning(`Failed to save: ${typedError.message}`);
+                }
             }
         }
         finally {
@@ -95810,7 +95821,17 @@ function saveCacheSync(paths, key) {
                 core.info(`Failed to save: ${typedError.message}`);
             }
             else {
-                core.warning(`Failed to save: ${typedError.message}`);
+                let failOnError = false;
+                try {
+                    failOnError = core.getBooleanInput(constants_1.Inputs.FailOnSaveError, { required: false });
+                }
+                catch ( /* input not set */_a) { /* input not set */ }
+                if (failOnError) {
+                    core.setFailed(`Cache save failed: ${typedError.message}`);
+                }
+                else {
+                    core.warning(`Failed to save: ${typedError.message}`);
+                }
             }
         }
         return cacheId;
@@ -96170,6 +96191,10 @@ function restoreImpl(stateProvider, earlyExit) {
             const isSync = utils.getInputAsBool(constants_1.Inputs.Sync);
             const customCompression = core.getInput(constants_1.Inputs.CustomCompression);
             const customCompressionLevel = core.getInput(constants_1.Inputs.CustomCompressionLevel);
+            // Persist compression settings to state so the post step can read them
+            // (INPUT_* env vars may not be reliably set in post steps)
+            core.saveState("CUSTOM_COMPRESSION", customCompression);
+            core.saveState("CUSTOM_COMPRESSION_LEVEL", customCompressionLevel);
             let cacheKey;
             if (canSaveToS3) {
                 core.info("The cache action detected a local S3 bucket cache. Using it.");
@@ -96439,7 +96464,7 @@ function getCacheFileName(compressionMethod) {
     if (Object.values(constants_2.CompressionMethod).includes(compressionMethod)) {
         return utils.getCacheFileName(compressionMethod);
     }
-    if (compressionMethod === "none")
+    if (!compressionMethod || compressionMethod === "none")
         return "cache";
     return `cache.${compressionMethod}`;
 }

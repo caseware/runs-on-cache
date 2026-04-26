@@ -413,7 +413,13 @@ export async function saveCache(
         } else if (typedError.name === ReserveCacheError.name) {
             core.info(`Failed to save: ${typedError.message}`);
         } else {
-            core.warning(`Failed to save: ${typedError.message}`);
+            let failOnError = false;
+            try { failOnError = core.getBooleanInput(Inputs.FailOnSaveError, { required: false }); } catch { /* input not set */ }
+            if (failOnError) {
+                core.setFailed(`Cache save failed: ${typedError.message}`);
+            } else {
+                core.warning(`Failed to save: ${typedError.message}`);
+            }
         }
     } finally {
         // Try to delete the archive to save space
@@ -465,7 +471,13 @@ export async function saveCacheSync(
         } else if (typedError.name === ReserveCacheError.name) {
             core.info(`Failed to save: ${typedError.message}`);
         } else {
-            core.warning(`Failed to save: ${typedError.message}`);
+            let failOnError = false;
+            try { failOnError = core.getBooleanInput(Inputs.FailOnSaveError, { required: false }); } catch { /* input not set */ }
+            if (failOnError) {
+                core.setFailed(`Cache save failed: ${typedError.message}`);
+            } else {
+                core.warning(`Failed to save: ${typedError.message}`);
+            }
         }
     }
     return cacheId;

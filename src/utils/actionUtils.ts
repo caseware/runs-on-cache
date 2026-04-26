@@ -97,7 +97,7 @@ export function getCacheFileName(compressionMethod: CompressionMethod | string) 
     if ((Object.values(CompressionMethod) as string[]).includes(compressionMethod)) {
         return utils.getCacheFileName(compressionMethod as CompressionMethod);
     }
-    if (compressionMethod === "none")
+    if (!compressionMethod || compressionMethod === "none")
         return "cache"
     return `cache.${compressionMethod}`;
 }

@@ -95110,7 +95110,8 @@ var Inputs;
     Inputs["FsBufferMB"] = "fs-buffer-mb";
     Inputs["SaveCompressionLevel"] = "save-compression-level";
     Inputs["NodeLocalCacheDir"] = "node-local-cache-dir";
-    Inputs["MountMode"] = "mount-mode"; // Input for mount mode: "ro" (read-only, default for node_modules) or "rw" (read-write, for mutable caches)
+    Inputs["MountMode"] = "mount-mode";
+    Inputs["FailOnSaveError"] = "fail-on-save-error"; // Input for failing the action on save errors (useful for cache validation tests)
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {
@@ -95761,7 +95762,17 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
                 core.info(`Failed to save: ${typedError.message}`);
             }
             else {
-                core.warning(`Failed to save: ${typedError.message}`);
+                let failOnError = false;
+                try {
+                    failOnError = core.getBooleanInput(constants_1.Inputs.FailOnSaveError, { required: false });
+                }
+                catch ( /* input not set */_a) { /* input not set */ }
+                if (failOnError) {
+                    core.setFailed(`Cache save failed: ${typedError.message}`);
+                }
+                else {
+                    core.warning(`Failed to save: ${typedError.message}`);
+                }
             }
         }
         finally {
@@ -95810,7 +95821,17 @@ function saveCacheSync(paths, key) {
                 core.info(`Failed to save: ${typedError.message}`);
             }
             else {
-                core.warning(`Failed to save: ${typedError.message}`);
+                let failOnError = false;
+                try {
+                    failOnError = core.getBooleanInput(constants_1.Inputs.FailOnSaveError, { required: false });
+                }
+                catch ( /* input not set */_a) { /* input not set */ }
+                if (failOnError) {
+                    core.setFailed(`Cache save failed: ${typedError.message}`);
+                }
+                else {
+                    core.warning(`Failed to save: ${typedError.message}`);
+                }
             }
         }
         return cacheId;
@@ -96482,7 +96503,7 @@ function getCacheFileName(compressionMethod) {
     if (Object.values(constants_2.CompressionMethod).includes(compressionMethod)) {
         return utils.getCacheFileName(compressionMethod);
     }
-    if (compressionMethod === "none")
+    if (!compressionMethod || compressionMethod === "none")
         return "cache";
     return `cache.${compressionMethod}`;
 }

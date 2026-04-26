@@ -60,6 +60,10 @@ inputs:
     description: 'Path to node-local persistent cache directory (HostPath mount on EKS). When set, BTRFS/VHDX images are cached on the node for instant restore. Falls back to S3 on miss. Default: empty (disabled). Recommended: /opt/local-volumes/btrfs-cache/'
     default: ''
     required: false
+  fail-on-save-error:
+    description: 'Fail the action if cache save encounters an error (useful for cache validation tests)'
+    default: 'false'
+    required: false
   mount-mode:
     description: |
       Mount mode for restored cache:
