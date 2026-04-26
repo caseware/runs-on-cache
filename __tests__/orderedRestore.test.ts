@@ -22,7 +22,7 @@ describe("orderedRestore", () => {
         delete process.env["RUNS_ON_S3_BUCKET_CACHE"];
     });
 
-    describe("cache key parsing", () => {
+    describe("Mode 1: explicit key list parsing", () => {
         test("parses multiline cache-keys input correctly", () => {
             const input = "exact-key-abc123\nweek-17-prefix\nany-prefix";
             const keys = input
@@ -58,6 +58,118 @@ describe("orderedRestore", () => {
         });
     });
 
+    describe("Mode 2: hash-walk key generation", () => {
+        test("deduplicates consecutive identical hashes", () => {
+            // Simulates file unchanged across commits
+            const hashes = [
+                "abc123", // HEAD
+                "abc123", // HEAD~1 (same)
+                "def456", // HEAD~2 (different)
+                "def456", // HEAD~3 (same)
+                "ghi789" // HEAD~4 (different)
+            ];
+            const prefix = "nodemodules-Linux";
+            const seen = new Set<string>();
+            const keys: string[] = [];
+
+            for (const hash of hashes) {
+                if (!seen.has(hash)) {
+                    seen.add(hash);
+                    keys.push(`${prefix}-${hash}`);
+                }
+            }
+
+            expect(keys).toEqual([
+                "nodemodules-Linux-abc123",
+                "nodemodules-Linux-def456",
+                "nodemodules-Linux-ghi789"
+            ]);
+        });
+
+        test("stops walk when file not found in history", () => {
+            const hashes: (string | null)[] = [
+                "abc123",
+                "def456",
+                null // file doesn't exist at this depth
+            ];
+            const prefix = "cache";
+            const keys: string[] = [];
+
+            for (const hash of hashes) {
+                if (!hash) break;
+                keys.push(`${prefix}-${hash}`);
+            }
+
+            expect(keys).toEqual(["cache-abc123", "cache-def456"]);
+        });
+
+        test("key-prefix + hash format is correct", () => {
+            const prefix = "nodemodules-s3-btrfs-Linux-aarch64";
+            const hash =
+                "bf1451d66ad80488ae3f0859fffa7721b227a4bcce790a3ba2a9d50b25b5d005";
+            const key = `${prefix}-${hash}`;
+
+            expect(key).toBe(
+                "nodemodules-s3-btrfs-Linux-aarch64-bf1451d66ad80488ae3f0859fffa7721b227a4bcce790a3ba2a9d50b25b5d005"
+            );
+        });
+    });
+
+    describe("mode selection", () => {
+        test("selects explicit mode when cache-keys is provided", () => {
+            const cacheKeysInput = "key-1\nkey-2";
+            const hashFile = "";
+            const keyPrefix = "";
+
+            const mode = cacheKeysInput
+                ? "explicit"
+                : hashFile && keyPrefix
+                  ? "hash-walk"
+                  : "error";
+            expect(mode).toBe("explicit");
+        });
+
+        test("selects hash-walk mode when hash-file and key-prefix provided", () => {
+            const cacheKeysInput = "";
+            const hashFile = "yarn.lock";
+            const keyPrefix = "nodemodules-Linux";
+
+            const mode = cacheKeysInput
+                ? "explicit"
+                : hashFile && keyPrefix
+                  ? "hash-walk"
+                  : "error";
+            expect(mode).toBe("hash-walk");
+        });
+
+        test("returns error when neither mode configured", () => {
+            const cacheKeysInput = "";
+            const hashFile = "";
+            const keyPrefix = "";
+
+            const mode = cacheKeysInput
+                ? "explicit"
+                : hashFile && keyPrefix
+                  ? "hash-walk"
+                  : "error";
+            expect(mode).toBe("error");
+        });
+
+        test("prefers explicit mode when both are provided", () => {
+            // cache-keys takes precedence
+            const cacheKeysInput = "explicit-key";
+            const hashFile = "yarn.lock";
+            const keyPrefix = "prefix";
+
+            const mode = cacheKeysInput
+                ? "explicit"
+                : hashFile && keyPrefix
+                  ? "hash-walk"
+                  : "error";
+            expect(mode).toBe("explicit");
+        });
+    });
+
     describe("cache-hit-type determination", () => {
         test("returns 'exact' when matched key equals primary key", () => {
             const primaryKey: string = "nodemodules-Linux-abc123";
@@ -88,7 +200,6 @@ describe("orderedRestore", () => {
         test("outputs matched-key, cache-hit-type, cache-hit on exact match", () => {
             const outputs: Record<string, string> = {};
 
-            // Simulate exact match
             const cacheKey = "exact-key";
             const primaryKey = "exact-key";
             const isExact = cacheKey === primaryKey;
@@ -132,7 +243,7 @@ describe("orderedRestore", () => {
     });
 
     describe("use cases", () => {
-        test("NX workspace-data key ordering", () => {
+        test("explicit mode: NX workspace-data key ordering", () => {
             const keys = [
                 "nx-ws-data-2026-W17-abc123",
                 "nx-ws-data-2026-W17-",
@@ -144,7 +255,7 @@ describe("orderedRestore", () => {
             expect(keys.length).toBe(4);
         });
 
-        test("LFS key ordering", () => {
+        test("explicit mode: LFS key ordering", () => {
             const keys = [
                 "lfs-abc123-my-project",
                 "lfs-abc123-",
@@ -155,7 +266,7 @@ describe("orderedRestore", () => {
             expect(keys.length).toBe(3);
         });
 
-        test("git objects key ordering", () => {
+        test("explicit mode: git objects key ordering", () => {
             const keys = [
                 "git-objects-2026-W17",
                 "git-objects-2026-W16",
@@ -164,6 +275,24 @@ describe("orderedRestore", () => {
 
             expect(keys[0]).toContain("W17");
             expect(keys.length).toBe(3);
+        });
+
+        test("hash-walk mode: yarn.lock cache key generation", () => {
+            // Simulates what hash-walk produces for yarn.lock
+            const prefix = "nodemodules-s3-btrfs-Linux-aarch64";
+            const hashAtHead =
+                "bf1451d66ad80488ae3f0859fffa7721b227a4bcce790a3ba2a9d50b25b5d005";
+            const hashAtHead1 =
+                "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+            const keys = [
+                `${prefix}-${hashAtHead}`,
+                `${prefix}-${hashAtHead1}`
+            ];
+
+            expect(keys[0]).toContain(hashAtHead);
+            expect(keys[1]).toContain(hashAtHead1);
+            expect(keys.length).toBe(2);
         });
 
         test("callers can use cache-hit-type to decide force-save", () => {

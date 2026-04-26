@@ -1,13 +1,43 @@
 name: 'Ordered Cache Restore'
-description: 'Restores cache by trying an ordered list of cache keys. Returns which key matched and whether it was an exact or partial hit.'
+description: |
+  Restores cache by trying an ordered list of cache keys. Supports two modes:
+  1. Explicit key list (cache-keys): Pass a newline-separated list of keys to try in order.
+     Useful for time-based keys, manual ordering, or any non-hash-based pattern.
+  2. Hash-walk (hash-file + key-prefix): Walks git history commit-by-commit, hashing the
+     specified file at each depth level, and tries "{key-prefix}-{hash}" as the cache key.
+     Stops at the first hit. Useful for lockfile-based caching (yarn.lock, package-lock.json).
+  Returns which key matched and whether it was an exact or partial hit.
 inputs:
+  # --- Mode 1: Explicit key list ---
   cache-keys:
     description: |
       Ordered list of cache keys to try, one per line.
       The first key is the "exact" key. If it matches, cache-hit-type is "exact".
       Subsequent keys are fallbacks. If one matches, cache-hit-type is "partial".
       If none match, cache-hit-type is "miss".
-    required: true
+      Mutually exclusive with hash-file/key-prefix.
+    required: false
+  # --- Mode 2: Git history hash walk ---
+  hash-file:
+    description: |
+      Path to a file to hash at each git commit (e.g., yarn.lock).
+      Used with key-prefix to generate cache keys: "{key-prefix}-{sha256(file@HEAD~N)}".
+      Walks one depth level at a time to minimize hashing cost.
+    required: false
+  key-prefix:
+    description: |
+      Prefix for hash-walk generated keys. Combined with the file hash:
+      "{key-prefix}-{sha256(file@HEAD~N)}". Required when hash-file is set.
+    required: false
+  hash-ref:
+    description: 'Git ref to start walking from (default: HEAD)'
+    required: false
+    default: 'HEAD'
+  hash-depth:
+    description: 'Maximum number of commits to walk back (default: 20)'
+    required: false
+    default: '20'
+  # --- Common inputs ---
   path:
     description: 'A list of files, directories, and wildcard patterns to cache and restore'
     required: true

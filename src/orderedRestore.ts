@@ -6,23 +6,90 @@ import { StateProvider } from "./stateProvider";
 
 const canSaveToS3 = process.env["RUNS_ON_S3_BUCKET_CACHE"] !== undefined;
 
+/**
+ * Hash a file at a specific git ref using git show + sha256.
+ * Returns the hex digest, or null if the file doesn't exist at that ref.
+ */
+async function hashFileAtRef(
+    file: string,
+    ref: string
+): Promise<string | null> {
+    try {
+        const { exec: execCmd } = await import("@actions/exec");
+        let stdout = "";
+        const exitCode = await execCmd(
+            "bash",
+            [
+                "-c",
+                `git show ${ref}:${file} 2>/dev/null | sha256sum | cut -d' ' -f1`
+            ],
+            {
+                silent: true,
+                listeners: {
+                    stdout: (data: Buffer) => {
+                        stdout += data.toString();
+                    }
+                },
+                ignoreReturnCode: true
+            }
+        );
+        const hash = stdout.trim();
+        if (exitCode !== 0 || !hash || hash.length !== 64) {
+            return null;
+        }
+        return hash;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Generate cache keys by walking git history.
+ * For each depth level, hashes the file and yields `{prefix}-{hash}`.
+ * Stops early if the file doesn't exist at a given ref.
+ */
+async function generateHashKeys(
+    keyPrefix: string,
+    hashFile: string,
+    hashRef: string,
+    hashDepth: number
+): Promise<string[]> {
+    const keys: string[] = [];
+    const seenHashes = new Set<string>();
+
+    for (let depth = 0; depth <= hashDepth; depth++) {
+        const ref = depth === 0 ? hashRef : `${hashRef}~${depth}`;
+        const hash = await hashFileAtRef(hashFile, ref);
+        if (!hash) {
+            core.debug(
+                `[OrderedRestore] No file at ${ref}:${hashFile}, stopping walk at depth ${depth}`
+            );
+            break;
+        }
+
+        // Skip duplicate hashes (file unchanged across commits)
+        if (seenHashes.has(hash)) {
+            core.debug(
+                `[OrderedRestore] Skipping depth ${depth} — same hash as previous`
+            );
+            continue;
+        }
+        seenHashes.add(hash);
+
+        const key = `${keyPrefix}-${hash}`;
+        keys.push(key);
+        core.debug(`[OrderedRestore] depth=${depth} ref=${ref} → ${key}`);
+    }
+
+    return keys;
+}
+
 async function run(): Promise<void> {
     try {
         if (!canSaveToS3) {
             core.setFailed(
                 "Ordered cache restore requires S3 bucket configuration (RUNS_ON_S3_BUCKET_CACHE)"
             );
-            return;
-        }
-
-        const cacheKeysInput = core.getInput("cache-keys", { required: true });
-        const cacheKeys = cacheKeysInput
-            .split("\n")
-            .map(k => k.trim())
-            .filter(k => k.length > 0);
-
-        if (cacheKeys.length === 0) {
-            core.setFailed("No cache keys provided");
             return;
         }
 
@@ -34,9 +101,62 @@ async function run(): Promise<void> {
             Inputs.CustomCompressionLevel
         );
 
-        core.info(
-            `Trying ${cacheKeys.length} cache keys in order:`
-        );
+        // Determine mode: explicit key list or hash-walk
+        const cacheKeysInput = core.getInput("cache-keys");
+        const hashFile = core.getInput("hash-file");
+        const keyPrefix = core.getInput("key-prefix");
+
+        let cacheKeys: string[];
+
+        if (cacheKeysInput) {
+            // Mode 1: Explicit key list (time-based, manual ordering, etc.)
+            cacheKeys = cacheKeysInput
+                .split("\n")
+                .map(k => k.trim())
+                .filter(k => k.length > 0);
+
+            if (cacheKeys.length === 0) {
+                core.setFailed("cache-keys provided but empty after parsing");
+                return;
+            }
+
+            core.info(`Mode: explicit key list (${cacheKeys.length} keys)`);
+        } else if (hashFile && keyPrefix) {
+            // Mode 2: Git history hash walk
+            const hashRef = core.getInput("hash-ref") || "HEAD";
+            const hashDepth = parseInt(
+                core.getInput("hash-depth") || "20",
+                10
+            );
+
+            core.info(
+                `Mode: hash-walk — file=${hashFile} ref=${hashRef} depth=${hashDepth}`
+            );
+
+            cacheKeys = await generateHashKeys(
+                keyPrefix,
+                hashFile,
+                hashRef,
+                hashDepth
+            );
+
+            if (cacheKeys.length === 0) {
+                core.warning(
+                    `Hash walk produced no keys (file ${hashFile} not found in git history)`
+                );
+                core.setOutput("matched-key", "");
+                core.setOutput("cache-hit-type", "miss");
+                core.setOutput("cache-hit", "false");
+                return;
+            }
+        } else {
+            core.setFailed(
+                "Either 'cache-keys' (explicit list) or 'hash-file' + 'key-prefix' (hash-walk) must be provided"
+            );
+            return;
+        }
+
+        core.info(`Trying ${cacheKeys.length} cache keys in order:`);
         cacheKeys.forEach((key, i) => {
             core.info(`  ${i + 1}. ${key}`);
         });
