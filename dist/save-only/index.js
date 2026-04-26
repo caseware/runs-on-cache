@@ -96143,6 +96143,7 @@ const constants_1 = __nccwpck_require__(9042);
 const stateProvider_1 = __nccwpck_require__(1527);
 const utils = __importStar(__nccwpck_require__(6850));
 const custom = __importStar(__nccwpck_require__(1082));
+const child_process_1 = __nccwpck_require__(2081);
 const canSaveToS3 = process.env["RUNS_ON_S3_BUCKET_CACHE"] !== undefined;
 // Catch and log any unhandled exceptions.  These exceptions can leak out of the uploadChunk method in
 // @actions/toolkit when a failed upload closes the file descriptor causing any in-process reads to
@@ -96237,13 +96238,25 @@ exports.saveOnlyRun = saveOnlyRun;
 function saveRun(earlyExit) {
     return __awaiter(this, void 0, void 0, function* () {
         try {
-            yield saveImpl(new stateProvider_1.StateProvider());
+            // Only attempt save if the restore step completed successfully.
+            // The main step sets CACHE_SAVE_ENABLED on successful restore.
+            // With post-if: "!cancelled()", the post step runs even on job failure,
+            // but we skip the S3 upload when restore didn't complete.
+            const saveEnabled = core.getState("CACHE_SAVE_ENABLED") === "true";
+            if (saveEnabled) {
+                yield saveImpl(new stateProvider_1.StateProvider());
+            }
+            else {
+                core.info("Skipping cache save — restore step did not complete successfully");
+            }
         }
         catch (err) {
             console.error(err);
-            if (earlyExit) {
-                process.exit(1);
-            }
+        }
+        finally {
+            // Always clean up BTRFS mounts, even if save was skipped or failed.
+            // Prevents stale mounts from causing EBUSY in downstream cleanup.
+            yield btrfsCleanup();
         }
         // node will stay alive if any promises are not resolved,
         // which is a possibility if HTTP requests are dangling
@@ -96256,6 +96269,83 @@ function saveRun(earlyExit) {
     });
 }
 exports.saveRun = saveRun;
+/**
+ * Clean up any active BTRFS mounts and loop devices.
+ * Idempotent — safe to call even if no BTRFS mounts exist.
+ */
+function btrfsCleanup() {
+    return __awaiter(this, void 0, void 0, function* () {
+        if (process.platform !== "linux")
+            return;
+        try {
+            // Find all BTRFS mounts
+            const output = (0, child_process_1.execSync)("findmnt -t btrfs -n -o TARGET", {
+                encoding: "utf8",
+                timeout: 10000
+            }).trim();
+            if (!output)
+                return;
+            // Unmount in reverse order (bind mounts before main mounts)
+            const mounts = output
+                .split("\n")
+                .map(m => m.trim())
+                .filter(m => m.length > 0)
+                .reverse();
+            for (const mount of mounts) {
+                try {
+                    core.info(`[BTRFS cleanup] Unmounting: ${mount}`);
+                    (0, child_process_1.execSync)(`sudo umount "${mount}"`, {
+                        encoding: "utf8",
+                        timeout: 30000
+                    });
+                }
+                catch (_a) {
+                    // Fallback to lazy unmount
+                    try {
+                        (0, child_process_1.execSync)(`sudo umount -l "${mount}"`, {
+                            encoding: "utf8",
+                            timeout: 30000
+                        });
+                    }
+                    catch (_b) {
+                        /* already unmounted */
+                    }
+                }
+            }
+            // Detach orphaned loop devices backing .btrfs files
+            try {
+                const losetupOutput = (0, child_process_1.execSync)("losetup -a", {
+                    encoding: "utf8",
+                    timeout: 10000
+                }).trim();
+                const loopLines = losetupOutput
+                    .split("\n")
+                    .filter(l => l.includes(".btrfs"));
+                for (const line of loopLines) {
+                    const device = line.split(":")[0];
+                    if (device) {
+                        core.info(`[BTRFS cleanup] Detaching loop device: ${device}`);
+                        try {
+                            (0, child_process_1.execSync)(`sudo losetup -d "${device}"`, {
+                                encoding: "utf8",
+                                timeout: 10000
+                            });
+                        }
+                        catch (_c) {
+                            /* already detached */
+                        }
+                    }
+                }
+            }
+            catch (_d) {
+                /* no loop devices or command failed */
+            }
+        }
+        catch (_e) {
+            // findmnt not available or no BTRFS mounts — nothing to clean
+        }
+    });
+}
 
 
 /***/ }),

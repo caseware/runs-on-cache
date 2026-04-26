@@ -101,6 +101,8 @@ export async function restoreImpl(
                 ].join(", ")}`
             );
 
+            // Signal to the post step that restore completed (save + cleanup should run)
+            core.saveState("CACHE_SAVE_ENABLED", "true");
             return;
         }
 
@@ -119,6 +121,8 @@ export async function restoreImpl(
             core.info(`Cache restored from key: ${cacheKey}`);
         }
 
+        // Signal to the post step that restore completed (save + cleanup should run)
+        core.saveState("CACHE_SAVE_ENABLED", "true");
         return cacheKey;
     } catch (error: unknown) {
         core.setFailed((error as Error).message);

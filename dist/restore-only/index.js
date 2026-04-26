@@ -96191,6 +96191,8 @@ function restoreImpl(stateProvider, earlyExit) {
                     primaryKey,
                     ...restoreKeys
                 ].join(", ")}`);
+                // Signal to the post step that restore completed (save + cleanup should run)
+                core.saveState("CACHE_SAVE_ENABLED", "true");
                 return;
             }
             // Store the matched cache key in states
@@ -96203,6 +96205,8 @@ function restoreImpl(stateProvider, earlyExit) {
             else {
                 core.info(`Cache restored from key: ${cacheKey}`);
             }
+            // Signal to the post step that restore completed (save + cleanup should run)
+            core.saveState("CACHE_SAVE_ENABLED", "true");
             return cacheKey;
         }
         catch (error) {
