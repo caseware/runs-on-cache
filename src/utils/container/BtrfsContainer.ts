@@ -37,6 +37,12 @@ export class BtrfsContainer extends Container {
      */
     private mountIsReadOnly = false;
 
+    /**
+     * Loop device allocated by explicit losetup for the current mount.
+     * Tracked so we can detach it on cleanup/save.
+     */
+    private activeLoopDevice: string | undefined;
+
     constructor(
         containerFile: string,
         compressionMethod: string,
@@ -445,26 +451,48 @@ export class BtrfsContainer extends Container {
         return output.trim();
     }
 
+    /**
+     * Mount a device/image at mountPath.
+     * When options include "loop", uses explicit losetup instead of mount -o loop
+     * for reliability on K8s nodes where auto-loop allocation may fail.
+     */
     private async mountWithErrorHandling(
         device: string,
         mountPath: string,
         options?: string[],
         useSudo = true
     ): Promise<void> {
-        const mountArgs = [device, mountPath];
-        if (options && options.length > 0) {
-            mountArgs.unshift("-o", options.join(","));
-        }
-
-        const command = useSudo ? "sudo" : "mount";
-        const args = useSudo ? ["mount", ...mountArgs] : mountArgs;
+        const isLoopMount = options?.includes("loop");
+        const filteredOptions = options?.filter(o => o !== "loop") || [];
+        let actualDevice = device;
 
         try {
+            if (isLoopMount) {
+                // Explicit losetup: allocate a loop device and attach the image file.
+                // This is more reliable than mount -o loop on K8s nodes where
+                // auto-loop allocation can fail with exit code 32.
+                const loopDev = await this.setupLoopDevice(device);
+                actualDevice = loopDev;
+                this.activeLoopDevice = loopDev;
+            }
+
+            const mountArgs = [actualDevice, mountPath];
+            if (filteredOptions.length > 0) {
+                mountArgs.unshift("-o", filteredOptions.join(","));
+            }
+            if (isLoopMount) {
+                // Specify filesystem type explicitly since we're mounting a loop device
+                mountArgs.unshift("-t", "btrfs");
+            }
+
+            const command = useSudo ? "sudo" : "mount";
+            const args = useSudo ? ["mount", ...mountArgs] : mountArgs;
+
             await this.execWithTimeout(
                 () =>
                     exec.exec(command, args, { silent: !core.isDebug() }),
                 MOUNT_TIMEOUT_MS,
-                `mount ${device} at ${mountPath}`
+                `mount ${actualDevice} at ${mountPath}`
             );
         } catch (error) {
             // Collect diagnostic info to help debug mount failures
@@ -482,15 +510,47 @@ export class BtrfsContainer extends Container {
                 };
                 await collect("file type", "file", [device]);
                 await collect("file size", "stat", ["--format=%s", device]);
-                await collect("btrfs module", "lsmod", []);
-                await collect("loop devices", "ls", ["-la", "/dev/loop*"]);
+                await collect("loaded modules", "sudo", ["lsmod"]);
+                await collect("loop devices", "sudo", ["losetup", "-a"]);
+                await collect("/dev/loop-control", "ls", ["-la", "/dev/loop-control"]);
                 core.warning(`[BTRFS] Mount diagnostic for ${device}:\n${diag.join("\n")}`);
             } catch { /* diagnostic collection is best-effort */ }
 
             // On mount failure, clean up any loop device that may have been allocated
             await this.cleanupLoopDevices(device);
-            throw this.wrapError(`mount ${device} at ${mountPath}`, error);
+            this.activeLoopDevice = undefined;
+            throw this.wrapError(`mount ${actualDevice} at ${mountPath}`, error);
         }
+    }
+
+    /**
+     * Attach a file to a loop device using explicit losetup.
+     * Returns the allocated loop device path (e.g., /dev/loop0).
+     */
+    private async setupLoopDevice(imageFile: string): Promise<string> {
+        let loopDev = "";
+        try {
+            await exec.exec("sudo", ["losetup", "--find", "--show", imageFile], {
+                listeners: {
+                    stdout: (data: Buffer) => { loopDev += data.toString(); }
+                },
+                silent: !core.isDebug()
+            });
+        } catch (error) {
+            throw new Error(
+                `Failed to attach ${imageFile} to a loop device. ` +
+                    `Ensure the 'loop' kernel module is loaded and /dev/loop-control exists. ` +
+                    `Error: ${error instanceof Error ? error.message : error}`
+            );
+        }
+        loopDev = loopDev.trim();
+        if (!loopDev.startsWith("/dev/loop")) {
+            throw new Error(
+                `losetup returned unexpected output: "${loopDev}". Expected /dev/loopN.`
+            );
+        }
+        this.logInfo(`Attached ${imageFile} → ${loopDev}`);
+        return loopDev;
     }
 
     private async execSudo(
@@ -739,6 +799,10 @@ export class BtrfsContainer extends Container {
                 description: "BTRFS filesystem operations (install btrfs-progs)"
             },
             {
+                command: "losetup",
+                description: "loop device management (install util-linux)"
+            },
+            {
                 command: "findmnt",
                 description: "finding mounted filesystems (install util-linux)"
             },
@@ -782,20 +846,23 @@ export class BtrfsContainer extends Container {
             );
         }
 
-        // Ensure btrfs kernel module is loaded — required for mount -t btrfs.
-        // On fresh K8s nodes the module may not be auto-loaded until something triggers it,
-        // causing mount to fail with exit code 32.
-        try {
-            await exec.exec("sudo", ["modprobe", "btrfs"], {
-                silent: !core.isDebug()
-            });
-        } catch (error) {
-            core.warning(
-                `${this.getLogPrefix()} Failed to load btrfs kernel module (modprobe btrfs). ` +
-                    `Mount may fail if the module is not already loaded. Error: ${
-                        error instanceof Error ? error.message : error
-                    }`
-            );
+        // Ensure kernel modules are loaded:
+        // - loop: required for losetup to attach .btrfs image files as block devices
+        // - btrfs: required for mount -t btrfs
+        // On fresh K8s nodes these may not be auto-loaded, causing mount exit code 32.
+        for (const mod of ["loop", "btrfs"]) {
+            try {
+                await exec.exec("sudo", ["modprobe", mod], {
+                    silent: !core.isDebug()
+                });
+            } catch (error) {
+                core.warning(
+                    `${this.getLogPrefix()} Failed to load ${mod} kernel module. ` +
+                        `Mount may fail. Error: ${
+                            error instanceof Error ? error.message : error
+                        }`
+                );
+            }
         }
     }
 
@@ -1036,6 +1103,17 @@ export class BtrfsContainer extends Container {
                     `[BTRFS] Unmounting main filesystem: ${this.mountPoint}`
                 );
                 await this.umountWithErrorHandling(this.mountPoint);
+            }
+
+            // Detach loop device after unmounting the filesystem
+            if (this.activeLoopDevice) {
+                core.debug(`[BTRFS] Detaching loop device: ${this.activeLoopDevice}`);
+                try {
+                    await this.execSudo("losetup", ["-d", this.activeLoopDevice]);
+                } catch (error) {
+                    core.debug(`Failed to detach loop device ${this.activeLoopDevice}: ${error}`);
+                }
+                this.activeLoopDevice = undefined;
             }
         } catch (error) {
             core.debug(`Cleanup mount failed (non-critical): ${error}`);

@@ -96832,16 +96832,36 @@ class BtrfsContainer extends Container_1.Container {
             return output.trim();
         });
     }
+    /**
+     * Mount a device/image at mountPath.
+     * When options include "loop", uses explicit losetup instead of mount -o loop
+     * for reliability on K8s nodes where auto-loop allocation may fail.
+     */
     mountWithErrorHandling(device, mountPath, options, useSudo = true) {
         return __awaiter(this, void 0, void 0, function* () {
-            const mountArgs = [device, mountPath];
-            if (options && options.length > 0) {
-                mountArgs.unshift("-o", options.join(","));
-            }
-            const command = useSudo ? "sudo" : "mount";
-            const args = useSudo ? ["mount", ...mountArgs] : mountArgs;
+            const isLoopMount = options === null || options === void 0 ? void 0 : options.includes("loop");
+            const filteredOptions = (options === null || options === void 0 ? void 0 : options.filter(o => o !== "loop")) || [];
+            let actualDevice = device;
             try {
-                yield this.execWithTimeout(() => exec.exec(command, args, { silent: !core.isDebug() }), MOUNT_TIMEOUT_MS, `mount ${device} at ${mountPath}`);
+                if (isLoopMount) {
+                    // Explicit losetup: allocate a loop device and attach the image file.
+                    // This is more reliable than mount -o loop on K8s nodes where
+                    // auto-loop allocation can fail with exit code 32.
+                    const loopDev = yield this.setupLoopDevice(device);
+                    actualDevice = loopDev;
+                    this.activeLoopDevice = loopDev;
+                }
+                const mountArgs = [actualDevice, mountPath];
+                if (filteredOptions.length > 0) {
+                    mountArgs.unshift("-o", filteredOptions.join(","));
+                }
+                if (isLoopMount) {
+                    // Specify filesystem type explicitly since we're mounting a loop device
+                    mountArgs.unshift("-t", "btrfs");
+                }
+                const command = useSudo ? "sudo" : "mount";
+                const args = useSudo ? ["mount", ...mountArgs] : mountArgs;
+                yield this.execWithTimeout(() => exec.exec(command, args, { silent: !core.isDebug() }), MOUNT_TIMEOUT_MS, `mount ${actualDevice} at ${mountPath}`);
             }
             catch (error) {
                 // Collect diagnostic info to help debug mount failures
@@ -96862,15 +96882,45 @@ class BtrfsContainer extends Container_1.Container {
                     });
                     yield collect("file type", "file", [device]);
                     yield collect("file size", "stat", ["--format=%s", device]);
-                    yield collect("btrfs module", "lsmod", []);
-                    yield collect("loop devices", "ls", ["-la", "/dev/loop*"]);
+                    yield collect("loaded modules", "sudo", ["lsmod"]);
+                    yield collect("loop devices", "sudo", ["losetup", "-a"]);
+                    yield collect("/dev/loop-control", "ls", ["-la", "/dev/loop-control"]);
                     core.warning(`[BTRFS] Mount diagnostic for ${device}:\n${diag.join("\n")}`);
                 }
                 catch ( /* diagnostic collection is best-effort */_a) { /* diagnostic collection is best-effort */ }
                 // On mount failure, clean up any loop device that may have been allocated
                 yield this.cleanupLoopDevices(device);
-                throw this.wrapError(`mount ${device} at ${mountPath}`, error);
+                this.activeLoopDevice = undefined;
+                throw this.wrapError(`mount ${actualDevice} at ${mountPath}`, error);
             }
+        });
+    }
+    /**
+     * Attach a file to a loop device using explicit losetup.
+     * Returns the allocated loop device path (e.g., /dev/loop0).
+     */
+    setupLoopDevice(imageFile) {
+        return __awaiter(this, void 0, void 0, function* () {
+            let loopDev = "";
+            try {
+                yield exec.exec("sudo", ["losetup", "--find", "--show", imageFile], {
+                    listeners: {
+                        stdout: (data) => { loopDev += data.toString(); }
+                    },
+                    silent: !core.isDebug()
+                });
+            }
+            catch (error) {
+                throw new Error(`Failed to attach ${imageFile} to a loop device. ` +
+                    `Ensure the 'loop' kernel module is loaded and /dev/loop-control exists. ` +
+                    `Error: ${error instanceof Error ? error.message : error}`);
+            }
+            loopDev = loopDev.trim();
+            if (!loopDev.startsWith("/dev/loop")) {
+                throw new Error(`losetup returned unexpected output: "${loopDev}". Expected /dev/loopN.`);
+            }
+            this.logInfo(`Attached ${imageFile} → ${loopDev}`);
+            return loopDev;
         });
     }
     execSudo(command, args = []) {
@@ -97084,6 +97134,10 @@ class BtrfsContainer extends Container_1.Container {
                     description: "BTRFS filesystem operations (install btrfs-progs)"
                 },
                 {
+                    command: "losetup",
+                    description: "loop device management (install util-linux)"
+                },
+                {
                     command: "findmnt",
                     description: "finding mounted filesystems (install util-linux)"
                 },
@@ -97117,17 +97171,20 @@ class BtrfsContainer extends Container_1.Container {
                 throw new Error(`sudo access is required for BTRFS mounting operations but sudo is not available or requires a password. ` +
                     `Please ensure the runner has passwordless sudo access or use a different compression method.`);
             }
-            // Ensure btrfs kernel module is loaded — required for mount -t btrfs.
-            // On fresh K8s nodes the module may not be auto-loaded until something triggers it,
-            // causing mount to fail with exit code 32.
-            try {
-                yield exec.exec("sudo", ["modprobe", "btrfs"], {
-                    silent: !core.isDebug()
-                });
-            }
-            catch (error) {
-                core.warning(`${this.getLogPrefix()} Failed to load btrfs kernel module (modprobe btrfs). ` +
-                    `Mount may fail if the module is not already loaded. Error: ${error instanceof Error ? error.message : error}`);
+            // Ensure kernel modules are loaded:
+            // - loop: required for losetup to attach .btrfs image files as block devices
+            // - btrfs: required for mount -t btrfs
+            // On fresh K8s nodes these may not be auto-loaded, causing mount exit code 32.
+            for (const mod of ["loop", "btrfs"]) {
+                try {
+                    yield exec.exec("sudo", ["modprobe", mod], {
+                        silent: !core.isDebug()
+                    });
+                }
+                catch (error) {
+                    core.warning(`${this.getLogPrefix()} Failed to load ${mod} kernel module. ` +
+                        `Mount may fail. Error: ${error instanceof Error ? error.message : error}`);
+                }
             }
         });
     }
@@ -97324,6 +97381,17 @@ class BtrfsContainer extends Container_1.Container {
                 if (mountCheck === 0) {
                     core.debug(`[BTRFS] Unmounting main filesystem: ${this.mountPoint}`);
                     yield this.umountWithErrorHandling(this.mountPoint);
+                }
+                // Detach loop device after unmounting the filesystem
+                if (this.activeLoopDevice) {
+                    core.debug(`[BTRFS] Detaching loop device: ${this.activeLoopDevice}`);
+                    try {
+                        yield this.execSudo("losetup", ["-d", this.activeLoopDevice]);
+                    }
+                    catch (error) {
+                        core.debug(`Failed to detach loop device ${this.activeLoopDevice}: ${error}`);
+                    }
+                    this.activeLoopDevice = undefined;
                 }
             }
             catch (error) {

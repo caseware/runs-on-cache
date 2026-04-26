@@ -17,6 +17,30 @@ const TEST_BASE_DIR = "/home/runner/work/repo";
 const TEST_CACHE_KEY = "Linux-node-abc123";
 const TEST_PATHS = ["node_modules"];
 
+/**
+ * Helper: returns true and writes /dev/loop0 to stdout if the call is
+ * `sudo losetup --find --show <file>`. Use inside custom mockImplementation
+ * callbacks so that explicit losetup always succeeds.
+ */
+function handleLosetupMock(
+    cmd: string,
+    args?: string[],
+    options?: { listeners?: { stdout?: (data: Buffer) => void } }
+): boolean {
+    if (
+        cmd === "sudo" &&
+        args?.[0] === "losetup" &&
+        args?.[1] === "--find" &&
+        args?.[2] === "--show"
+    ) {
+        if (options?.listeners?.stdout) {
+            options.listeners.stdout(Buffer.from("/dev/loop0\n"));
+        }
+        return true;
+    }
+    return false;
+}
+
 function createBtrfsContainer(
     overrides: {
         containerFile?: string;
@@ -55,8 +79,20 @@ beforeEach(() => {
     // Mock platform as Linux
     Object.defineProperty(process, "platform", { value: "linux" });
 
-    // Default mock for exec - succeed
-    mockedExec.exec.mockResolvedValue(0);
+    // Default mock for exec - succeed, with losetup returning a loop device
+    mockedExec.exec.mockImplementation(async (cmd, args, options) => {
+        if (
+            cmd === "sudo" &&
+            args?.[0] === "losetup" &&
+            args?.[1] === "--find" &&
+            args?.[2] === "--show"
+        ) {
+            if (options?.listeners?.stdout) {
+                options.listeners.stdout(Buffer.from("/dev/loop0\n"));
+            }
+        }
+        return 0;
+    });
 
     // Mock core methods
     mockedCore.isDebug.mockReturnValue(false);
@@ -178,7 +214,7 @@ describe("BtrfsContainer.initialize", () => {
         const whichCalls = mockedExec.exec.mock.calls.filter(
             call => call[0] === "which"
         );
-        expect(whichCalls.length).toBe(5); // truncate, mkfs.btrfs, btrfs, findmnt, sudo
+        expect(whichCalls.length).toBe(6); // truncate, mkfs.btrfs, btrfs, losetup, findmnt, sudo
 
         // Should check sudo access
         const sudoCalls = mockedExec.exec.mock.calls.filter(
@@ -249,20 +285,32 @@ describe("BtrfsContainer.createEmptyCache", () => {
         expect(mkfsCall).toBeDefined();
         expect(mkfsCall![1]).toContain("-f");
 
-        // Should mount with sudo
+        // Should use explicit losetup to attach loop device
+        const losetupCall = execCalls.find(
+            call =>
+                call[0] === "sudo" &&
+                call[1]?.[0] === "losetup" &&
+                call[1]?.[1] === "--find" &&
+                call[1]?.[2] === "--show"
+        );
+        expect(losetupCall).toBeDefined();
+
+        // Should mount with sudo using the loop device and -t btrfs
         const mountCall = execCalls.find(
             call =>
                 call[0] === "sudo" &&
-                call[1]?.[0] === "mount"
+                call[1]?.[0] === "mount" &&
+                (call[1] as string[]).includes("-t") &&
+                (call[1] as string[]).includes("btrfs")
         );
         expect(mountCall).toBeDefined();
 
-        // Mount options should include loop, rw, and compression
+        // Mount options should include rw and compression (no "loop" — handled by losetup)
         const mountArgs = mountCall![1] as string[];
         const optionsIndex = mountArgs.indexOf("-o");
         expect(optionsIndex).toBeGreaterThan(-1);
         const options = mountArgs[optionsIndex + 1];
-        expect(options).toContain("loop");
+        expect(options).not.toContain("loop");
         expect(options).toContain("rw");
         expect(options).toContain("compress=zstd:3");
     });
@@ -608,6 +656,7 @@ describe("ContainerFactory BTRFS selection", () => {
 describe("BtrfsContainer edge case improvements", () => {
     test("restore checks filesystem health after mount", async () => {
         mockedExec.exec.mockImplementation(async (cmd, args, options) => {
+            if (handleLosetupMock(cmd, args as string[], options)) return 0;
             // Mock btrfs device stats
             if (
                 cmd === "sudo" &&
@@ -647,6 +696,7 @@ describe("BtrfsContainer edge case improvements", () => {
 
     test("restore warns on filesystem I/O errors", async () => {
         mockedExec.exec.mockImplementation(async (cmd, args, options) => {
+            if (handleLosetupMock(cmd, args as string[], options)) return 0;
             if (
                 cmd === "sudo" &&
                 args?.[0] === "btrfs" &&
@@ -678,6 +728,7 @@ describe("BtrfsContainer edge case improvements", () => {
 
     test("createEmptyCache checks disk space", async () => {
         mockedExec.exec.mockImplementation(async (cmd, args, options) => {
+            if (handleLosetupMock(cmd, args as string[], options)) return 0;
             // Mock df output
             if (cmd === "df") {
                 if (options?.listeners?.stdout) {
@@ -703,6 +754,7 @@ describe("BtrfsContainer edge case improvements", () => {
 
     test("createEmptyCache reduces sparse size when disk is constrained", async () => {
         mockedExec.exec.mockImplementation(async (cmd, args, options) => {
+            if (handleLosetupMock(cmd, args as string[], options)) return 0;
             // Mock df output: only 10GB available
             if (cmd === "df") {
                 if (options?.listeners?.stdout) {
