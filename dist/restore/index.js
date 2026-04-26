@@ -96673,6 +96673,10 @@ class BtrfsContainer extends Container_1.Container {
             const localCopy = path.join(tempDir, "cache.btrfs");
             this.logInfo(`Copying for RW mount: ${imageFile} → ${localCopy}`);
             yield fs.copyFile(imageFile, localCopy);
+            // Randomize the BTRFS UUID on the copy so the kernel doesn't reject it
+            // as a duplicate of the node-local original that's still on disk.
+            this.logInfo("Randomizing BTRFS UUID on copy");
+            yield this.execSudo("btrfstune", ["-f", "-u", localCopy]);
             // Update containerFile to the local copy so save() operates on the right file
             this.containerFile = localCopy;
             yield this.mount();
