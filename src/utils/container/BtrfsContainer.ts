@@ -219,6 +219,7 @@ export class BtrfsContainer extends Container {
         const tempDir = await createCacheKeySpecificTempDirectory(this.cacheKey);
         this.mountPoint = path.join(tempDir, "mount");
 
+        await this.cleanStaleMounts();
         await fs.mkdir(this.mountPoint, { recursive: true });
         this.logInfo(`Mounting read-only: ${imageFile} → ${this.mountPoint}`);
 
@@ -1056,6 +1057,7 @@ export class BtrfsContainer extends Container {
             );
             this.mountPoint = path.join(tempDir, "mount");
 
+            await this.cleanStaleMounts();
             // Create mount point and mount the image
             await fs.mkdir(this.mountPoint, { recursive: true });
             core.debug(`[BTRFS] Mounting image to ${this.mountPoint}`);
@@ -1158,6 +1160,42 @@ export class BtrfsContainer extends Container {
             }
         });
         await Promise.all(promises);
+    }
+
+    /**
+     * Detect and unmount stale BTRFS mounts from a previous run.
+     * On reused EC2 runners, a previous job's post step may have been skipped
+     * (e.g. cancellation), leaving mounts at the target paths.
+     */
+    private async cleanStaleMounts(): Promise<void> {
+        // Check bind mount targets (workspace paths like node_modules)
+        for (const p of this.pathsToCache) {
+            const absPath = path.join(this.baseDir, p);
+            await this.unmountIfMounted(absPath);
+        }
+
+        // Check the main BTRFS mount point
+        if (this.mountPoint) {
+            await this.unmountIfMounted(this.mountPoint);
+        }
+    }
+
+    private async unmountIfMounted(targetPath: string): Promise<void> {
+        try {
+            const rc = await exec.exec("mountpoint", ["-q", targetPath], {
+                cwd: this.safeCwd,
+                ignoreReturnCode: true,
+                silent: true
+            });
+            if (rc === 0) {
+                core.warning(
+                    `${this.getLogPrefix()} Stale mount detected at ${targetPath}, unmounting...`
+                );
+                await this.umountWithErrorHandling(targetPath);
+            }
+        } catch {
+            // targetPath doesn't exist or mountpoint check failed — nothing to clean
+        }
     }
 
     private async unmount(): Promise<void> {

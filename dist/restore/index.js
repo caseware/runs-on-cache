@@ -96649,6 +96649,7 @@ class BtrfsContainer extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
             this.mountPoint = path.join(tempDir, "mount");
+            yield this.cleanStaleMounts();
             yield fs.mkdir(this.mountPoint, { recursive: true });
             this.logInfo(`Mounting read-only: ${imageFile} → ${this.mountPoint}`);
             yield this.mountWithErrorHandling(imageFile, this.mountPoint, ["loop", "ro", `compress=${this.compressionLevel}`]);
@@ -97357,6 +97358,7 @@ class BtrfsContainer extends Container_1.Container {
             try {
                 const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
                 this.mountPoint = path.join(tempDir, "mount");
+                yield this.cleanStaleMounts();
                 // Create mount point and mount the image
                 yield fs.mkdir(this.mountPoint, { recursive: true });
                 core.debug(`[BTRFS] Mounting image to ${this.mountPoint}`);
@@ -97444,6 +97446,42 @@ class BtrfsContainer extends Container_1.Container {
                 }
             }));
             yield Promise.all(promises);
+        });
+    }
+    /**
+     * Detect and unmount stale BTRFS mounts from a previous run.
+     * On reused EC2 runners, a previous job's post step may have been skipped
+     * (e.g. cancellation), leaving mounts at the target paths.
+     */
+    cleanStaleMounts() {
+        return __awaiter(this, void 0, void 0, function* () {
+            // Check bind mount targets (workspace paths like node_modules)
+            for (const p of this.pathsToCache) {
+                const absPath = path.join(this.baseDir, p);
+                yield this.unmountIfMounted(absPath);
+            }
+            // Check the main BTRFS mount point
+            if (this.mountPoint) {
+                yield this.unmountIfMounted(this.mountPoint);
+            }
+        });
+    }
+    unmountIfMounted(targetPath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const rc = yield exec.exec("mountpoint", ["-q", targetPath], {
+                    cwd: this.safeCwd,
+                    ignoreReturnCode: true,
+                    silent: true
+                });
+                if (rc === 0) {
+                    core.warning(`${this.getLogPrefix()} Stale mount detected at ${targetPath}, unmounting...`);
+                    yield this.umountWithErrorHandling(targetPath);
+                }
+            }
+            catch (_a) {
+                // targetPath doesn't exist or mountpoint check failed — nothing to clean
+            }
         });
     }
     unmount() {
