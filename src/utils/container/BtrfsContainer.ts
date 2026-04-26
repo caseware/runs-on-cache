@@ -1,7 +1,8 @@
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
-import * as fs from "fs/promises";
-import * as path from "path";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 
 import { createCacheKeySpecificTempDirectory } from "../actionUtils";
 import { Container, ContainerOptions } from "./Container";
@@ -47,6 +48,9 @@ export class BtrfsContainer extends Container {
      * Tracked so we can detach it on cleanup/save.
      */
     private activeLoopDevice: string | undefined;
+
+    /** Per-run temp dir used as CWD for all exec calls (prevents stray root-owned dirs in workspace). */
+    private safeCwd = "";
 
     constructor(
         containerFile: string,
@@ -119,6 +123,10 @@ export class BtrfsContainer extends Container {
     }
 
     async initialize(): Promise<void> {
+        // Create a per-run temp directory for sudo operations CWD.
+        // Prevents mount/mkfs/losetup from creating stray root-owned dirs in the workspace.
+        this.safeCwd = await fs.mkdtemp(path.join(os.tmpdir(), "btrfs-"));
+
         try {
             await this.checkPrerequisites();
         } catch (e) {
@@ -281,11 +289,12 @@ export class BtrfsContainer extends Container {
                 "-s",
                 effectiveSize,
                 this.containerFile
-            ]);
+            ], { cwd: this.safeCwd });
 
             // Format with BTRFS
             this.logInfo(`Formatting image with BTRFS`);
             await exec.exec("mkfs.btrfs", ["-f", this.containerFile], {
+                cwd: this.safeCwd,
                 silent: !core.isDebug()
             });
 
@@ -327,7 +336,8 @@ export class BtrfsContainer extends Container {
         try {
             await exec.exec(
                 "sudo",
-                ["mount", "-o", `remount,compress-force=${this.saveCompressionLevel}`, this.mountPoint]
+                ["mount", "-o", `remount,compress-force=${this.saveCompressionLevel}`, this.mountPoint],
+                { cwd: this.safeCwd }
             );
         } catch (remountError) {
             core.warning(
@@ -341,7 +351,8 @@ export class BtrfsContainer extends Container {
         try {
             await exec.exec(
                 "sudo",
-                ["btrfs", "filesystem", "defragment", "-r", `-c${defragAlgo}`, this.mountPoint]
+                ["btrfs", "filesystem", "defragment", "-r", `-c${defragAlgo}`, this.mountPoint],
+                { cwd: this.safeCwd }
             );
         } catch (defragError) {
             core.warning(
@@ -352,7 +363,7 @@ export class BtrfsContainer extends Container {
         }
 
         this.logDebug(`Syncing and calculating used space`);
-        await exec.exec("sync", [], { silent: !core.isDebug() });
+        await exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
 
         // Get used space and resize filesystem — resize is best-effort
         let usedBytes = 0;
@@ -375,7 +386,7 @@ export class BtrfsContainer extends Container {
             await exec.exec(
                 "sudo",
                 ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint],
-                { silent: !core.isDebug() }
+                { cwd: this.safeCwd, silent: !core.isDebug() }
             );
             fsResizeSucceeded = true;
         } catch (resizeError) {
@@ -387,7 +398,7 @@ export class BtrfsContainer extends Container {
         }
 
         // Ensure all changes are written to disk before unmounting
-        await exec.exec("sync", [], { silent: !core.isDebug() });
+        await exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
 
         // Unmount filesystem - the containerFile now points to the actual file with all data
         await this.unmount();
@@ -400,7 +411,7 @@ export class BtrfsContainer extends Container {
         if (fsResizeSucceeded) {
             this.logDebug(`Resizing backing file to ${targetMb} MB`);
             try {
-                await exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
+                await exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile], { cwd: this.safeCwd });
             } catch (truncateError) {
                 core.warning(
                     `Backing file truncate failed (will upload at original size): ${
@@ -412,7 +423,7 @@ export class BtrfsContainer extends Container {
             this.logInfo("Skipping backing file truncation — filesystem resize did not succeed");
         }
 
-        await exec.exec("sync", [], { silent: !core.isDebug() });
+        await exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
 
         // Verification mount: prove the image is mountable before uploading to S3.
         // Never push an unmountable image — that would poison every future restore.
@@ -457,6 +468,7 @@ export class BtrfsContainer extends Container {
     ): Promise<string> {
         let output = "";
         await exec.exec(command, args, {
+            cwd: this.safeCwd,
             listeners: {
                 stdout: (data: Buffer) => {
                     output += data.toString();
@@ -506,7 +518,7 @@ export class BtrfsContainer extends Container {
 
             await this.execWithTimeout(
                 () =>
-                    exec.exec(command, args, { silent: !core.isDebug() }),
+                    exec.exec(command, args, { cwd: this.safeCwd, silent: !core.isDebug() }),
                 MOUNT_TIMEOUT_MS,
                 `mount ${actualDevice} at ${mountPath}`
             );
@@ -518,6 +530,7 @@ export class BtrfsContainer extends Container {
                     try {
                         let out = "";
                         await exec.exec(cmd, cmdArgs, {
+                            cwd: this.safeCwd,
                             silent: true,
                             listeners: { stdout: (d: Buffer) => { out += d.toString(); } }
                         });
@@ -531,7 +544,7 @@ export class BtrfsContainer extends Container {
                 await collect("dmesg (last 40 lines)", "bash", ["-c", "sudo dmesg -T 2>/dev/null | tail -40 || sudo dmesg 2>/dev/null | tail -40 || echo unavailable"]);
                 // Ensure btrfs-progs is available for diagnostics
                 if (actualDevice.startsWith("/dev/loop")) {
-                    await exec.exec("bash", ["-c", "command -v btrfs >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs 2>/dev/null) || true"], { silent: true });
+                    await exec.exec("bash", ["-c", "command -v btrfs >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs 2>/dev/null) || true"], { cwd: this.safeCwd, silent: true });
                     await collect("btrfs check --readonly", "sudo", ["btrfs", "check", "--readonly", actualDevice]);
                     await collect("btrfs superblock (compat flags)", "bash", ["-c", `sudo btrfs inspect-internal dump-super ${actualDevice} 2>&1 | grep -iE 'compat|magic|generation|sectorsize|nodesize|root_level'`]);
                 }
@@ -556,6 +569,7 @@ export class BtrfsContainer extends Container {
         let loopDev = "";
         try {
             await exec.exec("sudo", ["losetup", "--find", "--show", imageFile], {
+                cwd: this.safeCwd,
                 listeners: {
                     stdout: (data: Buffer) => { loopDev += data.toString(); }
                 },
@@ -588,13 +602,13 @@ export class BtrfsContainer extends Container {
         try {
             const loopDev = await this.setupLoopDevice(imageFile);
             try {
-                await exec.exec("mkdir", ["-p", verifyDir]);
-                await exec.exec("sudo", ["mount", "-t", "btrfs", "-o", "ro", loopDev, verifyDir]);
-                await exec.exec("sudo", ["umount", verifyDir]);
+                await exec.exec("mkdir", ["-p", verifyDir], { cwd: this.safeCwd });
+                await exec.exec("sudo", ["mount", "-t", "btrfs", "-o", "ro", loopDev, verifyDir], { cwd: this.safeCwd });
+                await exec.exec("sudo", ["umount", verifyDir], { cwd: this.safeCwd });
                 this.logInfo("Verification mount succeeded — image is safe to upload");
             } finally {
                 await this.cleanupLoopDevices(imageFile);
-                await exec.exec("rm", ["-rf", verifyDir]).catch(() => {});
+                await exec.exec("rm", ["-rf", verifyDir], { cwd: this.safeCwd }).catch(() => {});
             }
         } catch (verifyError) {
             core.error(
@@ -611,6 +625,7 @@ export class BtrfsContainer extends Container {
         args: string[] = []
     ): Promise<void> {
         await exec.exec("sudo", [command, ...args], {
+            cwd: this.safeCwd,
             silent: !core.isDebug()
         });
     }
@@ -870,6 +885,7 @@ export class BtrfsContainer extends Container {
             requiredTools.map(async tool => {
                 try {
                     await exec.exec("which", [tool.command], {
+                        cwd: this.safeCwd,
                         silent: !core.isDebug()
                     });
                 } catch (error) {
@@ -890,6 +906,7 @@ export class BtrfsContainer extends Container {
         // Check if sudo works without password prompt (for CI environments)
         try {
             await exec.exec("sudo", ["-n", "true"], {
+                cwd: this.safeCwd,
                 silent: !core.isDebug()
             });
         } catch (error) {
@@ -906,6 +923,7 @@ export class BtrfsContainer extends Container {
         for (const mod of ["loop", "btrfs"]) {
             try {
                 await exec.exec("sudo", ["modprobe", mod], {
+                    cwd: this.safeCwd,
                     silent: !core.isDebug()
                 });
             } catch (error) {
@@ -1049,6 +1067,7 @@ export class BtrfsContainer extends Container {
                     // Only create the workspace target — never write to the RO filesystem.
                     try {
                         await exec.exec("test", ["-d", btrfsPath], {
+                            cwd: this.safeCwd,
                             ignoreReturnCode: false,
                             silent: !core.isDebug()
                         });
@@ -1115,7 +1134,7 @@ export class BtrfsContainer extends Container {
         }
 
         try {
-            await exec.exec("sync", [], { silent: !core.isDebug() });
+            await exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
 
             // First unmount all bind mounts
             for (const p of this.pathsToCache) {
@@ -1125,6 +1144,7 @@ export class BtrfsContainer extends Container {
                         "mountpoint",
                         [absPath],
                         {
+                            cwd: this.safeCwd,
                             ignoreReturnCode: true,
                             silent: !core.isDebug()
                         }
@@ -1145,6 +1165,7 @@ export class BtrfsContainer extends Container {
                 "mountpoint",
                 [this.mountPoint],
                 {
+                    cwd: this.safeCwd,
                     ignoreReturnCode: true,
                     silent: !core.isDebug()
                 }
@@ -1175,6 +1196,13 @@ export class BtrfsContainer extends Container {
             await fs.rm(this.mountPoint, { recursive: true, force: true });
         } catch (error) {
             core.debug(`Cleanup mount point failed (non-critical): ${error}`);
+        }
+
+        // Clean up the per-run sudo CWD temp dir
+        if (this.safeCwd) {
+            try {
+                await fs.rm(this.safeCwd, { recursive: true, force: true });
+            } catch { /* best-effort */ }
         }
     }
 }

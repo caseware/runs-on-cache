@@ -96502,8 +96502,9 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.BtrfsContainer = void 0;
 const core = __importStar(__nccwpck_require__(2186));
 const exec = __importStar(__nccwpck_require__(1514));
-const fs = __importStar(__nccwpck_require__(3292));
-const path = __importStar(__nccwpck_require__(1017));
+const fs = __importStar(__nccwpck_require__(3977));
+const os = __importStar(__nccwpck_require__(612));
+const path = __importStar(__nccwpck_require__(9411));
 const actionUtils_1 = __nccwpck_require__(6850);
 const Container_1 = __nccwpck_require__(9620);
 const NodeLocalCache_1 = __nccwpck_require__(8033);
@@ -96531,6 +96532,8 @@ class BtrfsContainer extends Container_1.Container {
          * Detected at discoverMountInfo() time — true if the current BTRFS mount is read-only.
          */
         this.mountIsReadOnly = false;
+        /** Per-run temp dir used as CWD for all exec calls (prevents stray root-owned dirs in workspace). */
+        this.safeCwd = "";
         if (!options.fsSize) {
             throw new Error("fsSize option is required for BtrfsContainer");
         }
@@ -96562,6 +96565,9 @@ class BtrfsContainer extends Container_1.Container {
     }
     initialize() {
         return __awaiter(this, void 0, void 0, function* () {
+            // Create a per-run temp directory for sudo operations CWD.
+            // Prevents mount/mkfs/losetup from creating stray root-owned dirs in the workspace.
+            this.safeCwd = yield fs.mkdtemp(path.join(os.tmpdir(), "btrfs-"));
             try {
                 yield this.checkPrerequisites();
             }
@@ -96704,10 +96710,11 @@ class BtrfsContainer extends Container_1.Container {
                     "-s",
                     effectiveSize,
                     this.containerFile
-                ]);
+                ], { cwd: this.safeCwd });
                 // Format with BTRFS
                 this.logInfo(`Formatting image with BTRFS`);
                 yield exec.exec("mkfs.btrfs", ["-f", this.containerFile], {
+                    cwd: this.safeCwd,
                     silent: !core.isDebug()
                 });
                 // Mount the filesystem so workspace operations write directly to it
@@ -96746,20 +96753,20 @@ class BtrfsContainer extends Container_1.Container {
             const defragAlgo = this.saveCompressionLevel.split(":")[0];
             this.logInfo(`Remounting with compress-force=${this.saveCompressionLevel} before defrag`);
             try {
-                yield exec.exec("sudo", ["mount", "-o", `remount,compress-force=${this.saveCompressionLevel}`, this.mountPoint]);
+                yield exec.exec("sudo", ["mount", "-o", `remount,compress-force=${this.saveCompressionLevel}`, this.mountPoint], { cwd: this.safeCwd });
             }
             catch (remountError) {
                 core.warning(`Remount with save compression failed, defrag will use mount-time level: ${remountError instanceof Error ? remountError.message : remountError}`);
             }
             this.logInfo(`Defragmenting + recompressing with ${defragAlgo} (save-compression-level: ${this.saveCompressionLevel})`);
             try {
-                yield exec.exec("sudo", ["btrfs", "filesystem", "defragment", "-r", `-c${defragAlgo}`, this.mountPoint]);
+                yield exec.exec("sudo", ["btrfs", "filesystem", "defragment", "-r", `-c${defragAlgo}`, this.mountPoint], { cwd: this.safeCwd });
             }
             catch (defragError) {
                 core.warning(`Defrag failed (image will upload at mount-time compression): ${defragError instanceof Error ? defragError.message : defragError}`);
             }
             this.logDebug(`Syncing and calculating used space`);
-            yield exec.exec("sync", [], { silent: !core.isDebug() });
+            yield exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
             // Get used space and resize filesystem — resize is best-effort
             let usedBytes = 0;
             let fsResizeSucceeded = false;
@@ -96775,14 +96782,14 @@ class BtrfsContainer extends Container_1.Container {
             const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
             core.debug(`Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
             try {
-                yield exec.exec("sudo", ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint], { silent: !core.isDebug() });
+                yield exec.exec("sudo", ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint], { cwd: this.safeCwd, silent: !core.isDebug() });
                 fsResizeSucceeded = true;
             }
             catch (resizeError) {
                 core.warning(`Filesystem resize failed (will upload at original size): ${resizeError instanceof Error ? resizeError.message : resizeError}`);
             }
             // Ensure all changes are written to disk before unmounting
-            yield exec.exec("sync", [], { silent: !core.isDebug() });
+            yield exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
             // Unmount filesystem - the containerFile now points to the actual file with all data
             yield this.unmount();
             // Only truncate the backing file if the BTRFS filesystem resize succeeded.
@@ -96793,7 +96800,7 @@ class BtrfsContainer extends Container_1.Container {
             if (fsResizeSucceeded) {
                 this.logDebug(`Resizing backing file to ${targetMb} MB`);
                 try {
-                    yield exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
+                    yield exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile], { cwd: this.safeCwd });
                 }
                 catch (truncateError) {
                     core.warning(`Backing file truncate failed (will upload at original size): ${truncateError instanceof Error ? truncateError.message : truncateError}`);
@@ -96802,7 +96809,7 @@ class BtrfsContainer extends Container_1.Container {
             else {
                 this.logInfo("Skipping backing file truncation — filesystem resize did not succeed");
             }
-            yield exec.exec("sync", [], { silent: !core.isDebug() });
+            yield exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
             // Verification mount: prove the image is mountable before uploading to S3.
             // Never push an unmountable image — that would poison every future restore.
             yield this.verifyImageMountable(this.containerFile);
@@ -96838,6 +96845,7 @@ class BtrfsContainer extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             let output = "";
             yield exec.exec(command, args, {
+                cwd: this.safeCwd,
                 listeners: {
                     stdout: (data) => {
                         output += data.toString();
@@ -96877,7 +96885,7 @@ class BtrfsContainer extends Container_1.Container {
                 }
                 const command = useSudo ? "sudo" : "mount";
                 const args = useSudo ? ["mount", ...mountArgs] : mountArgs;
-                yield this.execWithTimeout(() => exec.exec(command, args, { silent: !core.isDebug() }), MOUNT_TIMEOUT_MS, `mount ${actualDevice} at ${mountPath}`);
+                yield this.execWithTimeout(() => exec.exec(command, args, { cwd: this.safeCwd, silent: !core.isDebug() }), MOUNT_TIMEOUT_MS, `mount ${actualDevice} at ${mountPath}`);
             }
             catch (error) {
                 // Collect diagnostic info to help debug mount failures
@@ -96887,6 +96895,7 @@ class BtrfsContainer extends Container_1.Container {
                         try {
                             let out = "";
                             yield exec.exec(cmd, cmdArgs, {
+                                cwd: this.safeCwd,
                                 silent: true,
                                 listeners: { stdout: (d) => { out += d.toString(); } }
                             });
@@ -96903,7 +96912,7 @@ class BtrfsContainer extends Container_1.Container {
                     yield collect("dmesg (last 40 lines)", "bash", ["-c", "sudo dmesg -T 2>/dev/null | tail -40 || sudo dmesg 2>/dev/null | tail -40 || echo unavailable"]);
                     // Ensure btrfs-progs is available for diagnostics
                     if (actualDevice.startsWith("/dev/loop")) {
-                        yield exec.exec("bash", ["-c", "command -v btrfs >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs 2>/dev/null) || true"], { silent: true });
+                        yield exec.exec("bash", ["-c", "command -v btrfs >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs 2>/dev/null) || true"], { cwd: this.safeCwd, silent: true });
                         yield collect("btrfs check --readonly", "sudo", ["btrfs", "check", "--readonly", actualDevice]);
                         yield collect("btrfs superblock (compat flags)", "bash", ["-c", `sudo btrfs inspect-internal dump-super ${actualDevice} 2>&1 | grep -iE 'compat|magic|generation|sectorsize|nodesize|root_level'`]);
                     }
@@ -96929,6 +96938,7 @@ class BtrfsContainer extends Container_1.Container {
             let loopDev = "";
             try {
                 yield exec.exec("sudo", ["losetup", "--find", "--show", imageFile], {
+                    cwd: this.safeCwd,
                     listeners: {
                         stdout: (data) => { loopDev += data.toString(); }
                     },
@@ -96959,14 +96969,14 @@ class BtrfsContainer extends Container_1.Container {
             try {
                 const loopDev = yield this.setupLoopDevice(imageFile);
                 try {
-                    yield exec.exec("mkdir", ["-p", verifyDir]);
-                    yield exec.exec("sudo", ["mount", "-t", "btrfs", "-o", "ro", loopDev, verifyDir]);
-                    yield exec.exec("sudo", ["umount", verifyDir]);
+                    yield exec.exec("mkdir", ["-p", verifyDir], { cwd: this.safeCwd });
+                    yield exec.exec("sudo", ["mount", "-t", "btrfs", "-o", "ro", loopDev, verifyDir], { cwd: this.safeCwd });
+                    yield exec.exec("sudo", ["umount", verifyDir], { cwd: this.safeCwd });
                     this.logInfo("Verification mount succeeded — image is safe to upload");
                 }
                 finally {
                     yield this.cleanupLoopDevices(imageFile);
-                    yield exec.exec("rm", ["-rf", verifyDir]).catch(() => { });
+                    yield exec.exec("rm", ["-rf", verifyDir], { cwd: this.safeCwd }).catch(() => { });
                 }
             }
             catch (verifyError) {
@@ -96978,6 +96988,7 @@ class BtrfsContainer extends Container_1.Container {
     execSudo(command, args = []) {
         return __awaiter(this, void 0, void 0, function* () {
             yield exec.exec("sudo", [command, ...args], {
+                cwd: this.safeCwd,
                 silent: !core.isDebug()
             });
         });
@@ -97202,6 +97213,7 @@ class BtrfsContainer extends Container_1.Container {
             yield Promise.all(requiredTools.map((tool) => __awaiter(this, void 0, void 0, function* () {
                 try {
                     yield exec.exec("which", [tool.command], {
+                        cwd: this.safeCwd,
                         silent: !core.isDebug()
                     });
                 }
@@ -97216,6 +97228,7 @@ class BtrfsContainer extends Container_1.Container {
             // Check if sudo works without password prompt (for CI environments)
             try {
                 yield exec.exec("sudo", ["-n", "true"], {
+                    cwd: this.safeCwd,
                     silent: !core.isDebug()
                 });
             }
@@ -97230,6 +97243,7 @@ class BtrfsContainer extends Container_1.Container {
             for (const mod of ["loop", "btrfs"]) {
                 try {
                     yield exec.exec("sudo", ["modprobe", mod], {
+                        cwd: this.safeCwd,
                         silent: !core.isDebug()
                     });
                 }
@@ -97345,6 +97359,7 @@ class BtrfsContainer extends Container_1.Container {
                         // Only create the workspace target — never write to the RO filesystem.
                         try {
                             yield exec.exec("test", ["-d", btrfsPath], {
+                                cwd: this.safeCwd,
                                 ignoreReturnCode: false,
                                 silent: !core.isDebug()
                             });
@@ -97406,12 +97421,13 @@ class BtrfsContainer extends Container_1.Container {
                 throw new Error("Mount point is not set");
             }
             try {
-                yield exec.exec("sync", [], { silent: !core.isDebug() });
+                yield exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
                 // First unmount all bind mounts
                 for (const p of this.pathsToCache) {
                     const absPath = path.join(this.baseDir, p);
                     try {
                         const bindMountCheck = yield exec.exec("mountpoint", [absPath], {
+                            cwd: this.safeCwd,
                             ignoreReturnCode: true,
                             silent: !core.isDebug()
                         });
@@ -97426,6 +97442,7 @@ class BtrfsContainer extends Container_1.Container {
                 }
                 // Then unmount the main BTRFS filesystem
                 const mountCheck = yield exec.exec("mountpoint", [this.mountPoint], {
+                    cwd: this.safeCwd,
                     ignoreReturnCode: true,
                     silent: !core.isDebug()
                 });
@@ -97453,6 +97470,13 @@ class BtrfsContainer extends Container_1.Container {
             }
             catch (error) {
                 core.debug(`Cleanup mount point failed (non-critical): ${error}`);
+            }
+            // Clean up the per-run sudo CWD temp dir
+            if (this.safeCwd) {
+                try {
+                    yield fs.rm(this.safeCwd, { recursive: true, force: true });
+                }
+                catch ( /* best-effort */_a) { /* best-effort */ }
             }
         });
     }
@@ -98911,6 +98935,22 @@ module.exports = require("node:events");
 
 "use strict";
 module.exports = require("node:fs");
+
+/***/ }),
+
+/***/ 3977:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("node:fs/promises");
+
+/***/ }),
+
+/***/ 612:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("node:os");
 
 /***/ }),
 
