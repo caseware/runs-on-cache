@@ -96758,6 +96758,7 @@ class BtrfsContainer extends Container_1.Container {
             yield exec.exec("sync", [], { silent: !core.isDebug() });
             // Get used space and resize filesystem — resize is best-effort
             let usedBytes = 0;
+            let fsResizeSucceeded = false;
             try {
                 const usageOutput = yield this.getBtrfsUsage();
                 usedBytes = this.parseUsedBytes(usageOutput);
@@ -96771,6 +96772,7 @@ class BtrfsContainer extends Container_1.Container {
             core.debug(`Used: ${usedBytes} bytes, Resizing to ${targetMb} MB`);
             try {
                 yield exec.exec("sudo", ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint], { silent: !core.isDebug() });
+                fsResizeSucceeded = true;
             }
             catch (resizeError) {
                 core.warning(`Filesystem resize failed (will upload at original size): ${resizeError instanceof Error ? resizeError.message : resizeError}`);
@@ -96802,13 +96804,22 @@ class BtrfsContainer extends Container_1.Container {
             catch (loopError) {
                 core.warning(`Could not attach loop device for integrity check: ${loopError}`);
             }
-            // Resize backing file — best-effort, skip on failure
-            this.logDebug(`Resizing backing file to ${targetMb} MB`);
-            try {
-                yield exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
+            // Only truncate the backing file if the BTRFS filesystem resize succeeded.
+            // If resize failed, the superblock still claims the original size (e.g. 256MB).
+            // Truncating to a smaller size would make the file smaller than the superblock
+            // expects, causing "device total_bytes should be at most X but found Y" on
+            // the next mount attempt (EINVAL / exit code 32).
+            if (fsResizeSucceeded) {
+                this.logDebug(`Resizing backing file to ${targetMb} MB`);
+                try {
+                    yield exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile]);
+                }
+                catch (truncateError) {
+                    core.warning(`Backing file truncate failed (will upload at original size): ${truncateError instanceof Error ? truncateError.message : truncateError}`);
+                }
             }
-            catch (truncateError) {
-                core.warning(`Backing file truncate failed (will upload at original size): ${truncateError instanceof Error ? truncateError.message : truncateError}`);
+            else {
+                this.logInfo("Skipping backing file truncation — filesystem resize did not succeed");
             }
             // Additional sync and wait after unmount to ensure file is fully accessible
             yield exec.exec("sync", [], { silent: !core.isDebug() });
