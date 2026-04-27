@@ -97263,7 +97263,7 @@ class BtrfsImage {
      *
      * Checks:
      *  1. File exists and is non-empty
-     *  2. `btrfs inspect-internal dump-super` succeeds (validates superblock,
+     *  2. `btrfs inspect-internal dump-super` exits 0 (validates superblock,
      *     magic number, checksums, generation counters)
      */
     verifyMountable() {
@@ -97278,20 +97278,23 @@ class BtrfsImage {
                 }
                 info(`Image file size: ${Math.round(stat.size / 1024 / 1024)} MB`);
                 // 2. BTRFS superblock validation (offline, no loop device needed)
-                let dumpOutput = "";
-                yield exec.exec("sudo", ["btrfs", "inspect-internal", "dump-super", this.imageFile], {
-                    cwd: this.opts.safeCwd,
+                //    dump-super returns non-zero if the superblock is unreadable.
+                //    Use getExecOutput for reliable stdout/stderr capture (the
+                //    listener pattern can miss output when the runner's CWD is
+                //    invalid after lazy unmount).
+                const result = yield exec.getExecOutput("sudo", ["btrfs", "inspect-internal", "dump-super", this.imageFile], {
+                    cwd: "/tmp",
                     silent: !core.isDebug(),
-                    listeners: {
-                        stdout: (data) => {
-                            dumpOutput += data.toString();
-                        }
-                    }
+                    ignoreReturnCode: true
                 });
-                // Validate key superblock fields
-                if (!dumpOutput.includes("magic") || !dumpOutput.includes("generation")) {
-                    core.error(`${LOG_PREFIX} Superblock dump missing expected fields — image may be corrupted`);
+                if (result.exitCode !== 0) {
+                    core.error(`${LOG_PREFIX} dump-super exited ${result.exitCode} — image may be corrupted. stderr: ${result.stderr.slice(0, 500)}`);
                     return false;
+                }
+                // Extra sanity: if we got stdout, check for key fields
+                const output = result.stdout;
+                if (output.length > 0 && (!output.includes("magic") || !output.includes("generation"))) {
+                    core.warning(`${LOG_PREFIX} dump-super exited 0 but output (${output.length} bytes) missing expected fields — proceeding anyway`);
                 }
                 info("Superblock validation succeeded — image is safe to upload");
                 return true;

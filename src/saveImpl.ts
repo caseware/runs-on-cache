@@ -136,7 +136,7 @@ export async function saveOnlyRun(
     // that all promises that we care about have successfully
     // resolved, so simply exit with success.
     if (earlyExit) {
-        process.exit(0);
+        process.exit(process.exitCode ?? 0);
     }
 }
 
@@ -170,6 +170,9 @@ export async function saveRun(earlyExit?: boolean | undefined): Promise<void> {
     }
 
     if (earlyExit) {
-        process.exit(0);
+        // Respect core.setFailed() which sets process.exitCode = 1.
+        // Without this, process.exit(0) overrides the failure signal
+        // and the job appears green despite a save error.
+        process.exit(process.exitCode ?? 0);
     }
 }

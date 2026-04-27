@@ -96232,6 +96232,7 @@ function saveImpl(stateProvider) {
 }
 exports.saveImpl = saveImpl;
 function saveOnlyRun(earlyExit) {
+    var _a;
     return __awaiter(this, void 0, void 0, function* () {
         try {
             const cacheId = yield saveImpl(new stateProvider_1.NullStateProvider());
@@ -96251,12 +96252,13 @@ function saveOnlyRun(earlyExit) {
         // that all promises that we care about have successfully
         // resolved, so simply exit with success.
         if (earlyExit) {
-            process.exit(0);
+            process.exit((_a = process.exitCode) !== null && _a !== void 0 ? _a : 0);
         }
     });
 }
 exports.saveOnlyRun = saveOnlyRun;
 function saveRun(earlyExit) {
+    var _a;
     return __awaiter(this, void 0, void 0, function* () {
         try {
             // With post-if: "always()", the post step runs on success, failure,
@@ -96289,7 +96291,10 @@ function saveRun(earlyExit) {
             yield (0, BtrfsCleanup_1.cleanupForCacheKey)(cacheKey);
         }
         if (earlyExit) {
-            process.exit(0);
+            // Respect core.setFailed() which sets process.exitCode = 1.
+            // Without this, process.exit(0) overrides the failure signal
+            // and the job appears green despite a save error.
+            process.exit((_a = process.exitCode) !== null && _a !== void 0 ? _a : 0);
         }
     });
 }
@@ -97568,7 +97573,7 @@ class BtrfsImage {
      *
      * Checks:
      *  1. File exists and is non-empty
-     *  2. `btrfs inspect-internal dump-super` succeeds (validates superblock,
+     *  2. `btrfs inspect-internal dump-super` exits 0 (validates superblock,
      *     magic number, checksums, generation counters)
      */
     verifyMountable() {
@@ -97583,20 +97588,23 @@ class BtrfsImage {
                 }
                 info(`Image file size: ${Math.round(stat.size / 1024 / 1024)} MB`);
                 // 2. BTRFS superblock validation (offline, no loop device needed)
-                let dumpOutput = "";
-                yield exec.exec("sudo", ["btrfs", "inspect-internal", "dump-super", this.imageFile], {
-                    cwd: this.opts.safeCwd,
+                //    dump-super returns non-zero if the superblock is unreadable.
+                //    Use getExecOutput for reliable stdout/stderr capture (the
+                //    listener pattern can miss output when the runner's CWD is
+                //    invalid after lazy unmount).
+                const result = yield exec.getExecOutput("sudo", ["btrfs", "inspect-internal", "dump-super", this.imageFile], {
+                    cwd: "/tmp",
                     silent: !core.isDebug(),
-                    listeners: {
-                        stdout: (data) => {
-                            dumpOutput += data.toString();
-                        }
-                    }
+                    ignoreReturnCode: true
                 });
-                // Validate key superblock fields
-                if (!dumpOutput.includes("magic") || !dumpOutput.includes("generation")) {
-                    core.error(`${LOG_PREFIX} Superblock dump missing expected fields — image may be corrupted`);
+                if (result.exitCode !== 0) {
+                    core.error(`${LOG_PREFIX} dump-super exited ${result.exitCode} — image may be corrupted. stderr: ${result.stderr.slice(0, 500)}`);
                     return false;
+                }
+                // Extra sanity: if we got stdout, check for key fields
+                const output = result.stdout;
+                if (output.length > 0 && (!output.includes("magic") || !output.includes("generation"))) {
+                    core.warning(`${LOG_PREFIX} dump-super exited 0 but output (${output.length} bytes) missing expected fields — proceeding anyway`);
                 }
                 info("Superblock validation succeeded — image is safe to upload");
                 return true;
