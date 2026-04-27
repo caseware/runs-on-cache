@@ -1,0 +1,100 @@
+name: 'Workspace cache setup'
+description: >-
+  Single composite step that configures AWS credentials, installs btrfs-progs,
+  computes the daily workspace cache key, and restores (or creates) the BTRFS
+  workspace image.  Should run BEFORE actions/checkout in any job that uses
+  the unified workspace cache.
+inputs:
+  aws-role-arn:
+    description: 'IAM role ARN for AWS credentials (S3 cache access)'
+    required: true
+  session-name:
+    description: 'AWS role session name suffix (e.g. get-affected, warm-workspace)'
+    required: false
+    default: 'workspace-cache'
+  run-number:
+    description: 'GitHub run number (for unique session names)'
+    required: false
+    default: '0'
+  s3-bucket:
+    description: 'S3 bucket for the cache'
+    required: false
+    default: 'ust1-cache-code-github-actions-develop-1'
+  force-save:
+    description: 'Always save (even on exact key match). Used by the warm-up job.'
+    required: false
+    default: 'false'
+  fail-on-save-error:
+    description: 'Fail the job if the BTRFS save pipeline errors.'
+    required: false
+    default: 'false'
+outputs:
+  cache-hit:
+    description: 'Whether an exact cache key matched'
+    value: ${{ steps.workspace-cache.outputs.cache-hit }}
+  cache-key:
+    description: 'The computed cache key for today'
+    value: ${{ steps.ws-cache-key.outputs.key }}
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.aws-role-arn }}
+        role-session-name: ${{ inputs.session-name }}-${{ inputs.run-number }}
+        role-skip-session-tagging: true
+        aws-region: us-east-1
+        role-duration-seconds: 7200
+
+    - name: Set persistent S3 env vars
+      shell: bash
+      run: |
+        echo "AWS_REGION=${AWS_REGION:-us-east-1}" >> "$GITHUB_ENV"
+        echo "RUNS_ON_S3_BUCKET_CACHE=${{ inputs.s3-bucket }}" >> "$GITHUB_ENV"
+
+    - name: Install btrfs-progs
+      shell: bash
+      run: |
+        if ! command -v mkfs.btrfs &>/dev/null; then
+          sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs
+        fi
+
+    - name: Compute workspace cache key
+      id: ws-cache-key
+      shell: bash
+      run: |
+        ARCH="$(uname -m)"
+        TODAY="$(date -u +'%Y-%m-%d')"
+        PREFIX="workspace-cache-v1-${RUNNER_OS}-${ARCH}"
+        EXACT_KEY="${PREFIX}-${TODAY}"
+        # Build restore keys: last 7 days + bare prefix (max 10 keys total incl primary)
+        RESTORE_KEYS=""
+        for i in $(seq 1 7); do
+          DAY="$(date -u -d "${i} days ago" +'%Y-%m-%d' 2>/dev/null || date -u -v-${i}d +'%Y-%m-%d' 2>/dev/null)"
+          if [ -n "$DAY" ]; then
+            RESTORE_KEYS="${RESTORE_KEYS}${PREFIX}-${DAY}
+        "
+          fi
+        done
+        RESTORE_KEYS="${RESTORE_KEYS}${PREFIX}-"
+        echo "key=${EXACT_KEY}" >> "$GITHUB_OUTPUT"
+        {
+          echo "restore-keys<<EOF"
+          echo "$RESTORE_KEYS"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+        echo "Cache key: ${EXACT_KEY}"
+
+    - name: Restore workspace cache
+      id: workspace-cache
+      uses: caseware/runs-on-cache@add-btrfs-lz4
+      with:
+        path: .
+        key: ${{ steps.ws-cache-key.outputs.key }}
+        restore-keys: ${{ steps.ws-cache-key.outputs.restore-keys }}
+        custom-compression: btrfs
+        mount-mode: rw
+        fs-size: 50G
+        force-save: ${{ inputs.force-save }}
+        fail-on-save-error: ${{ inputs.fail-on-save-error }}
