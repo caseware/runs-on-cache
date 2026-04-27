@@ -404,7 +404,40 @@ export class BtrfsImage {
 
     async randomizeUuid(): Promise<void> {
         info("Randomizing BTRFS UUID on copy");
-        await sudoExec("btrfstune", ["-f", "-u", this.imageFile], this.opts.safeCwd);
+        const result = await exec.getExecOutput(
+            "sudo",
+            ["btrfstune", "-f", "-u", this.imageFile],
+            { cwd: this.opts.safeCwd, silent: !core.isDebug(), ignoreReturnCode: true }
+        );
+        if (result.exitCode !== 0) {
+            // Collect diagnostics before throwing
+            const stderr = result.stderr.trim();
+            const stdout = result.stdout.trim();
+            let fileSizeMb = "unknown";
+            try {
+                const stat = await fs.stat(this.imageFile);
+                fileSizeMb = `${Math.round(stat.size / (1024 * 1024))}`;
+            } catch { /* ignore */ }
+
+            let dfOutput = "";
+            try {
+                const dfResult = await exec.getExecOutput(
+                    "df", ["-h", path.dirname(this.imageFile)],
+                    { cwd: this.opts.safeCwd, silent: true, ignoreReturnCode: true }
+                );
+                dfOutput = dfResult.stdout.trim();
+            } catch { /* ignore */ }
+
+            core.warning(
+                `${LOG_PREFIX} btrfstune failed (exit ${result.exitCode}). ` +
+                `File: ${this.imageFile} (${fileSizeMb} MB). ` +
+                `stderr: ${stderr || "(empty)"}. stdout: ${stdout || "(empty)"}. ` +
+                `df: ${dfOutput || "(unavailable)"}`
+            );
+            throw new Error(
+                `btrfstune -f -u failed with exit code ${result.exitCode}: ${stderr || stdout || "no output"}`
+            );
+        }
     }
 
     // ── Filesystem health ───────────────────────────────────────────

@@ -97090,10 +97090,19 @@ class BtrfsContainer extends Container_1.Container {
             const localCopy = path.join(tempDir, "cache.btrfs");
             this.logInfo(`Copying for RW mount: ${imageFile} → ${localCopy}`);
             yield fs.copyFile(imageFile, localCopy);
+            // Verify copy integrity: file size must match original
+            const [srcStat, dstStat] = yield Promise.all([
+                fs.stat(imageFile),
+                fs.stat(localCopy)
+            ]);
+            if (srcStat.size !== dstStat.size) {
+                throw new Error(`Copy integrity check failed: source ${srcStat.size} bytes vs copy ${dstStat.size} bytes`);
+            }
+            this.logInfo(`Copy verified: ${Math.round(dstStat.size / (1024 * 1024))} MB`);
             // Randomize UUID so kernel doesn't reject duplicate of node-local original
+            this.image.setImageFile(localCopy);
             yield this.image.randomizeUuid();
             this.containerFile = localCopy;
-            this.image.setImageFile(localCopy);
             yield this.mountImageReadWrite();
             yield this.image.expandForHeadroom(this.mountPoint);
         });
@@ -97687,7 +97696,29 @@ class BtrfsImage {
     randomizeUuid() {
         return __awaiter(this, void 0, void 0, function* () {
             info("Randomizing BTRFS UUID on copy");
-            yield sudoExec("btrfstune", ["-f", "-u", this.imageFile], this.opts.safeCwd);
+            const result = yield exec.getExecOutput("sudo", ["btrfstune", "-f", "-u", this.imageFile], { cwd: this.opts.safeCwd, silent: !core.isDebug(), ignoreReturnCode: true });
+            if (result.exitCode !== 0) {
+                // Collect diagnostics before throwing
+                const stderr = result.stderr.trim();
+                const stdout = result.stdout.trim();
+                let fileSizeMb = "unknown";
+                try {
+                    const stat = yield fs.stat(this.imageFile);
+                    fileSizeMb = `${Math.round(stat.size / (1024 * 1024))}`;
+                }
+                catch ( /* ignore */_a) { /* ignore */ }
+                let dfOutput = "";
+                try {
+                    const dfResult = yield exec.getExecOutput("df", ["-h", path.dirname(this.imageFile)], { cwd: this.opts.safeCwd, silent: true, ignoreReturnCode: true });
+                    dfOutput = dfResult.stdout.trim();
+                }
+                catch ( /* ignore */_b) { /* ignore */ }
+                core.warning(`${LOG_PREFIX} btrfstune failed (exit ${result.exitCode}). ` +
+                    `File: ${this.imageFile} (${fileSizeMb} MB). ` +
+                    `stderr: ${stderr || "(empty)"}. stdout: ${stdout || "(empty)"}. ` +
+                    `df: ${dfOutput || "(unavailable)"}`);
+                throw new Error(`btrfstune -f -u failed with exit code ${result.exitCode}: ${stderr || stdout || "no output"}`);
+            }
         });
     }
     // ── Filesystem health ───────────────────────────────────────────

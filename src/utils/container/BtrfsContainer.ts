@@ -360,11 +360,25 @@ export class BtrfsContainer extends Container {
         this.logInfo(`Copying for RW mount: ${imageFile} → ${localCopy}`);
         await fs.copyFile(imageFile, localCopy);
 
+        // Verify copy integrity: file size must match original
+        const [srcStat, dstStat] = await Promise.all([
+            fs.stat(imageFile),
+            fs.stat(localCopy)
+        ]);
+        if (srcStat.size !== dstStat.size) {
+            throw new Error(
+                `Copy integrity check failed: source ${srcStat.size} bytes vs copy ${dstStat.size} bytes`
+            );
+        }
+        this.logInfo(
+            `Copy verified: ${Math.round(dstStat.size / (1024 * 1024))} MB`
+        );
+
         // Randomize UUID so kernel doesn't reject duplicate of node-local original
+        this.image.setImageFile(localCopy);
         await this.image.randomizeUuid();
 
         this.containerFile = localCopy;
-        this.image.setImageFile(localCopy);
         await this.mountImageReadWrite();
         await this.image.expandForHeadroom(this.mountPoint!);
     }
