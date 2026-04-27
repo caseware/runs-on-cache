@@ -97532,7 +97532,22 @@ class BtrfsImage {
                 if (core.isDebug()) {
                     yield this.collectMountDiagnostics(device, actualDevice);
                 }
-                yield this.cleanupLoopDevices(device);
+                // Detach the loop device directly if we know it, then fall back to
+                // file-based lookup. This avoids orphaned loop devices when the image
+                // path used for losetup -j doesn't match (symlinks, node-local paths).
+                if (this.activeLoopDevice) {
+                    try {
+                        yield sudoExec("losetup", ["-d", this.activeLoopDevice], this.opts.safeCwd);
+                        core.debug(`${LOG_PREFIX} Detached ${this.activeLoopDevice} after mount failure`);
+                    }
+                    catch (_a) {
+                        core.debug(`${LOG_PREFIX} Direct detach of ${this.activeLoopDevice} failed, trying file-based cleanup`);
+                        yield this.cleanupLoopDevices(device);
+                    }
+                }
+                else {
+                    yield this.cleanupLoopDevices(device);
+                }
                 this.activeLoopDevice = undefined;
                 throw new Error(`Failed to mount ${actualDevice} at ${mountPath}: ${error instanceof Error ? error.message : error}`);
             }
