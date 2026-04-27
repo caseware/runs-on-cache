@@ -96611,6 +96611,16 @@ class BtrfsContainer extends Container_1.Container {
     getLogPrefix() {
         return "[BTRFS]";
     }
+    /**
+     * Override setArchivePath to keep BtrfsImage.imageFile in sync with
+     * Container.containerFile. Without this, node-local S3 download path
+     * updates containerFile but the image still points to the original
+     * $RUNNER_TEMP path (which doesn't exist when download went to node-local).
+     */
+    setArchivePath(archivePath) {
+        super.setArchivePath(archivePath);
+        this.image.setImageFile(archivePath);
+    }
     // ── Node-local restore (hot path) ────────────────────────────────
     tryRestoreFromNodeLocal(restoreKeys) {
         return __awaiter(this, void 0, void 0, function* () {
@@ -96722,6 +96732,9 @@ class BtrfsContainer extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
             this.mountPoint = path.join(tempDir, "mount");
+            // Sync image path — imageFile may differ from the original containerFile
+            // (e.g. node-local path vs $RUNNER_TEMP path after S3 download to node-local)
+            this.image.setImageFile(imageFile);
             yield this.cleanStaleMounts();
             yield this.image.mountRO(this.mountPoint);
             try {
@@ -97374,21 +97387,28 @@ class BtrfsImage {
     setupLoopDevice(imageFile) {
         return __awaiter(this, void 0, void 0, function* () {
             let loopDev = "";
+            let stderrOutput = "";
             try {
                 yield exec.exec("sudo", ["losetup", "--find", "--show", imageFile], {
                     cwd: this.opts.safeCwd,
                     listeners: {
                         stdout: (data) => {
                             loopDev += data.toString();
+                        },
+                        stderr: (data) => {
+                            stderrOutput += data.toString();
                         }
                     },
                     silent: !core.isDebug()
                 });
             }
             catch (error) {
+                const details = stderrOutput.trim()
+                    ? `stderr: ${stderrOutput.trim()}`
+                    : `${error instanceof Error ? error.message : error}`;
                 throw new Error(`Failed to attach ${imageFile} to a loop device. ` +
                     `Ensure the 'loop' kernel module is loaded. ` +
-                    `Error: ${error instanceof Error ? error.message : error}`);
+                    `${details}`);
             }
             loopDev = loopDev.trim();
             if (!loopDev.startsWith("/dev/loop")) {

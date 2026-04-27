@@ -119,6 +119,17 @@ export class BtrfsContainer extends Container {
         return "[BTRFS]";
     }
 
+    /**
+     * Override setArchivePath to keep BtrfsImage.imageFile in sync with
+     * Container.containerFile. Without this, node-local S3 download path
+     * updates containerFile but the image still points to the original
+     * $RUNNER_TEMP path (which doesn't exist when download went to node-local).
+     */
+    setArchivePath(archivePath: string): void {
+        super.setArchivePath(archivePath);
+        this.image.setImageFile(archivePath);
+    }
+
     // ── Node-local restore (hot path) ────────────────────────────────
 
     async tryRestoreFromNodeLocal(restoreKeys?: string[]): Promise<boolean> {
@@ -248,6 +259,10 @@ export class BtrfsContainer extends Container {
             this.cacheKey
         );
         this.mountPoint = path.join(tempDir, "mount");
+
+        // Sync image path — imageFile may differ from the original containerFile
+        // (e.g. node-local path vs $RUNNER_TEMP path after S3 download to node-local)
+        this.image.setImageFile(imageFile);
 
         await this.cleanStaleMounts();
         await this.image.mountRO(this.mountPoint);

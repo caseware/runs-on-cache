@@ -468,6 +468,7 @@ export class BtrfsImage {
 
     private async setupLoopDevice(imageFile: string): Promise<string> {
         let loopDev = "";
+        let stderrOutput = "";
         try {
             await exec.exec(
                 "sudo",
@@ -477,16 +478,22 @@ export class BtrfsImage {
                     listeners: {
                         stdout: (data: Buffer) => {
                             loopDev += data.toString();
+                        },
+                        stderr: (data: Buffer) => {
+                            stderrOutput += data.toString();
                         }
                     },
                     silent: !core.isDebug()
                 }
             );
         } catch (error) {
+            const details = stderrOutput.trim()
+                ? `stderr: ${stderrOutput.trim()}`
+                : `${error instanceof Error ? error.message : error}`;
             throw new Error(
                 `Failed to attach ${imageFile} to a loop device. ` +
                     `Ensure the 'loop' kernel module is loaded. ` +
-                    `Error: ${error instanceof Error ? error.message : error}`
+                    `${details}`
             );
         }
         loopDev = loopDev.trim();
