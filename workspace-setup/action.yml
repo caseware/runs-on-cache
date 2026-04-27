@@ -1,9 +1,9 @@
 name: 'Workspace cache setup'
 description: >-
-  Single composite step that configures AWS credentials, installs btrfs-progs,
-  computes the daily workspace cache key, and restores (or creates) the BTRFS
-  workspace image.  Should run BEFORE actions/checkout in any job that uses
-  the unified workspace cache.
+  Single composite step that configures AWS credentials, installs platform-specific
+  tools, computes the daily workspace cache key, and restores (or creates) the
+  workspace image.  Supports BTRFS on Linux and VHDX on Windows.
+  Should run BEFORE actions/checkout in any job that uses the unified workspace cache.
 inputs:
   aws-role-arn:
     description: 'IAM role ARN for AWS credentials (S3 cache access)'
@@ -20,12 +20,18 @@ inputs:
     description: 'S3 bucket for the cache'
     required: false
     default: 'ust1-cache-code-github-actions-develop-1'
+  custom-compression:
+    description: >-
+      Custom compression method (btrfs or vhdx).
+      Defaults to auto-detect: btrfs on Linux, vhdx on Windows.
+    required: false
+    default: ''
   force-save:
     description: 'Always save (even on exact key match). Used by the warm-up job.'
     required: false
     default: 'false'
   fail-on-save-error:
-    description: 'Fail the job if the BTRFS save pipeline errors.'
+    description: 'Fail the job if the save pipeline errors.'
     required: false
     default: 'false'
 outputs:
@@ -34,10 +40,11 @@ outputs:
     value: ${{ steps.workspace-cache.outputs.cache-hit }}
   cache-key:
     description: 'The computed cache key for today'
-    value: ${{ steps.ws-cache-key.outputs.key }}
+    value: ${{ steps.ws-cache-key-linux.outputs.key || steps.ws-cache-key-windows.outputs.key }}
 runs:
   using: composite
   steps:
+    # ── AWS Credentials (cross-platform) ──────────────────────────────
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
@@ -47,21 +54,36 @@ runs:
         aws-region: us-east-1
         role-duration-seconds: 7200
 
-    - name: Set persistent S3 env vars
+    # ── S3 env vars (Linux) ───────────────────────────────────────────
+    - name: Set persistent S3 env vars (Linux)
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         echo "AWS_REGION=${AWS_REGION:-us-east-1}" >> "$GITHUB_ENV"
         echo "RUNS_ON_S3_BUCKET_CACHE=${{ inputs.s3-bucket }}" >> "$GITHUB_ENV"
 
+    # ── S3 env vars (Windows) ─────────────────────────────────────────
+    - name: Set persistent S3 env vars (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $region = if ($env:AWS_REGION) { $env:AWS_REGION } else { "us-east-1" }
+        "AWS_REGION=$region" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "RUNS_ON_S3_BUCKET_CACHE=${{ inputs.s3-bucket }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    # ── Install btrfs-progs (Linux only) ──────────────────────────────
     - name: Install btrfs-progs
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         if ! command -v mkfs.btrfs &>/dev/null; then
           sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs
         fi
 
-    - name: Compute workspace cache key
-      id: ws-cache-key
+    # ── Compute workspace cache key (Linux) ───────────────────────────
+    - name: Compute workspace cache key (Linux)
+      if: runner.os == 'Linux'
+      id: ws-cache-key-linux
       shell: bash
       run: |
         ARCH="$(uname -m)"
@@ -86,14 +108,53 @@ runs:
         } >> "$GITHUB_OUTPUT"
         echo "Cache key: ${EXACT_KEY}"
 
+    # ── Compute workspace cache key (Windows) ─────────────────────────
+    - name: Compute workspace cache key (Windows)
+      if: runner.os == 'Windows'
+      id: ws-cache-key-windows
+      shell: pwsh
+      run: |
+        $arch = if ($env:PROCESSOR_ARCHITECTURE) { $env:PROCESSOR_ARCHITECTURE } else { "AMD64" }
+        $today = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
+        $prefix = "workspace-cache-v1-$($env:RUNNER_OS)-$arch"
+        $exactKey = "$prefix-$today"
+        $restoreKeys = @()
+        for ($i = 1; $i -le 7; $i++) {
+          $day = (Get-Date).ToUniversalTime().AddDays(-$i).ToString("yyyy-MM-dd")
+          $restoreKeys += "$prefix-$day"
+        }
+        $restoreKeys += "$prefix-"
+        "key=$exactKey" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        "restore-keys<<EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        ($restoreKeys -join "`n") | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        "EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        Write-Host "Cache key: $exactKey"
+
+    # ── Auto-detect compression method ────────────────────────────────
+    - name: Resolve compression method
+      id: resolve-compression
+      shell: bash
+      run: |
+        INPUT="${{ inputs.custom-compression }}"
+        if [ -z "$INPUT" ]; then
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "method=vhdx" >> "$GITHUB_OUTPUT"
+          else
+            echo "method=btrfs" >> "$GITHUB_OUTPUT"
+          fi
+        else
+          echo "method=$INPUT" >> "$GITHUB_OUTPUT"
+        fi
+
+    # ── Restore workspace cache ───────────────────────────────────────
     - name: Restore workspace cache
       id: workspace-cache
       uses: caseware/runs-on-cache@add-btrfs-lz4
       with:
         path: .
-        key: ${{ steps.ws-cache-key.outputs.key }}
-        restore-keys: ${{ steps.ws-cache-key.outputs.restore-keys }}
-        custom-compression: btrfs
+        key: ${{ steps.ws-cache-key-linux.outputs.key || steps.ws-cache-key-windows.outputs.key }}
+        restore-keys: ${{ steps.ws-cache-key-linux.outputs.restore-keys || steps.ws-cache-key-windows.outputs.restore-keys }}
+        custom-compression: ${{ steps.resolve-compression.outputs.method }}
         mount-mode: rw
         fs-size: 50G
         force-save: ${{ inputs.force-save }}
