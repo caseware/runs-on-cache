@@ -161,6 +161,7 @@ runs:
         fail-on-save-error: ${{ inputs.fail-on-save-error }}
 
     - name: Pre-start NX daemon
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         if [ -d ".nx/workspace-data" ] && [ -d "node_modules/.bin" ]; then
