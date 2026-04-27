@@ -296,13 +296,34 @@ export class BtrfsContainer extends Container {
         this.image.setImageFile(imageFile);
 
         await this.cleanStaleMounts();
-        await this.image.mountRO(this.mountPoint);
+
+        // For shared node-local WORM files, another runner on the same node
+        // may already have a loop device + mount. Creating a second loop device
+        // triggers BTRFS UUID collision (exit 32). Reuse the existing mount
+        // via bind mount instead.
+        const existingMount = await this.findExistingBtrfsMount(imageFile);
+        if (existingMount) {
+            this.logInfo(
+                `Bind-mounting from existing mount: ${existingMount} → ${this.mountPoint}`
+            );
+            await fs.mkdir(this.mountPoint, { recursive: true });
+            await exec.exec(
+                "sudo",
+                ["mount", "--bind", existingMount, this.mountPoint],
+                { cwd: this.safeCwd, silent: !core.isDebug() }
+            );
+            this.mountIsReadOnly = true;
+        } else {
+            await this.image.mountRO(this.mountPoint);
+        }
 
         try {
             await this.bindMountPaths(true);
         } catch (error) {
             await this.image.umountSafe(this.mountPoint);
-            await this.image.cleanupLoopDevices(imageFile);
+            if (!existingMount) {
+                await this.image.cleanupLoopDevices(imageFile);
+            }
             this.mountPoint = undefined;
             throw error;
         }
@@ -554,6 +575,46 @@ export class BtrfsContainer extends Container {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────
+
+    /**
+     * Find an existing BTRFS mount for the given image file.
+     * Another runner on the same node may have already attached a loop device
+     * and mounted it. Returns the mount point path, or null if not mounted.
+     */
+    private async findExistingBtrfsMount(
+        imageFile: string
+    ): Promise<string | null> {
+        try {
+            // 1. Find loop device(s) attached to this file
+            const losetupOut = await exec.getExecOutput(
+                "losetup",
+                ["-j", imageFile],
+                { cwd: this.safeCwd, silent: true, ignoreReturnCode: true }
+            );
+            if (losetupOut.exitCode !== 0 || !losetupOut.stdout.trim())
+                return null;
+
+            // Parse: "/dev/loop5: 7:0 (/opt/.../file.btrfs)"
+            const match = losetupOut.stdout.match(/^(\/dev\/loop\d+):/m);
+            if (!match) return null;
+
+            const loopDev = match[1];
+
+            // 2. Find mount point for this loop device
+            const findmntOut = await exec.getExecOutput(
+                "findmnt",
+                ["-n", "-o", "TARGET", loopDev],
+                { cwd: this.safeCwd, silent: true, ignoreReturnCode: true }
+            );
+            const mountTarget = findmntOut.stdout.trim();
+            if (findmntOut.exitCode !== 0 || !mountTarget) return null;
+
+            // Return only the first mount point (there could be bind mounts)
+            return mountTarget.split("\n")[0].trim();
+        } catch {
+            return null;
+        }
+    }
 
     /**
      * Check if the container file is inside the node-local WORM cache dir.
