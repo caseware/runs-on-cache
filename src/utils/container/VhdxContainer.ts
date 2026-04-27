@@ -5,7 +5,6 @@ import * as path from "path";
 
 import { createCacheKeySpecificTempDirectory } from "../actionUtils";
 import { Container, ContainerOptions } from "./Container";
-import { NodeLocalCache } from "./NodeLocalCache";
 
 const MOUNT_TIMEOUT_MS = 60_000;
 const MIN_DISK_HEADROOM_MB = 1024;
@@ -27,8 +26,6 @@ export class VhdxContainer extends Container {
     private mountDriveLetter: string | undefined;
     private fsSize: string;
     private bufferBytes: number;
-    private readonly nodeLocal: NodeLocalCache;
-    private restoredFromNodeLocal = false;
 
     constructor(
         containerFile: string,
@@ -55,11 +52,6 @@ export class VhdxContainer extends Container {
 
         this.fsSize = options.fsSize;
         this.bufferBytes = (options.bufferMb ?? 512) * 1024 * 1024;
-        this.nodeLocal = new NodeLocalCache(
-            options.nodeLocalCacheDir || "",
-            cacheKey,
-            ".vhdx"
-        );
 
         // Security: validate paths
         this.checkPathTraversal(this.baseDir, this.containerFile);
@@ -73,6 +65,10 @@ export class VhdxContainer extends Container {
                 `Invalid filesystem size format: ${this.fsSize}. Must be a number followed by optional K, M, G, or T.`
             );
         }
+    }
+
+    protected nodeLocalExtension(): string {
+        return ".vhdx";
     }
 
     isSupportedMethod(method?: string): boolean {
@@ -134,26 +130,6 @@ export class VhdxContainer extends Container {
             );
             return false;
         }
-    }
-
-    shouldSkipS3Upload(): boolean {
-        return this.restoredFromNodeLocal;
-    }
-
-    async getNodeLocalDownloadPath(): Promise<string | null> {
-        return this.nodeLocal.getDownloadPath();
-    }
-
-    async commitNodeLocalDownload(tempPath: string): Promise<boolean> {
-        return this.nodeLocal.commitTempFile(tempPath);
-    }
-
-    getNodeLocalFinalPath(): string | null {
-        return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
-    }
-
-    isNodeLocalEnabled(): boolean {
-        return this.nodeLocal.enabled;
     }
 
     protected getLogPrefix(): string {

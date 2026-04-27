@@ -1,4 +1,5 @@
 import * as core from "@actions/core";
+import { NodeLocalCache } from "./NodeLocalCache";
 
 export interface ContainerOptions {
     fsSize?: string;
@@ -9,6 +10,14 @@ export interface ContainerOptions {
 }
 
 export abstract class Container {
+    /**
+     * Node-local cache instance — shared across all container types (E).
+     * Subclasses that need it set nodeLocalExtension in their constructor;
+     * the base class creates the NodeLocalCache from options.
+     */
+    protected readonly nodeLocal: NodeLocalCache;
+    protected restoredFromNodeLocal = false;
+
     constructor(
         protected containerFile: string,
         protected readonly compressionMethod: string,
@@ -17,7 +26,17 @@ export abstract class Container {
         protected readonly pathsToCache: string[],
         protected readonly cacheKey: string,
         protected readonly options: ContainerOptions = {}
-    ) {}
+    ) {
+        // Subclasses override nodeLocalExtension() before calling super()
+        // isn't possible, so we provide a default. Subclasses that need
+        // a different extension can re-create nodeLocal in their constructor.
+        this.nodeLocal = new NodeLocalCache(
+            options.nodeLocalCacheDir || "",
+            cacheKey,
+            this.nodeLocalExtension()
+        );
+    }
+
     abstract requiresCreateEmptyCache: boolean;
     abstract requiresKeepArchive: boolean;
 
@@ -31,63 +50,80 @@ export abstract class Container {
     async createEmptyCache(): Promise<void> {}
 
     /**
+     * File extension for node-local cache files.
+     * Override in subclasses for different archive types.
+     */
+    protected nodeLocalExtension(): string {
+        return ".tar";
+    }
+
+    // ── Node-local methods (E: shared implementation) ────────────────
+
+    /**
      * Try to restore from a node-local persistent cache.
-     * Returns true if restored from node-local, false if S3 download is needed.
-     * Default implementation returns false (no node-local support).
+     * Default implementation: find exact/partial match, point containerFile, call restore().
+     * BtrfsContainer overrides this with mount-based logic.
      */
-    async tryRestoreFromNodeLocal(_restoreKeys?: string[]): Promise<boolean> {
-        return false;
+    async tryRestoreFromNodeLocal(restoreKeys?: string[]): Promise<boolean> {
+        if (!this.nodeLocal.enabled) return false;
+
+        const localExists = await this.nodeLocal.exists();
+        let localPath: string | null = localExists
+            ? this.nodeLocal.localPath
+            : null;
+
+        if (!localPath && restoreKeys && restoreKeys.length > 0) {
+            localPath = await this.nodeLocal.findClosestMatch(restoreKeys);
+            if (localPath) {
+                this.logInfo(`Node-local partial hit — using ${localPath}`);
+            }
+        }
+
+        if (!localPath) return false;
+
+        this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
+
+        try {
+            this.containerFile = localPath;
+            await this.restore();
+            this.restoredFromNodeLocal = true;
+            return true;
+        } catch (error) {
+            core.warning(
+                `${this.getLogPrefix()} Node-local restore failed, falling back to S3: ${
+                    error instanceof Error ? error.message : error
+                }`
+            );
+            return false;
+        }
     }
 
-    /**
-     * Whether the S3 upload should be skipped (e.g., restored from node-local read-only).
-     */
     shouldSkipS3Upload(): boolean {
-        return false;
+        return this.restoredFromNodeLocal;
     }
 
-    /**
-     * Get the path where S3 should download the archive to.
-     * When node-local caching is enabled, returns a .tempXXX path in the HostPath dir
-     * so the download goes directly there (no copy).
-     * Returns null when node-local is disabled (caller uses default temp dir).
-     */
     async getNodeLocalDownloadPath(): Promise<string | null> {
-        return null;
+        return this.nodeLocal.getDownloadPath();
     }
 
-    /**
-     * Commit a node-local download: atomic mv from .tempXXX to final path.
-     * Called after S3 download completes when the download went to a node-local temp path.
-     * Returns true if committed, false if another runner beat us.
-     */
     async commitNodeLocalDownload(tempPath: string): Promise<boolean> {
-        return false;
+        return this.nodeLocal.commitTempFile(tempPath);
     }
 
-    /**
-     * The final committed path for this cache key on the node.
-     * Returns null when node-local is disabled.
-     */
     getNodeLocalFinalPath(): string | null {
-        return null;
+        return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
     }
 
-    /**
-     * Whether node-local caching is enabled for this container.
-     */
     isNodeLocalEnabled(): boolean {
-        return false;
+        return this.nodeLocal.enabled;
     }
 
-    /**
-     * Update the archive file path (e.g., when S3 download goes to a different location).
-     */
+    // ── Common helpers ───────────────────────────────────────────────
+
     setArchivePath(archivePath: string): void {
         this.containerFile = archivePath;
     }
 
-    // Common helper methods for all container implementations
     protected wrapError(operation: string, error: unknown): Error {
         return new Error(
             `Failed to ${operation}: ${
@@ -111,7 +147,6 @@ export abstract class Container {
         return new Error(`${logPrefix} ${message}`);
     }
 
-    // Default log prefix - subclasses can override
     protected getLogPrefix(): string {
         return "[CONTAINER]";
     }

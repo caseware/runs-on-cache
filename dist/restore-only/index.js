@@ -96529,6 +96529,15 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.BtrfsContainer = void 0;
+/**
+ * BtrfsContainer — thin orchestrator for BTRFS-backed cache entries.
+ *
+ * Delegates image lifecycle (create/mount/unmount/resize/verify) to BtrfsImage.
+ * Owns bind-mount logic (workspace ↔ BTRFS image paths) and node-local caching.
+ *
+ * Split rationale (A): BtrfsImage is a pure filesystem primitive; BtrfsContainer
+ * adds the cache-action-specific orchestration (bind mounts, node-local, key tracking).
+ */
 const core = __importStar(__nccwpck_require__(2186));
 const exec = __importStar(__nccwpck_require__(1514));
 const fs = __importStar(__nccwpck_require__(3977));
@@ -96536,75 +96545,61 @@ const os = __importStar(__nccwpck_require__(612));
 const path = __importStar(__nccwpck_require__(9411));
 const actionUtils_1 = __nccwpck_require__(6850);
 const Container_1 = __nccwpck_require__(9620);
-const NodeLocalCache_1 = __nccwpck_require__(8033);
-const MOUNT_TIMEOUT_MS = 30000;
-const MIN_DISK_HEADROOM_MB = 1024;
+const BtrfsImage_1 = __nccwpck_require__(7517);
 class BtrfsContainer extends Container_1.Container {
     constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
         var _a;
         if (!compressionLevel) {
-            // Default to zstd default with compression level 3.
             compressionLevel = "zstd:3";
         }
         super(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options);
         this.requiresCreateEmptyCache = true;
         this.requiresKeepArchive = true;
-        /**
-         * Tracks whether restore used a node-local image (skip S3 upload on save).
-         */
-        this.restoredFromNodeLocal = false;
-        /**
-         * Set to true if save verification fails — prevents uploading an unmountable image.
-         */
+        /** Set to true if save verification fails. */
         this.saveAborted = false;
-        /**
-         * Detected at discoverMountInfo() time — true if the current BTRFS mount is read-only.
-         */
+        /** True if the current BTRFS mount is read-only. */
         this.mountIsReadOnly = false;
-        /** Per-run temp dir used as CWD for all exec calls (prevents stray root-owned dirs in workspace). */
+        /** Per-run temp dir used as CWD for all exec calls. */
         this.safeCwd = "";
         if (!options.fsSize) {
             throw new Error("fsSize option is required for BtrfsContainer");
         }
         this.fsSize = options.fsSize;
-        this.bufferBytes = ((_a = options.bufferMb) !== null && _a !== void 0 ? _a : 256) * 1024 * 1024; // Convert MB to bytes
-        // Use higher compression for save (upload) to minimize image size.
-        // Restore decompresses on-demand, so higher save compression = smaller image + same read perf.
-        this.saveCompressionLevel = options.saveCompressionLevel || "zstd:3";
         this.mountMode = options.mountMode || "rw";
-        this.nodeLocal = new NodeLocalCache_1.NodeLocalCache(options.nodeLocalCacheDir || "", cacheKey, ".btrfs");
-        // Security input validations
+        // Input validation
+        (0, BtrfsImage_1.validateFsSize)(this.fsSize);
+        if (this.compressionLevel) {
+            (0, BtrfsImage_1.validateCompressionLevel)(this.compressionLevel);
+        }
+        const saveCompLevel = options.saveCompressionLevel || "zstd:3";
+        (0, BtrfsImage_1.validateCompressionLevel)(saveCompLevel);
         this.checkPathTraversal(this.baseDir, this.containerFile);
-        this.pathsToCache.forEach(pathToCheck => this.checkPathTraversal(this.baseDir, pathToCheck));
-        // Validate fsSize format to prevent command injection
-        if (!/^[0-9]+[KMGT]?$/.test(this.fsSize)) {
-            throw new Error(`Invalid filesystem size format: ${this.fsSize}. Must be a number followed by optional K, M, G, or T.`);
-        }
-        // Validate compression level
-        const compressionRegex = /^(zlib(?:[:][1-9])?|lzo|zstd(?::-?(?:[0-9]|1[0-5]))?)$/;
-        if (this.compressionLevel && !compressionRegex.test(this.compressionLevel)) {
-            throw new Error(`Invalid compression level format: ${this.compressionLevel}. Must be 'zlib:<level>' where <level> is between 1 and 9, lzo, or zstd:<level> where <level> is between -15 and 15.`);
-        }
-        if (!compressionRegex.test(this.saveCompressionLevel)) {
-            throw new Error(`Invalid save compression level format: ${this.saveCompressionLevel}. Must be 'zlib:<level>', lzo, or zstd:<level>.`);
-        }
+        this.pathsToCache.forEach(p => this.checkPathTraversal(this.baseDir, p));
+        // BtrfsImage handles all image-level operations (A)
+        this.image = new BtrfsImage_1.BtrfsImage(containerFile, {
+            compressionLevel: this.compressionLevel,
+            saveCompressionLevel: saveCompLevel,
+            bufferBytes: ((_a = options.bufferMb) !== null && _a !== void 0 ? _a : 256) * 1024 * 1024,
+            safeCwd: "" // set in initialize()
+        });
+    }
+    nodeLocalExtension() {
+        return ".btrfs";
     }
     isSupportedMethod(method) {
         return ((method === null || method === void 0 ? void 0 : method.split("-")[0]) || method) === "btrfs";
     }
     initialize() {
         return __awaiter(this, void 0, void 0, function* () {
-            // Create a per-run temp directory for sudo operations CWD.
-            // Prevents mount/mkfs/losetup from creating stray root-owned dirs in the workspace.
             this.safeCwd = yield fs.mkdtemp(path.join(os.tmpdir(), "btrfs-"));
+            this.image.setSafeCwd(this.safeCwd);
             try {
-                yield this.checkPrerequisites();
+                yield this.image.checkPrerequisites();
             }
             catch (e) {
                 core.setFailed(e.message);
                 process.exit(1);
             }
-            // Clean up stale temp files — non-fatal if it fails (e.g., EACCES on HostPath dir)
             try {
                 yield this.nodeLocal.cleanupStaleTempFiles();
             }
@@ -96613,20 +96608,15 @@ class BtrfsContainer extends Container_1.Container {
             }
         });
     }
-    // Override the log prefix for BTRFS-specific logging
     getLogPrefix() {
         return "[BTRFS]";
     }
     // ── Node-local restore (hot path) ────────────────────────────────
-    /**
-     * Check if a node-local BTRFS image exists for this cache key.
-     * This is the fast path: mount directly from the node's HostPath volume (~1-2s).
-     */
     tryRestoreFromNodeLocal(restoreKeys) {
         return __awaiter(this, void 0, void 0, function* () {
             if (!this.nodeLocal.enabled)
                 return false;
-            // 1. Try exact key match first (fastest path)
+            // 1. Exact key match (fastest path)
             const localExists = yield this.nodeLocal.exists();
             if (localExists) {
                 const localPath = this.nodeLocal.localPath;
@@ -96636,7 +96626,7 @@ class BtrfsContainer extends Container_1.Container {
                         yield this.copyAndMountReadWrite(localPath);
                     }
                     else {
-                        yield this.mountReadOnly(localPath);
+                        yield this.mountImageReadOnly(localPath);
                     }
                     this.restoredFromNodeLocal = true;
                     return true;
@@ -96646,12 +96636,11 @@ class BtrfsContainer extends Container_1.Container {
                     return false;
                 }
             }
-            // 2. Try partial match: find closest cache key on this node
+            // 2. Partial match
             if (restoreKeys && restoreKeys.length > 0) {
                 const closestMatch = yield this.nodeLocal.findClosestMatch(restoreKeys);
                 if (closestMatch) {
                     try {
-                        // Standard augmentation mode: copy old, mount RW, yarn augments delta
                         this.logInfo(`Node-local partial hit — copying ${path.basename(closestMatch)} for RW augmentation`);
                         yield this.copyAndMountReadWrite(closestMatch);
                         this.restoredFromNodeLocal = true;
@@ -96666,69 +96655,20 @@ class BtrfsContainer extends Container_1.Container {
             return false;
         });
     }
-    /**
-     * Mount a BTRFS image read-only and bind-mount paths to the workspace.
-     * Used for node_modules and other immutable caches.
-     */
-    mountReadOnly(imageFile) {
-        return __awaiter(this, void 0, void 0, function* () {
-            const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
-            this.mountPoint = path.join(tempDir, "mount");
-            yield this.cleanStaleMounts();
-            yield fs.mkdir(this.mountPoint, { recursive: true });
-            this.logInfo(`Mounting read-only: ${imageFile} → ${this.mountPoint}`);
-            yield this.mountWithErrorHandling(imageFile, this.mountPoint, ["loop", "ro", `compress=${this.compressionLevel}`]);
-            try {
-                // Bind-mount each path read-only to the workspace
-                yield this.bindMountPaths(true);
-            }
-            catch (error) {
-                // If bind-mount fails, unmount the BTRFS image to avoid a dangling RO mount
-                // that would confuse the save step's discoverMountInfo()
-                yield this.umountWithErrorHandling(this.mountPoint);
-                yield this.cleanupLoopDevices(imageFile);
-                this.mountPoint = undefined;
-                throw error;
-            }
-            yield this.checkFilesystemHealth();
-        });
-    }
-    /**
-     * Copy the BTRFS image to a job-local temp directory, then mount read-write.
-     * Used for mutable caches (e.g., sparse git repos).
-     */
-    copyAndMountReadWrite(imageFile) {
-        return __awaiter(this, void 0, void 0, function* () {
-            const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
-            const localCopy = path.join(tempDir, "cache.btrfs");
-            this.logInfo(`Copying for RW mount: ${imageFile} → ${localCopy}`);
-            yield fs.copyFile(imageFile, localCopy);
-            // Randomize the BTRFS UUID on the copy so the kernel doesn't reject it
-            // as a duplicate of the node-local original that's still on disk.
-            this.logInfo("Randomizing BTRFS UUID on copy");
-            yield this.execSudo("btrfstune", ["-f", "-u", localCopy]);
-            // Update containerFile to the local copy so save() operates on the right file
-            this.containerFile = localCopy;
-            yield this.mount();
-        });
-    }
     // ── Standard restore (S3 download path) ──────────────────────────
     restore() {
         return __awaiter(this, void 0, void 0, function* () {
             try {
                 if (this.mountMode === "ro") {
-                    // Mount the downloaded image read-only
-                    yield this.mountReadOnly(this.containerFile);
+                    yield this.mountImageReadOnly(this.containerFile);
                 }
                 else {
-                    // Standard read-write mount
-                    yield this.mount();
-                    yield this.checkFilesystemHealth();
+                    yield this.mountImageReadWrite();
+                    yield this.image.checkHealth(this.mountPoint);
                 }
             }
             catch (error) {
-                // Clean up any leaked loop devices
-                yield this.cleanupLoopDevices(this.containerFile);
+                yield this.image.cleanupLoopDevices(this.containerFile);
                 throw this.wrapError("restore BTRFS cache", error);
             }
         });
@@ -96736,39 +96676,21 @@ class BtrfsContainer extends Container_1.Container {
     createEmptyCache() {
         return __awaiter(this, void 0, void 0, function* () {
             try {
-                // Calculate optimal sparse file size based on available disk space
-                const effectiveSize = yield this.calculateSparseSize();
-                // Create new empty cache image
-                this.logInfo(`Creating sparse image: ${this.containerFile} (virtual size: ${effectiveSize})`);
-                yield exec.exec("truncate", [
-                    "-s",
-                    effectiveSize,
-                    this.containerFile
-                ], { cwd: this.safeCwd });
-                // Format with BTRFS
-                this.logInfo(`Formatting image with BTRFS`);
-                yield exec.exec("mkfs.btrfs", ["-f", this.containerFile], {
-                    cwd: this.safeCwd,
-                    silent: !core.isDebug()
-                });
-                // Mount the filesystem so workspace operations write directly to it
-                return this.mount();
+                yield this.image.createSparseImage(this.fsSize);
+                return this.mountImageReadWrite();
             }
             catch (error) {
-                // Clean up loop devices on failure
-                yield this.cleanupLoopDevices(this.containerFile);
+                yield this.image.cleanupLoopDevices(this.containerFile);
                 throw this.wrapError("create empty BTRFS cache", error);
             }
         });
     }
     save() {
         return __awaiter(this, void 0, void 0, function* () {
-            // Discover all mount information once
             try {
                 yield this.discoverMountInfo();
             }
             catch (_a) {
-                // No BTRFS mount found — restore likely failed, nothing to save
                 this.logInfo("No BTRFS mount found — skipping save");
                 return;
             }
@@ -96776,109 +96698,214 @@ class BtrfsContainer extends Container_1.Container {
                 this.logInfo("Mount point not discovered — skipping save");
                 return;
             }
-            // Read-only mount means nothing changed — skip save
             if (this.mountIsReadOnly) {
                 this.logInfo("Skipping save — mount is read-only, nothing to persist");
                 return;
             }
-            // Remount with higher compression before defrag so rewritten blocks use save-level compression.
-            // btrfs defrag -c only sets the algorithm (zstd/lzo/zlib), not the level.
-            // The actual compression level comes from the mount option, so we remount with compress-force=<saveLevel>.
-            const defragAlgo = this.saveCompressionLevel.split(":")[0];
-            this.logInfo(`Remounting with compress-force=${this.saveCompressionLevel} before defrag`);
-            try {
-                yield exec.exec("sudo", ["mount", "-o", `remount,compress-force=${this.saveCompressionLevel}`, this.mountPoint], { cwd: this.safeCwd });
+            // Defrag + resize + truncate
+            yield this.image.prepareSave(this.mountPoint);
+            // Unmount all bind mounts + main mount
+            yield this.unmountAll();
+            // Verify image is mountable before upload
+            const ok = yield this.image.verifyMountable();
+            if (!ok) {
+                this.saveAborted = true;
             }
-            catch (remountError) {
-                core.warning(`Remount with save compression failed, defrag will use mount-time level: ${remountError instanceof Error ? remountError.message : remountError}`);
-            }
-            this.logInfo(`Defragmenting + recompressing with ${defragAlgo} (save-compression-level: ${this.saveCompressionLevel})`);
-            try {
-                yield exec.exec("sudo", ["btrfs", "filesystem", "defragment", "-r", `-c${defragAlgo}`, this.mountPoint], { cwd: this.safeCwd });
-            }
-            catch (defragError) {
-                core.warning(`Defrag failed (image will upload at mount-time compression): ${defragError instanceof Error ? defragError.message : defragError}`);
-            }
-            this.logDebug(`Syncing and calculating used space`);
-            yield exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
-            // Get used space and resize filesystem — resize is best-effort
-            let usedBytes = 0;
-            let fsResizeSucceeded = false;
-            try {
-                const usageOutput = yield this.getBtrfsUsage();
-                usedBytes = this.parseUsedBytes(usageOutput);
-            }
-            catch (error) {
-                core.warning(`Could not determine exact usage, using default buffer: ${error}`);
-                usedBytes = 512 * 1024 * 1024; // 512MB default
-            }
-            const targetSize = usedBytes + this.bufferBytes;
-            const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024))); // Ensure minimum 1MB
-            this.logInfo(`Resize target: ${targetMb} MB (effective usage: ${Math.ceil(usedBytes / (1024 * 1024))} MB + ${Math.ceil(this.bufferBytes / (1024 * 1024))} MB buffer)`);
-            try {
-                yield exec.exec("sudo", ["btrfs", "filesystem", "resize", `${targetMb}M`, this.mountPoint], { cwd: this.safeCwd, silent: !core.isDebug() });
-                fsResizeSucceeded = true;
-            }
-            catch (resizeError) {
-                core.warning(`Filesystem resize failed (will upload at original size): ${resizeError instanceof Error ? resizeError.message : resizeError}`);
-            }
-            // Ensure all changes are written to disk before unmounting
-            yield exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
-            // Unmount filesystem - the containerFile now points to the actual file with all data
-            yield this.unmount();
-            // Only truncate the backing file if the BTRFS filesystem resize succeeded.
-            // If resize failed, the superblock still claims the original size (e.g. 256MB).
-            // Truncating to a smaller size would make the file smaller than the superblock
-            // expects, causing "device total_bytes should be at most X but found Y" on
-            // the next mount attempt (EINVAL / exit code 32).
-            if (fsResizeSucceeded) {
-                this.logDebug(`Resizing backing file to ${targetMb} MB`);
-                try {
-                    yield exec.exec("truncate", ["-s", `${targetMb}M`, this.containerFile], { cwd: this.safeCwd });
-                }
-                catch (truncateError) {
-                    core.warning(`Backing file truncate failed (will upload at original size): ${truncateError instanceof Error ? truncateError.message : truncateError}`);
-                }
-            }
-            else {
-                this.logInfo("Skipping backing file truncation — filesystem resize did not succeed");
-            }
-            yield exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
-            // Verification mount: prove the image is mountable before uploading to S3.
-            // Never push an unmountable image — that would poison every future restore.
-            yield this.verifyImageMountable(this.containerFile);
             this.logDebug(`Save completed. Container file ready for upload: ${this.containerFile}`);
         });
     }
-    /**
-     * Whether the S3 upload should be skipped because the node already has the image
-     * or because the save verification failed (never push an unmountable image).
-     */
     shouldSkipS3Upload() {
         return this.mountIsReadOnly || this.saveAborted;
     }
-    getNodeLocalDownloadPath() {
+    // ── Private: mount orchestration ─────────────────────────────────
+    mountImageReadOnly(imageFile) {
         return __awaiter(this, void 0, void 0, function* () {
-            return this.nodeLocal.getDownloadPath();
+            const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
+            this.mountPoint = path.join(tempDir, "mount");
+            yield this.cleanStaleMounts();
+            yield this.image.mountRO(this.mountPoint);
+            try {
+                yield this.bindMountPaths(true);
+            }
+            catch (error) {
+                yield this.image.umountSafe(this.mountPoint);
+                yield this.image.cleanupLoopDevices(imageFile);
+                this.mountPoint = undefined;
+                throw error;
+            }
+            yield this.image.checkHealth(this.mountPoint);
         });
     }
-    commitNodeLocalDownload(tempPath) {
+    mountImageReadWrite() {
         return __awaiter(this, void 0, void 0, function* () {
-            return this.nodeLocal.commitTempFile(tempPath);
+            try {
+                const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
+                this.mountPoint = path.join(tempDir, "mount");
+                yield this.cleanStaleMounts();
+                yield this.image.mountRW(this.mountPoint);
+                yield this.bindMountPaths(false);
+            }
+            catch (error) {
+                yield this.image.cleanupLoopDevices(this.containerFile);
+                throw new Error(`Failed to mount BTRFS filesystem: ${error instanceof Error ? error.message : error}`);
+            }
         });
     }
-    getNodeLocalFinalPath() {
-        return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
-    }
-    isNodeLocalEnabled() {
-        return this.nodeLocal.enabled;
-    }
-    // ── Previous-version mount (git alternates pattern) ──────────────
-    // ── Private helpers ──────────────────────────────────────────────
-    execWithOutput(command, args) {
+    copyAndMountReadWrite(imageFile) {
         return __awaiter(this, void 0, void 0, function* () {
+            const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
+            const localCopy = path.join(tempDir, "cache.btrfs");
+            this.logInfo(`Copying for RW mount: ${imageFile} → ${localCopy}`);
+            yield fs.copyFile(imageFile, localCopy);
+            // Randomize UUID so kernel doesn't reject duplicate of node-local original
+            yield this.image.randomizeUuid();
+            this.containerFile = localCopy;
+            this.image.setImageFile(localCopy);
+            yield this.mountImageReadWrite();
+        });
+    }
+    // ── Bind mounts ──────────────────────────────────────────────────
+    bindMountPaths(readOnly) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const promises = this.pathsToCache.map((p) => __awaiter(this, void 0, void 0, function* () {
+                if (!this.mountPoint) {
+                    throw new Error("Mount point is not set");
+                }
+                // For absolute paths, use directly as workspace target.
+                // path.join(mountPoint, p) strips leading '/' and nests inside mount.
+                const absPath = path.isAbsolute(p)
+                    ? p
+                    : path.join(this.baseDir, p);
+                const btrfsPath = path.join(this.mountPoint, p);
+                core.debug(`[BTRFS] Bind-mounting ${btrfsPath} → ${absPath}${readOnly ? " (ro)" : ""}`);
+                try {
+                    if (readOnly) {
+                        // RO: source must exist in image; only create workspace target
+                        try {
+                            yield exec.exec("test", ["-d", btrfsPath], {
+                                cwd: this.safeCwd,
+                                ignoreReturnCode: false,
+                                silent: !core.isDebug()
+                            });
+                        }
+                        catch (_a) {
+                            throw new Error(`Source path ${btrfsPath} does not exist in BTRFS image`);
+                        }
+                        yield this.execSudo("mkdir", ["-p", absPath]);
+                        yield this.execSudo("chown", [
+                            "--reference",
+                            path.dirname(absPath),
+                            absPath
+                        ]);
+                    }
+                    else {
+                        // RW: create directories on both sides
+                        yield Promise.all([
+                            this.execSudo("mkdir", ["-p", btrfsPath]),
+                            this.execSudo("mkdir", ["-p", absPath])
+                        ]);
+                        yield Promise.all([
+                            this.execSudo("chown", [
+                                "--reference",
+                                path.dirname(absPath),
+                                absPath
+                            ]),
+                            this.execSudo("chown", [
+                                "--reference",
+                                this.baseDir,
+                                btrfsPath
+                            ])
+                        ]);
+                    }
+                    // Bind mount
+                    yield exec.exec("sudo", ["mount", "-o", "bind", btrfsPath, absPath], { cwd: this.safeCwd, silent: !core.isDebug() });
+                    // Remount read-only if requested
+                    if (readOnly) {
+                        yield exec.exec("sudo", [
+                            "mount",
+                            "-o",
+                            "bind,remount,ro",
+                            btrfsPath,
+                            absPath
+                        ], { cwd: this.safeCwd, silent: !core.isDebug() });
+                    }
+                }
+                catch (error) {
+                    throw new Error(`Failed to bind-mount ${btrfsPath} to ${absPath}: ${error instanceof Error ? error.message : error}`);
+                }
+            }));
+            yield Promise.all(promises);
+        });
+    }
+    // ── Unmount ──────────────────────────────────────────────────────
+    unmountAll() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.mountPoint) {
+                throw new Error("Mount point is not set");
+            }
+            // Unmount bind mounts first
+            for (const p of this.pathsToCache) {
+                const absPath = path.isAbsolute(p)
+                    ? p
+                    : path.join(this.baseDir, p);
+                try {
+                    const rc = yield exec.exec("mountpoint", [absPath], {
+                        cwd: this.safeCwd,
+                        ignoreReturnCode: true,
+                        silent: !core.isDebug()
+                    });
+                    if (rc === 0) {
+                        core.debug(`[BTRFS] Unmounting bind mount: ${absPath}`);
+                        yield this.image.umountSafe(absPath);
+                    }
+                }
+                catch (error) {
+                    core.debug(`Failed to unmount bind mount ${absPath}: ${error}`);
+                }
+            }
+            // Then unmount main filesystem + detach loop
+            yield this.image.unmount(this.mountPoint);
+        });
+    }
+    cleanStaleMounts() {
+        return __awaiter(this, void 0, void 0, function* () {
+            for (const p of this.pathsToCache) {
+                const absPath = path.isAbsolute(p)
+                    ? p
+                    : path.join(this.baseDir, p);
+                yield this.unmountIfMounted(absPath);
+            }
+            if (this.mountPoint) {
+                yield this.unmountIfMounted(this.mountPoint);
+            }
+        });
+    }
+    unmountIfMounted(targetPath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const rc = yield exec.exec("mountpoint", ["-q", targetPath], {
+                    cwd: this.safeCwd,
+                    ignoreReturnCode: true,
+                    silent: true
+                });
+                if (rc === 0) {
+                    core.warning(`${this.getLogPrefix()} Stale mount detected at ${targetPath}, unmounting...`);
+                    yield this.image.umountSafe(targetPath);
+                }
+            }
+            catch (_a) {
+                // targetPath doesn't exist or mountpoint check failed
+            }
+        });
+    }
+    // ── Discovery ────────────────────────────────────────────────────
+    discoverMountInfo() {
+        return __awaiter(this, void 0, void 0, function* () {
+            const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
+            const expectedMountPoint = path.join(tempDir, "mount");
+            this.logDebug(`Looking for BTRFS mount at: ${expectedMountPoint}`);
             let output = "";
-            yield exec.exec(command, args, {
+            yield exec.exec("findmnt", ["-t", "btrfs", "-n", "-o", "TARGET,SOURCE,OPTIONS"], {
                 cwd: this.safeCwd,
                 listeners: {
                     stdout: (data) => {
@@ -96887,138 +96914,30 @@ class BtrfsContainer extends Container_1.Container {
                 },
                 silent: !core.isDebug()
             });
-            return output.trim();
-        });
-    }
-    /**
-     * Mount a device/image at mountPath.
-     * When options include "loop", uses explicit losetup instead of mount -o loop
-     * for reliability on K8s nodes where auto-loop allocation may fail.
-     */
-    mountWithErrorHandling(device, mountPath, options, useSudo = true) {
-        return __awaiter(this, void 0, void 0, function* () {
-            const isLoopMount = options === null || options === void 0 ? void 0 : options.includes("loop");
-            const filteredOptions = (options === null || options === void 0 ? void 0 : options.filter(o => o !== "loop")) || [];
-            let actualDevice = device;
-            try {
-                if (isLoopMount) {
-                    // Explicit losetup: allocate a loop device and attach the image file.
-                    // This is more reliable than mount -o loop on K8s nodes where
-                    // auto-loop allocation can fail with exit code 32.
-                    const loopDev = yield this.setupLoopDevice(device);
-                    actualDevice = loopDev;
-                    this.activeLoopDevice = loopDev;
-                }
-                const mountArgs = [actualDevice, mountPath];
-                if (filteredOptions.length > 0) {
-                    mountArgs.unshift("-o", filteredOptions.join(","));
-                }
-                if (isLoopMount) {
-                    // Specify filesystem type explicitly since we're mounting a loop device
-                    mountArgs.unshift("-t", "btrfs");
-                }
-                const command = useSudo ? "sudo" : "mount";
-                const args = useSudo ? ["mount", ...mountArgs] : mountArgs;
-                yield this.execWithTimeout(() => exec.exec(command, args, { cwd: this.safeCwd, silent: !core.isDebug() }), MOUNT_TIMEOUT_MS, `mount ${actualDevice} at ${mountPath}`);
-            }
-            catch (error) {
-                // Collect diagnostic info to help debug mount failures
-                try {
-                    const diag = [];
-                    const collect = (label, cmd, cmdArgs) => __awaiter(this, void 0, void 0, function* () {
-                        try {
-                            let out = "";
-                            yield exec.exec(cmd, cmdArgs, {
-                                cwd: this.safeCwd,
-                                silent: true,
-                                listeners: { stdout: (d) => { out += d.toString(); } }
-                            });
-                            diag.push(`${label}: ${out.trim()}`);
-                        }
-                        catch (_b) {
-                            diag.push(`${label}: <unavailable>`);
-                        }
-                    });
-                    yield collect("file size", "stat", ["--format=%s", device]);
-                    yield collect("loop devices", "sudo", ["losetup", "-a"]);
-                    // Kernel log — the definitive source for why mount failed
-                    // Use `dmesg -T` (human timestamps) with tail; avoid --time-format which may not exist
-                    yield collect("dmesg (last 40 lines)", "bash", ["-c", "sudo dmesg -T 2>/dev/null | tail -40 || sudo dmesg 2>/dev/null | tail -40 || echo unavailable"]);
-                    // Ensure btrfs-progs is available for diagnostics
-                    if (actualDevice.startsWith("/dev/loop")) {
-                        yield exec.exec("bash", ["-c", "command -v btrfs >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs 2>/dev/null) || true"], { cwd: this.safeCwd, silent: true });
-                        yield collect("btrfs check --readonly", "sudo", ["btrfs", "check", "--readonly", actualDevice]);
-                        yield collect("btrfs superblock (compat flags)", "bash", ["-c", `sudo btrfs inspect-internal dump-super ${actualDevice} 2>&1 | grep -iE 'compat|magic|generation|sectorsize|nodesize|root_level'`]);
-                    }
-                    // Log each diagnostic as a separate warning to avoid GitHub Actions truncation
-                    for (const d of diag) {
-                        core.warning(`[BTRFS] ${d}`);
+            output = output.trim();
+            this.logDebug(`findmnt output:\n${output}`);
+            const lines = output.split("\n");
+            for (const line of lines) {
+                if (line.trim() === "")
+                    continue;
+                const parts = line.trim().split(/\s+/);
+                if (parts.length >= 2) {
+                    const mountPoint = parts[0];
+                    const options = parts.slice(2).join(" ");
+                    if (mountPoint === expectedMountPoint) {
+                        this.logDebug(`Found existing mount: ${parts[1]} → ${mountPoint} (${options})`);
+                        this.mountPoint = mountPoint;
+                        this.mountIsReadOnly = /\bro\b/.test(options);
+                        this.logDebug(`Using containerFile: ${this.containerFile} (readOnly=${this.mountIsReadOnly})`);
+                        return;
                     }
                 }
-                catch ( /* diagnostic collection is best-effort */_a) { /* diagnostic collection is best-effort */ }
-                // On mount failure, clean up any loop device that may have been allocated
-                yield this.cleanupLoopDevices(device);
-                this.activeLoopDevice = undefined;
-                throw this.wrapError(`mount ${actualDevice} at ${mountPath}`, error);
             }
+            throw new Error(`No BTRFS cache filesystem found for cache key ${this.cacheKey}. ` +
+                `Expected mount at: ${expectedMountPoint}.`);
         });
     }
-    /**
-     * Attach a file to a loop device using explicit losetup.
-     * Returns the allocated loop device path (e.g., /dev/loop0).
-     */
-    setupLoopDevice(imageFile) {
-        return __awaiter(this, void 0, void 0, function* () {
-            let loopDev = "";
-            try {
-                yield exec.exec("sudo", ["losetup", "--find", "--show", imageFile], {
-                    cwd: this.safeCwd,
-                    listeners: {
-                        stdout: (data) => { loopDev += data.toString(); }
-                    },
-                    silent: !core.isDebug()
-                });
-            }
-            catch (error) {
-                throw new Error(`Failed to attach ${imageFile} to a loop device. ` +
-                    `Ensure the 'loop' kernel module is loaded and /dev/loop-control exists. ` +
-                    `Error: ${error instanceof Error ? error.message : error}`);
-            }
-            loopDev = loopDev.trim();
-            if (!loopDev.startsWith("/dev/loop")) {
-                throw new Error(`losetup returned unexpected output: "${loopDev}". Expected /dev/loopN.`);
-            }
-            this.logInfo(`Attached ${imageFile} → ${loopDev}`);
-            return loopDev;
-        });
-    }
-    /**
-     * Verify the image file is mountable by doing a read-only losetup + mount + unmount cycle.
-     * If the mount fails, sets saveAborted = true to prevent uploading a broken image.
-     */
-    verifyImageMountable(imageFile) {
-        return __awaiter(this, void 0, void 0, function* () {
-            this.logInfo("Verifying image is mountable before upload...");
-            const verifyDir = `${imageFile}.verify-mount`;
-            try {
-                const loopDev = yield this.setupLoopDevice(imageFile);
-                try {
-                    yield exec.exec("mkdir", ["-p", verifyDir], { cwd: this.safeCwd });
-                    yield exec.exec("sudo", ["mount", "-t", "btrfs", "-o", "ro", loopDev, verifyDir], { cwd: this.safeCwd });
-                    yield exec.exec("sudo", ["umount", verifyDir], { cwd: this.safeCwd });
-                    this.logInfo("Verification mount succeeded — image is safe to upload");
-                }
-                finally {
-                    yield this.cleanupLoopDevices(imageFile);
-                    yield exec.exec("rm", ["-rf", verifyDir], { cwd: this.safeCwd }).catch(() => { });
-                }
-            }
-            catch (verifyError) {
-                core.error(`Verification mount FAILED — aborting S3 upload to prevent poisoning cache: ${verifyError instanceof Error ? verifyError.message : verifyError}`);
-                this.saveAborted = true;
-            }
-        });
-    }
+    // ── Helpers ──────────────────────────────────────────────────────
     execSudo(command, args = []) {
         return __awaiter(this, void 0, void 0, function* () {
             yield exec.exec("sudo", [command, ...args], {
@@ -97027,165 +96946,317 @@ class BtrfsContainer extends Container_1.Container {
             });
         });
     }
-    umountWithErrorHandling(mountPath) {
+    checkPathTraversal(base, pathToCheck) {
+        const absBase = path.resolve(base);
+        const absPathToCheck = path.resolve(path.join(base, pathToCheck));
+        if (!absPathToCheck.startsWith(absBase)) {
+            throw new Error(`Path traversal detected: ${pathToCheck} resolves outside base directory`);
+        }
+    }
+}
+exports.BtrfsContainer = BtrfsContainer;
+
+
+/***/ }),
+
+/***/ 7517:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.validateCompressionLevel = exports.validateFsSize = exports.parseSizeToBytes = exports.BtrfsImage = void 0;
+/**
+ * BtrfsImage — pure BTRFS image lifecycle operations.
+ *
+ * Responsibilities: create sparse image, format, mount/unmount (RO/RW),
+ * defrag, resize, truncate, verify, loop device management.
+ *
+ * Does NOT know about bind mounts, workspace paths, node-local caching,
+ * or cache keys. Those concerns belong to BtrfsContainer (the orchestrator).
+ */
+const core = __importStar(__nccwpck_require__(2186));
+const exec = __importStar(__nccwpck_require__(1514));
+const fs = __importStar(__nccwpck_require__(3977));
+const path = __importStar(__nccwpck_require__(9411));
+const MOUNT_TIMEOUT_MS = 30000;
+const MIN_DISK_HEADROOM_MB = 1024;
+const LOG_PREFIX = "[BTRFS]";
+class BtrfsImage {
+    constructor(imageFile, opts) {
+        this.imageFile = imageFile;
+        this.opts = opts;
+    }
+    /** Update the backing file path (e.g. after copying for RW). */
+    setImageFile(filePath) {
+        this.imageFile = filePath;
+    }
+    getImageFile() {
+        return this.imageFile;
+    }
+    /** Set the safe CWD for exec calls (needed after async mkdtemp in initialize). */
+    setSafeCwd(cwd) {
+        this.opts.safeCwd = cwd;
+    }
+    // ── Create ──────────────────────────────────────────────────────
+    createSparseImage(fsSize) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const effectiveSize = yield this.calculateSparseSize(path.dirname(this.imageFile), fsSize);
+            info(`Creating sparse image: ${this.imageFile} (virtual size: ${effectiveSize})`);
+            yield exec.exec("truncate", ["-s", effectiveSize, this.imageFile], {
+                cwd: this.opts.safeCwd
+            });
+            info("Formatting image with BTRFS");
+            yield exec.exec("mkfs.btrfs", ["-f", this.imageFile], {
+                cwd: this.opts.safeCwd,
+                silent: !core.isDebug()
+            });
+        });
+    }
+    // ── Mount / Unmount ─────────────────────────────────────────────
+    mountRO(mountPoint) {
+        return __awaiter(this, void 0, void 0, function* () {
+            info(`Mounting read-only: ${this.imageFile} → ${mountPoint}`);
+            yield fs.mkdir(mountPoint, { recursive: true });
+            yield this.mountWithErrorHandling(this.imageFile, mountPoint, [
+                "loop",
+                "ro",
+                `compress=${this.opts.compressionLevel}`
+            ]);
+        });
+    }
+    mountRW(mountPoint) {
+        return __awaiter(this, void 0, void 0, function* () {
+            core.debug(`${LOG_PREFIX} Mounting image to ${mountPoint}`);
+            yield fs.mkdir(mountPoint, { recursive: true });
+            yield this.mountWithErrorHandling(this.imageFile, mountPoint, [
+                "loop",
+                "rw",
+                `compress=${this.opts.compressionLevel}`
+            ]);
+        });
+    }
+    unmount(mountPoint) {
         return __awaiter(this, void 0, void 0, function* () {
             try {
-                yield this.execSudo("umount", [mountPath]);
+                yield exec.exec("sync", [], {
+                    cwd: this.opts.safeCwd,
+                    silent: !core.isDebug()
+                });
+                const rc = yield exec.exec("mountpoint", [mountPoint], {
+                    cwd: this.opts.safeCwd,
+                    ignoreReturnCode: true,
+                    silent: !core.isDebug()
+                });
+                if (rc === 0) {
+                    core.debug(`${LOG_PREFIX} Unmounting: ${mountPoint}`);
+                    yield this.umountSafe(mountPoint);
+                }
+                if (this.activeLoopDevice) {
+                    core.debug(`${LOG_PREFIX} Detaching loop device: ${this.activeLoopDevice}`);
+                    try {
+                        yield sudoExec("losetup", ["-d", this.activeLoopDevice], this.opts.safeCwd);
+                    }
+                    catch (_a) {
+                        core.debug(`Failed to detach loop device ${this.activeLoopDevice}`);
+                    }
+                    this.activeLoopDevice = undefined;
+                }
             }
             catch (error) {
-                core.warning(`${this.getLogPrefix()} Failed to umount ${mountPath}: ${error instanceof Error ? error.message : error}`);
+                core.debug(`Cleanup mount failed (non-critical): ${error}`);
+            }
+            try {
+                yield fs.rm(mountPoint, { recursive: true, force: true });
+            }
+            catch (error) {
+                core.debug(`Cleanup mount point failed (non-critical): ${error}`);
             }
         });
     }
-    /**
-     * Execute a promise with a timeout. If the operation exceeds the timeout,
-     * reject with a descriptive error.
-     */
-    execWithTimeout(fn, timeoutMs, description) {
+    umountSafe(target) {
         return __awaiter(this, void 0, void 0, function* () {
-            return new Promise((resolve, reject) => {
-                const timer = setTimeout(() => {
-                    reject(new Error(`${this.getLogPrefix()} Operation timed out after ${timeoutMs}ms: ${description}`));
-                }, timeoutMs);
-                fn().then(result => {
-                    clearTimeout(timer);
-                    resolve(result);
-                }, err => {
-                    clearTimeout(timer);
-                    reject(err);
-                });
+            try {
+                yield sudoExec("umount", [target], this.opts.safeCwd);
+            }
+            catch (error) {
+                core.warning(`${LOG_PREFIX} Failed to umount ${target}: ${error instanceof Error ? error.message : error}`);
+            }
+        });
+    }
+    // ── Save pipeline: defrag → resize → unmount → truncate → verify ──
+    prepareSave(mountPoint) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const defragAlgo = this.opts.saveCompressionLevel.split(":")[0];
+            // Remount with save-level compression before defrag
+            info(`Remounting with compress-force=${this.opts.saveCompressionLevel} before defrag`);
+            try {
+                yield exec.exec("sudo", [
+                    "mount",
+                    "-o",
+                    `remount,compress-force=${this.opts.saveCompressionLevel}`,
+                    mountPoint
+                ], { cwd: this.opts.safeCwd });
+            }
+            catch (e) {
+                core.warning(`Remount with save compression failed: ${e instanceof Error ? e.message : e}`);
+            }
+            // Defrag + recompress
+            info(`Defragmenting + recompressing with ${defragAlgo} (save-compression-level: ${this.opts.saveCompressionLevel})`);
+            try {
+                yield exec.exec("sudo", [
+                    "btrfs",
+                    "filesystem",
+                    "defragment",
+                    "-r",
+                    `-c${defragAlgo}`,
+                    mountPoint
+                ], { cwd: this.opts.safeCwd });
+            }
+            catch (e) {
+                core.warning(`Defrag failed (will upload at mount-time compression): ${e instanceof Error ? e.message : e}`);
+            }
+            yield exec.exec("sync", [], {
+                cwd: this.opts.safeCwd,
+                silent: !core.isDebug()
+            });
+            // Resize filesystem
+            let usedBytes = 0;
+            let fsResizeSucceeded = false;
+            try {
+                const usageOutput = yield this.getBtrfsUsage(mountPoint);
+                usedBytes = this.parseUsedBytes(usageOutput);
+            }
+            catch (error) {
+                core.warning(`Could not determine exact usage, using default buffer: ${error}`);
+                usedBytes = 512 * 1024 * 1024;
+            }
+            const targetSize = usedBytes + this.opts.bufferBytes;
+            const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024)));
+            info(`Resize target: ${targetMb} MB (effective usage: ${Math.ceil(usedBytes / (1024 * 1024))} MB + ${Math.ceil(this.opts.bufferBytes / (1024 * 1024))} MB buffer)`);
+            try {
+                yield exec.exec("sudo", [
+                    "btrfs",
+                    "filesystem",
+                    "resize",
+                    `${targetMb}M`,
+                    mountPoint
+                ], { cwd: this.opts.safeCwd, silent: !core.isDebug() });
+                fsResizeSucceeded = true;
+            }
+            catch (e) {
+                core.warning(`Filesystem resize failed (will upload at original size): ${e instanceof Error ? e.message : e}`);
+            }
+            yield exec.exec("sync", [], {
+                cwd: this.opts.safeCwd,
+                silent: !core.isDebug()
+            });
+            // Truncate backing file only if resize succeeded
+            if (fsResizeSucceeded) {
+                core.debug(`${LOG_PREFIX} Resizing backing file to ${targetMb} MB`);
+                try {
+                    yield exec.exec("truncate", ["-s", `${targetMb}M`, this.imageFile], { cwd: this.opts.safeCwd });
+                }
+                catch (e) {
+                    core.warning(`Backing file truncate failed: ${e instanceof Error ? e.message : e}`);
+                }
+            }
+            else {
+                info("Skipping backing file truncation — filesystem resize did not succeed");
+            }
+            yield exec.exec("sync", [], {
+                cwd: this.opts.safeCwd,
+                silent: !core.isDebug()
             });
         });
     }
     /**
-     * Clean up any loop devices associated with a given file.
-     * Prevents loop device leaks when mount fails partway through.
+     * Verify the image is mountable by doing a RO losetup+mount+umount cycle.
+     * Returns false if verification fails (caller should abort S3 upload).
      */
-    cleanupLoopDevices(imageFile) {
+    verifyMountable() {
         return __awaiter(this, void 0, void 0, function* () {
+            info("Verifying image is mountable before upload...");
+            const verifyDir = `${this.imageFile}.verify-mount`;
             try {
-                const output = yield this.execWithOutput("losetup", [
-                    "-j",
-                    imageFile
-                ]);
-                if (!output)
-                    return;
-                // Output format: /dev/loop0: [0050]:12345 (/path/to/file)
-                const devices = output
-                    .split("\n")
-                    .map(line => line.split(":")[0])
-                    .filter(d => d.startsWith("/dev/loop"));
-                for (const device of devices) {
-                    this.logDebug(`Cleaning up leaked loop device: ${device}`);
-                    try {
-                        yield this.execSudo("losetup", ["-d", device]);
-                    }
-                    catch (_a) {
-                        core.warning(`${this.getLogPrefix()} Failed to detach loop device ${device}`);
-                    }
+                const loopDev = yield this.setupLoopDevice(this.imageFile);
+                try {
+                    yield exec.exec("mkdir", ["-p", verifyDir], {
+                        cwd: this.opts.safeCwd
+                    });
+                    yield exec.exec("sudo", ["mount", "-t", "btrfs", "-o", "ro", loopDev, verifyDir], { cwd: this.opts.safeCwd });
+                    yield exec.exec("sudo", ["umount", verifyDir], {
+                        cwd: this.opts.safeCwd
+                    });
+                    info("Verification mount succeeded — image is safe to upload");
+                    return true;
+                }
+                finally {
+                    yield this.cleanupLoopDevices(this.imageFile);
+                    yield exec
+                        .exec("rm", ["-rf", verifyDir], {
+                        cwd: this.opts.safeCwd
+                    })
+                        .catch(() => { });
                 }
             }
-            catch (_b) {
-                // losetup -j may fail if no loop devices exist; that's fine
+            catch (verifyError) {
+                core.error(`Verification mount FAILED — aborting S3 upload to prevent poisoning cache: ${verifyError instanceof Error
+                    ? verifyError.message
+                    : verifyError}`);
+                return false;
             }
         });
     }
-    /**
-     * Check available disk space and warn or fail if insufficient.
-     * Returns available space in bytes.
-     */
-    checkDiskSpace(targetPath) {
-        var _a;
+    // ── UUID randomization (K8s HostPath dedup) ─────────────────────
+    randomizeUuid() {
+        return __awaiter(this, void 0, void 0, function* () {
+            info("Randomizing BTRFS UUID on copy");
+            yield sudoExec("btrfstune", ["-f", "-u", this.imageFile], this.opts.safeCwd);
+        });
+    }
+    // ── Filesystem health ───────────────────────────────────────────
+    checkHealth(mountPoint) {
         return __awaiter(this, void 0, void 0, function* () {
             try {
-                const output = yield this.execWithOutput("df", [
-                    "--output=avail",
-                    "-B1",
-                    targetPath
-                ]);
-                const lines = output.split("\n");
-                // Skip header line
-                const availStr = (_a = lines[lines.length - 1]) === null || _a === void 0 ? void 0 : _a.trim();
-                if (availStr) {
-                    const availBytes = parseInt(availStr, 10);
-                    const availMb = Math.floor(availBytes / (1024 * 1024));
-                    this.logDebug(`Available disk space: ${availMb} MB`);
-                    if (availMb < MIN_DISK_HEADROOM_MB) {
-                        core.warning(`${this.getLogPrefix()} Low disk space: ${availMb} MB available ` +
-                            `(minimum recommended: ${MIN_DISK_HEADROOM_MB} MB). ` +
-                            `BTRFS operations may fail.`);
-                    }
-                    return availBytes;
-                }
-            }
-            catch (_b) {
-                this.logDebug("Could not check disk space (non-critical)");
-            }
-            return 0;
-        });
-    }
-    /**
-     * Calculate the optimal sparse file size based on available disk space.
-     * Uses the smaller of: configured fsSize or 80% of available disk.
-     * The sparse file only consumes actual written bytes, so this is a virtual ceiling.
-     */
-    calculateSparseSize() {
-        return __awaiter(this, void 0, void 0, function* () {
-            const availBytes = yield this.checkDiskSpace(path.dirname(this.containerFile));
-            if (availBytes === 0) {
-                // Couldn't determine disk space; use configured size
-                return this.fsSize;
-            }
-            // Parse configured fsSize to bytes
-            const configuredBytes = this.parseSizeToBytes(this.fsSize);
-            // Use 80% of available space as the virtual ceiling
-            const safeMaxBytes = Math.floor(availBytes * 0.8);
-            if (configuredBytes > safeMaxBytes && safeMaxBytes > 0) {
-                const safeSizeGb = Math.max(1, Math.floor(safeMaxBytes / (1024 * 1024 * 1024)));
-                this.logInfo(`Reducing sparse file size from ${this.fsSize} to ${safeSizeGb}G ` +
-                    `(80% of ${Math.floor(availBytes / (1024 * 1024 * 1024))}G available)`);
-                return `${safeSizeGb}G`;
-            }
-            return this.fsSize;
-        });
-    }
-    parseSizeToBytes(size) {
-        const match = size.match(/^(\d+)([KMGT])?$/);
-        if (!match)
-            return 0;
-        let bytes = parseInt(match[1], 10);
-        switch (match[2]) {
-            case "K":
-                bytes *= 1024;
-                break;
-            case "M":
-                bytes *= 1024 * 1024;
-                break;
-            case "G":
-                bytes *= 1024 * 1024 * 1024;
-                break;
-            case "T":
-                bytes *= 1024 * 1024 * 1024 * 1024;
-                break;
-        }
-        return bytes;
-    }
-    /**
-     * Check filesystem health after mounting by reading device stats.
-     * Reports any I/O errors detected by BTRFS.
-     */
-    checkFilesystemHealth() {
-        return __awaiter(this, void 0, void 0, function* () {
-            if (!this.mountPoint)
-                return;
-            try {
-                const output = yield this.execWithOutput("sudo", [
+                const output = yield execWithOutput("sudo", [
                     "btrfs",
                     "device",
                     "stats",
-                    this.mountPoint
-                ]);
-                // Parse stats: look for non-zero error counters
+                    mountPoint
+                ], this.opts.safeCwd);
                 const errorLines = output
                     .split("\n")
                     .filter(line => {
@@ -97193,32 +97264,49 @@ class BtrfsContainer extends Container_1.Container {
                     return match && parseInt(match[2], 10) > 0;
                 });
                 if (errorLines.length > 0) {
-                    core.warning(`${this.getLogPrefix()} Filesystem has I/O errors:\n${errorLines.join("\n")}` +
+                    core.warning(`${LOG_PREFIX} Filesystem has I/O errors:\n${errorLines.join("\n")}` +
                         `\nConsider recreating the cache image.`);
                 }
                 else {
-                    this.logDebug("Filesystem health check: no errors detected");
+                    core.debug(`${LOG_PREFIX} Filesystem health check: no errors detected`);
                 }
             }
             catch (_a) {
-                this.logDebug("Could not check filesystem health (non-critical)");
+                core.debug(`${LOG_PREFIX} Could not check filesystem health (non-critical)`);
             }
         });
     }
-    checkPathTraversal(base, pathToCheck) {
-        // Validate that the resolved path is within the base directory
-        const absBase = path.resolve(base);
-        const absPathToCheck = path.resolve(path.join(base, pathToCheck));
-        if (!absPathToCheck.startsWith(absBase)) {
-            throw new Error(`Path traversal detected: ${pathToCheck} resolves outside base directory`);
-        }
+    // ── Loop device management ──────────────────────────────────────
+    cleanupLoopDevices(imageFile) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const output = yield execWithOutput("losetup", ["-j", imageFile], this.opts.safeCwd);
+                if (!output)
+                    return;
+                const devices = output
+                    .split("\n")
+                    .map(line => line.split(":")[0])
+                    .filter(d => d.startsWith("/dev/loop"));
+                for (const device of devices) {
+                    core.debug(`${LOG_PREFIX} Cleaning up leaked loop device: ${device}`);
+                    try {
+                        yield sudoExec("losetup", ["-d", device], this.opts.safeCwd);
+                    }
+                    catch (_a) {
+                        core.warning(`${LOG_PREFIX} Failed to detach loop device ${device}`);
+                    }
+                }
+            }
+            catch (_b) {
+                // losetup -j may fail if no loop devices exist
+            }
+        });
     }
+    // ── Prerequisites ───────────────────────────────────────────────
     checkPrerequisites() {
         return __awaiter(this, void 0, void 0, function* () {
             if (process.platform !== "linux") {
-                throw new Error(`BTRFS compression is only supported on Linux platforms. ` +
-                    `Current platform: ${process.platform}. ` +
-                    `Please use a different compression method or switch to a Linux runner.`);
+                throw new Error(`BTRFS compression is only supported on Linux. Current platform: ${process.platform}.`);
             }
             const requiredTools = [
                 { command: "truncate", description: "creating sparse files" },
@@ -97247,72 +97335,176 @@ class BtrfsContainer extends Container_1.Container {
             yield Promise.all(requiredTools.map((tool) => __awaiter(this, void 0, void 0, function* () {
                 try {
                     yield exec.exec("which", [tool.command], {
-                        cwd: this.safeCwd,
+                        cwd: this.opts.safeCwd,
                         silent: !core.isDebug()
                     });
                 }
-                catch (error) {
+                catch (_b) {
                     missingTools.push(`${tool.command} (${tool.description})`);
                 }
             })));
             if (missingTools.length > 0) {
-                throw new Error(`Missing required tools for BTRFS compression: ${missingTools.join(", ")}. ` +
-                    `Please install the missing tools or use a different compression method.`);
+                throw new Error(`Missing required tools for BTRFS compression: ${missingTools.join(", ")}.`);
             }
-            // Check if sudo works without password prompt (for CI environments)
+            // Passwordless sudo check
             try {
                 yield exec.exec("sudo", ["-n", "true"], {
-                    cwd: this.safeCwd,
+                    cwd: this.opts.safeCwd,
                     silent: !core.isDebug()
                 });
             }
-            catch (error) {
-                throw new Error(`sudo access is required for BTRFS mounting operations but sudo is not available or requires a password. ` +
-                    `Please ensure the runner has passwordless sudo access or use a different compression method.`);
+            catch (_a) {
+                throw new Error("sudo access is required for BTRFS mounting but sudo is not available or requires a password.");
             }
-            // Ensure kernel modules are loaded:
-            // - loop: required for losetup to attach .btrfs image files as block devices
-            // - btrfs: required for mount -t btrfs
-            // On fresh K8s nodes these may not be auto-loaded, causing mount exit code 32.
+            // Ensure kernel modules are loaded (K8s nodes may not auto-load)
             for (const mod of ["loop", "btrfs"]) {
                 try {
                     yield exec.exec("sudo", ["modprobe", mod], {
-                        cwd: this.safeCwd,
+                        cwd: this.opts.safeCwd,
                         silent: !core.isDebug()
                     });
                 }
                 catch (error) {
-                    core.debug(`${this.getLogPrefix()} modprobe ${mod} failed (module likely built-in): ${error instanceof Error ? error.message : error}`);
+                    core.debug(`${LOG_PREFIX} modprobe ${mod} failed (module likely built-in): ${error instanceof Error ? error.message : error}`);
                 }
             }
         });
     }
-    getBtrfsUsage() {
+    // ── Private helpers ─────────────────────────────────────────────
+    setupLoopDevice(imageFile) {
         return __awaiter(this, void 0, void 0, function* () {
-            if (!this.mountPoint) {
-                throw new Error("Mount point is not set");
+            let loopDev = "";
+            try {
+                yield exec.exec("sudo", ["losetup", "--find", "--show", imageFile], {
+                    cwd: this.opts.safeCwd,
+                    listeners: {
+                        stdout: (data) => {
+                            loopDev += data.toString();
+                        }
+                    },
+                    silent: !core.isDebug()
+                });
             }
-            return this.execWithOutput("sudo", [
+            catch (error) {
+                throw new Error(`Failed to attach ${imageFile} to a loop device. ` +
+                    `Ensure the 'loop' kernel module is loaded. ` +
+                    `Error: ${error instanceof Error ? error.message : error}`);
+            }
+            loopDev = loopDev.trim();
+            if (!loopDev.startsWith("/dev/loop")) {
+                throw new Error(`losetup returned unexpected output: "${loopDev}".`);
+            }
+            info(`Attached ${imageFile} → ${loopDev}`);
+            return loopDev;
+        });
+    }
+    mountWithErrorHandling(device, mountPath, options) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const isLoopMount = options === null || options === void 0 ? void 0 : options.includes("loop");
+            const filteredOptions = (options === null || options === void 0 ? void 0 : options.filter(o => o !== "loop")) || [];
+            let actualDevice = device;
+            try {
+                if (isLoopMount) {
+                    const loopDev = yield this.setupLoopDevice(device);
+                    actualDevice = loopDev;
+                    this.activeLoopDevice = loopDev;
+                }
+                const mountArgs = [actualDevice, mountPath];
+                if (filteredOptions.length > 0) {
+                    mountArgs.unshift("-o", filteredOptions.join(","));
+                }
+                if (isLoopMount) {
+                    mountArgs.unshift("-t", "btrfs");
+                }
+                yield execWithTimeout(() => exec.exec("sudo", ["mount", ...mountArgs], {
+                    cwd: this.opts.safeCwd,
+                    silent: !core.isDebug()
+                }), MOUNT_TIMEOUT_MS, `mount ${actualDevice} at ${mountPath}`);
+            }
+            catch (error) {
+                // Diagnostics: only collect in debug mode to keep normal failures fast
+                if (core.isDebug()) {
+                    yield this.collectMountDiagnostics(device, actualDevice);
+                }
+                yield this.cleanupLoopDevices(device);
+                this.activeLoopDevice = undefined;
+                throw new Error(`Failed to mount ${actualDevice} at ${mountPath}: ${error instanceof Error ? error.message : error}`);
+            }
+        });
+    }
+    /**
+     * Collect diagnostic info on mount failure (debug-only).
+     * Runs stat, losetup, dmesg, btrfs check, dump-super.
+     */
+    collectMountDiagnostics(imageFile, actualDevice) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const diag = [];
+                const collect = (label, cmd, cmdArgs) => __awaiter(this, void 0, void 0, function* () {
+                    try {
+                        let out = "";
+                        yield exec.exec(cmd, cmdArgs, {
+                            cwd: this.opts.safeCwd,
+                            silent: true,
+                            listeners: {
+                                stdout: (d) => {
+                                    out += d.toString();
+                                }
+                            }
+                        });
+                        diag.push(`${label}: ${out.trim()}`);
+                    }
+                    catch (_b) {
+                        diag.push(`${label}: <unavailable>`);
+                    }
+                });
+                yield collect("file size", "stat", [
+                    "--format=%s",
+                    imageFile
+                ]);
+                yield collect("loop devices", "sudo", ["losetup", "-a"]);
+                yield collect("dmesg (last 40 lines)", "bash", [
+                    "-c",
+                    "sudo dmesg -T 2>/dev/null | tail -40 || sudo dmesg 2>/dev/null | tail -40 || echo unavailable"
+                ]);
+                if (actualDevice.startsWith("/dev/loop")) {
+                    yield exec
+                        .exec("bash", [
+                        "-c",
+                        "command -v btrfs >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs 2>/dev/null) || true"
+                    ], { cwd: this.opts.safeCwd, silent: true })
+                        .catch(() => { });
+                    yield collect("btrfs check --readonly", "sudo", [
+                        "btrfs",
+                        "check",
+                        "--readonly",
+                        actualDevice
+                    ]);
+                    yield collect("btrfs superblock (compat flags)", "bash", [
+                        "-c",
+                        `sudo btrfs inspect-internal dump-super ${actualDevice} 2>&1 | grep -iE 'compat|magic|generation|sectorsize|nodesize|root_level'`
+                    ]);
+                }
+                for (const d of diag) {
+                    core.warning(`${LOG_PREFIX} ${d}`);
+                }
+            }
+            catch (_a) {
+                /* diagnostic collection is best-effort */
+            }
+        });
+    }
+    getBtrfsUsage(mountPoint) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return execWithOutput("sudo", [
                 "btrfs",
                 "filesystem",
                 "usage",
                 "-b",
-                this.mountPoint
-            ]);
+                mountPoint
+            ], this.opts.safeCwd);
         });
     }
-    /**
-     * Parse `btrfs filesystem usage -b` output and return the effective bytes
-     * that the image must accommodate.
-     *
-     * BTRFS allocates space in chunks (typically 256 MB data + 256 MB metadata +
-     * 8 MB system). `Device allocated:` is always >= `Used:` because it includes
-     * chunk overhead. Using just `Used:` would undersize the image, causing
-     * resize failures when BTRFS can't relocate chunks.
-     *
-     * Returns `max(Used, Device allocated)` so the truncate target is always
-     * large enough for what the filesystem actually occupies on disk.
-     */
     parseUsedBytes(usageOutput) {
         const lines = usageOutput.split("\n");
         let used = 0;
@@ -97331,249 +97523,133 @@ class BtrfsContainer extends Container_1.Container {
             throw new Error("Could not parse BTRFS usage output");
         }
         const effective = Math.max(used, deviceAllocated);
-        this.logDebug(`BTRFS usage — Used: ${used} bytes, Device allocated: ${deviceAllocated} bytes, effective: ${effective} bytes`);
+        core.debug(`${LOG_PREFIX} BTRFS usage — Used: ${used} bytes, Device allocated: ${deviceAllocated} bytes, effective: ${effective} bytes`);
         return effective;
     }
-    discoverMountInfo() {
+    calculateSparseSize(targetDir, fsSize) {
         return __awaiter(this, void 0, void 0, function* () {
-            // Get the expected temp directory for this cache key
-            const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
-            const expectedMountPoint = path.join(tempDir, "mount");
-            this.logDebug(`Looking for BTRFS mount at: ${expectedMountPoint}`);
-            // Use findmnt to find BTRFS mounts with target, source, and options
-            const output = yield this.execWithOutput("findmnt", [
-                "-t",
-                "btrfs",
-                "-n",
-                "-o",
-                "TARGET,SOURCE,OPTIONS"
-            ]);
-            this.logDebug(`findmnt output:\n${output}`);
-            // Parse findmnt output: TARGET SOURCE OPTIONS
-            const lines = output.split("\n");
-            for (const line of lines) {
-                if (line.trim() === "")
-                    continue;
-                const parts = line.trim().split(/\s+/);
-                if (parts.length >= 2) {
-                    const mountPoint = parts[0];
-                    const device = parts[1];
-                    const options = parts.slice(2).join(" ");
-                    // Look for our specific mount point
-                    if (mountPoint === expectedMountPoint) {
-                        this.logDebug(`Found existing mount: ${device} → ${mountPoint} (${options})`);
-                        this.mountPoint = mountPoint;
-                        this.mountIsReadOnly = /\bro\b/.test(options);
-                        // With deterministic temp directories, containerFile should already be correct
-                        this.logDebug(`Using containerFile: ${this.containerFile} (readOnly=${this.mountIsReadOnly})`);
-                        return;
-                    }
-                }
+            const availBytes = yield checkDiskSpace(targetDir, this.opts.safeCwd);
+            if (availBytes === 0)
+                return fsSize;
+            const configuredBytes = parseSizeToBytes(fsSize);
+            const safeMaxBytes = Math.floor(availBytes * 0.8);
+            if (configuredBytes > safeMaxBytes && safeMaxBytes > 0) {
+                const safeSizeGb = Math.max(1, Math.floor(safeMaxBytes / (1024 * 1024 * 1024)));
+                info(`Reducing sparse file size from ${fsSize} to ${safeSizeGb}G ` +
+                    `(80% of ${Math.floor(availBytes / (1024 * 1024 * 1024))}G available)`);
+                return `${safeSizeGb}G`;
             }
-            throw new Error(`No BTRFS cache filesystem found for cache key ${this.cacheKey}. ` +
-                `Expected mount at: ${expectedMountPoint}. ` +
-                `Make sure the cache was properly initialized and mounted first.`);
-        });
-    }
-    /**
-     * Mount the BTRFS image read-write (standard mode for population/save).
-     */
-    mount() {
-        return __awaiter(this, void 0, void 0, function* () {
-            try {
-                const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
-                this.mountPoint = path.join(tempDir, "mount");
-                yield this.cleanStaleMounts();
-                // Create mount point and mount the image
-                yield fs.mkdir(this.mountPoint, { recursive: true });
-                core.debug(`[BTRFS] Mounting image to ${this.mountPoint}`);
-                yield this.mountWithErrorHandling(this.containerFile, this.mountPoint, ["loop", "rw", `compress=${this.compressionLevel}`]);
-                // Bind-mount each path so workspace points to BTRFS (read-write)
-                yield this.bindMountPaths(false);
-            }
-            catch (error) {
-                // Clean up loop devices on mount failure
-                yield this.cleanupLoopDevices(this.containerFile);
-                throw new Error(`Failed to mount BTRFS filesystem: ${error instanceof Error ? error.message : error}`);
-            }
-        });
-    }
-    /**
-     * Bind-mount each cached path from the BTRFS mount to the workspace.
-     * @param readOnly If true, bind mounts are remounted read-only after initial bind.
-     */
-    bindMountPaths(readOnly) {
-        return __awaiter(this, void 0, void 0, function* () {
-            const promises = this.pathsToCache.map((p) => __awaiter(this, void 0, void 0, function* () {
-                if (!this.mountPoint) {
-                    throw new Error("Mount point is not set");
-                }
-                // For absolute paths (e.g. $RUNNER_TEMP/git-cache/objects), use them
-                // directly as the workspace target — do NOT path.join(baseDir, p)
-                // because path.join concatenates, creating stray dirs inside workspace.
-                // For the BTRFS internal path, path.join(mountPoint, p) is correct:
-                // it strips the leading '/' and nests inside the mount.
-                const absPath = path.isAbsolute(p) ? p : path.join(this.baseDir, p);
-                const btrfsPath = path.join(this.mountPoint, p);
-                core.debug(`[BTRFS] Bind-mounting ${btrfsPath} → ${absPath}${readOnly ? " (ro)" : ""}`);
-                try {
-                    if (readOnly) {
-                        // Read-only mount: BTRFS path must already exist in the image.
-                        // Only create the workspace target — never write to the RO filesystem.
-                        try {
-                            yield exec.exec("test", ["-d", btrfsPath], {
-                                cwd: this.safeCwd,
-                                ignoreReturnCode: false,
-                                silent: !core.isDebug()
-                            });
-                        }
-                        catch (_a) {
-                            throw new Error(`Source path ${btrfsPath} does not exist in BTRFS image`);
-                        }
-                        yield this.execSudo("mkdir", ["-p", absPath]);
-                        const parentDir = path.dirname(absPath);
-                        yield this.execSudo("chown", [
-                            "--reference",
-                            parentDir,
-                            absPath
-                        ]);
-                    }
-                    else {
-                        // Read-write mount: create directories on both sides
-                        yield Promise.all([
-                            this.execSudo("mkdir", ["-p", btrfsPath]),
-                            this.execSudo("mkdir", ["-p", absPath])
-                        ]);
-                        const parentDir = path.dirname(absPath);
-                        yield Promise.all([
-                            this.execSudo("chown", [
-                                "--reference",
-                                parentDir,
-                                absPath
-                            ]),
-                            this.execSudo("chown", [
-                                "--reference",
-                                this.baseDir,
-                                btrfsPath
-                            ])
-                        ]);
-                    }
-                    // Bind mount: workspace points to BTRFS
-                    yield this.mountWithErrorHandling(btrfsPath, absPath, [
-                        "bind"
-                    ]);
-                    // Remount read-only if requested
-                    if (readOnly) {
-                        yield this.mountWithErrorHandling(btrfsPath, absPath, [
-                            "bind",
-                            "remount",
-                            "ro"
-                        ]);
-                    }
-                }
-                catch (error) {
-                    throw new Error(`Failed to bind-mount ${btrfsPath} to ${absPath}: ${error instanceof Error ? error.message : error}`);
-                }
-            }));
-            yield Promise.all(promises);
-        });
-    }
-    /**
-     * Detect and unmount stale BTRFS mounts from a previous run.
-     * On reused EC2 runners, a previous job's post step may have been skipped
-     * (e.g. cancellation), leaving mounts at the target paths.
-     */
-    cleanStaleMounts() {
-        return __awaiter(this, void 0, void 0, function* () {
-            // Check bind mount targets (workspace paths like node_modules)
-            for (const p of this.pathsToCache) {
-                const absPath = path.isAbsolute(p) ? p : path.join(this.baseDir, p);
-                yield this.unmountIfMounted(absPath);
-            }
-            // Check the main BTRFS mount point
-            if (this.mountPoint) {
-                yield this.unmountIfMounted(this.mountPoint);
-            }
-        });
-    }
-    unmountIfMounted(targetPath) {
-        return __awaiter(this, void 0, void 0, function* () {
-            try {
-                const rc = yield exec.exec("mountpoint", ["-q", targetPath], {
-                    cwd: this.safeCwd,
-                    ignoreReturnCode: true,
-                    silent: true
-                });
-                if (rc === 0) {
-                    core.warning(`${this.getLogPrefix()} Stale mount detected at ${targetPath}, unmounting...`);
-                    yield this.umountWithErrorHandling(targetPath);
-                }
-            }
-            catch (_a) {
-                // targetPath doesn't exist or mountpoint check failed — nothing to clean
-            }
-        });
-    }
-    unmount() {
-        return __awaiter(this, void 0, void 0, function* () {
-            if (!this.mountPoint) {
-                throw new Error("Mount point is not set");
-            }
-            try {
-                yield exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
-                // First unmount all bind mounts
-                for (const p of this.pathsToCache) {
-                    const absPath = path.isAbsolute(p) ? p : path.join(this.baseDir, p);
-                    try {
-                        const bindMountCheck = yield exec.exec("mountpoint", [absPath], {
-                            cwd: this.safeCwd,
-                            ignoreReturnCode: true,
-                            silent: !core.isDebug()
-                        });
-                        if (bindMountCheck === 0) {
-                            core.debug(`[BTRFS] Unmounting bind mount: ${absPath}`);
-                            yield this.umountWithErrorHandling(absPath);
-                        }
-                    }
-                    catch (error) {
-                        core.debug(`Failed to unmount bind mount ${absPath}: ${error}`);
-                    }
-                }
-                // Then unmount the main BTRFS filesystem
-                const mountCheck = yield exec.exec("mountpoint", [this.mountPoint], {
-                    cwd: this.safeCwd,
-                    ignoreReturnCode: true,
-                    silent: !core.isDebug()
-                });
-                if (mountCheck === 0) {
-                    core.debug(`[BTRFS] Unmounting main filesystem: ${this.mountPoint}`);
-                    yield this.umountWithErrorHandling(this.mountPoint);
-                }
-                // Detach loop device after unmounting the filesystem
-                if (this.activeLoopDevice) {
-                    core.debug(`[BTRFS] Detaching loop device: ${this.activeLoopDevice}`);
-                    try {
-                        yield this.execSudo("losetup", ["-d", this.activeLoopDevice]);
-                    }
-                    catch (error) {
-                        core.debug(`Failed to detach loop device ${this.activeLoopDevice}: ${error}`);
-                    }
-                    this.activeLoopDevice = undefined;
-                }
-            }
-            catch (error) {
-                core.debug(`Cleanup mount failed (non-critical): ${error}`);
-            }
-            try {
-                yield fs.rm(this.mountPoint, { recursive: true, force: true });
-            }
-            catch (error) {
-                core.debug(`Cleanup mount point failed (non-critical): ${error}`);
-            }
+            return fsSize;
         });
     }
 }
-exports.BtrfsContainer = BtrfsContainer;
+exports.BtrfsImage = BtrfsImage;
+// ── Module-level helpers (shared, no class dependency) ──────────────
+function info(message) {
+    core.info(`${LOG_PREFIX} ${message}`);
+}
+function sudoExec(command, args, cwd) {
+    return __awaiter(this, void 0, void 0, function* () {
+        yield exec.exec("sudo", [command, ...args], {
+            cwd,
+            silent: !core.isDebug()
+        });
+    });
+}
+function execWithOutput(command, args, cwd) {
+    return __awaiter(this, void 0, void 0, function* () {
+        let output = "";
+        yield exec.exec(command, args, {
+            cwd,
+            listeners: {
+                stdout: (data) => {
+                    output += data.toString();
+                }
+            },
+            silent: !core.isDebug()
+        });
+        return output.trim();
+    });
+}
+function execWithTimeout(fn, timeoutMs, description) {
+    return __awaiter(this, void 0, void 0, function* () {
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                reject(new Error(`${LOG_PREFIX} Operation timed out after ${timeoutMs}ms: ${description}`));
+            }, timeoutMs);
+            fn().then(result => {
+                clearTimeout(timer);
+                resolve(result);
+            }, err => {
+                clearTimeout(timer);
+                reject(err);
+            });
+        });
+    });
+}
+function checkDiskSpace(targetPath, cwd) {
+    var _a;
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const output = yield execWithOutput("df", [
+                "--output=avail",
+                "-B1",
+                targetPath
+            ], cwd);
+            const lines = output.split("\n");
+            const availStr = (_a = lines[lines.length - 1]) === null || _a === void 0 ? void 0 : _a.trim();
+            if (availStr) {
+                const availBytes = parseInt(availStr, 10);
+                const availMb = Math.floor(availBytes / (1024 * 1024));
+                core.debug(`${LOG_PREFIX} Available disk space: ${availMb} MB`);
+                if (availMb < MIN_DISK_HEADROOM_MB) {
+                    core.warning(`${LOG_PREFIX} Low disk space: ${availMb} MB available ` +
+                        `(minimum recommended: ${MIN_DISK_HEADROOM_MB} MB).`);
+                }
+                return availBytes;
+            }
+        }
+        catch (_b) {
+            core.debug(`${LOG_PREFIX} Could not check disk space (non-critical)`);
+        }
+        return 0;
+    });
+}
+function parseSizeToBytes(size) {
+    const match = size.match(/^(\d+)([KMGT])?$/);
+    if (!match)
+        return 0;
+    let bytes = parseInt(match[1], 10);
+    switch (match[2]) {
+        case "K":
+            bytes *= 1024;
+            break;
+        case "M":
+            bytes *= 1024 * 1024;
+            break;
+        case "G":
+            bytes *= 1024 * 1024 * 1024;
+            break;
+        case "T":
+            bytes *= 1024 * 1024 * 1024 * 1024;
+            break;
+    }
+    return bytes;
+}
+exports.parseSizeToBytes = parseSizeToBytes;
+function validateFsSize(fsSize) {
+    if (!/^[0-9]+[KMGT]?$/.test(fsSize)) {
+        throw new Error(`Invalid filesystem size format: ${fsSize}. Must be a number followed by optional K, M, G, or T.`);
+    }
+}
+exports.validateFsSize = validateFsSize;
+function validateCompressionLevel(level) {
+    const regex = /^(zlib(?:[:][1-9])?|lzo|zstd(?::-?(?:[0-9]|1[0-5]))?)$/;
+    if (!regex.test(level)) {
+        throw new Error(`Invalid compression level format: ${level}.`);
+    }
+}
+exports.validateCompressionLevel = validateCompressionLevel;
 
 
 /***/ }),
@@ -97618,6 +97694,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.Container = void 0;
 const core = __importStar(__nccwpck_require__(2186));
+const NodeLocalCache_1 = __nccwpck_require__(8033);
 class Container {
     constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options = {}) {
         this.containerFile = containerFile;
@@ -97627,6 +97704,11 @@ class Container {
         this.pathsToCache = pathsToCache;
         this.cacheKey = cacheKey;
         this.options = options;
+        this.restoredFromNodeLocal = false;
+        // Subclasses override nodeLocalExtension() before calling super()
+        // isn't possible, so we provide a default. Subclasses that need
+        // a different extension can re-create nodeLocal in their constructor.
+        this.nodeLocal = new NodeLocalCache_1.NodeLocalCache(options.nodeLocalCacheDir || "", cacheKey, this.nodeLocalExtension());
     }
     // eslint-disable-next-line @typescript-eslint/no-empty-function
     initialize() {
@@ -97637,62 +97719,70 @@ class Container {
         return __awaiter(this, void 0, void 0, function* () { });
     }
     /**
-     * Try to restore from a node-local persistent cache.
-     * Returns true if restored from node-local, false if S3 download is needed.
-     * Default implementation returns false (no node-local support).
+     * File extension for node-local cache files.
+     * Override in subclasses for different archive types.
      */
-    tryRestoreFromNodeLocal(_restoreKeys) {
+    nodeLocalExtension() {
+        return ".tar";
+    }
+    // ── Node-local methods (E: shared implementation) ────────────────
+    /**
+     * Try to restore from a node-local persistent cache.
+     * Default implementation: find exact/partial match, point containerFile, call restore().
+     * BtrfsContainer overrides this with mount-based logic.
+     */
+    tryRestoreFromNodeLocal(restoreKeys) {
         return __awaiter(this, void 0, void 0, function* () {
-            return false;
+            if (!this.nodeLocal.enabled)
+                return false;
+            const localExists = yield this.nodeLocal.exists();
+            let localPath = localExists
+                ? this.nodeLocal.localPath
+                : null;
+            if (!localPath && restoreKeys && restoreKeys.length > 0) {
+                localPath = yield this.nodeLocal.findClosestMatch(restoreKeys);
+                if (localPath) {
+                    this.logInfo(`Node-local partial hit — using ${localPath}`);
+                }
+            }
+            if (!localPath)
+                return false;
+            this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
+            try {
+                this.containerFile = localPath;
+                yield this.restore();
+                this.restoredFromNodeLocal = true;
+                return true;
+            }
+            catch (error) {
+                core.warning(`${this.getLogPrefix()} Node-local restore failed, falling back to S3: ${error instanceof Error ? error.message : error}`);
+                return false;
+            }
         });
     }
-    /**
-     * Whether the S3 upload should be skipped (e.g., restored from node-local read-only).
-     */
     shouldSkipS3Upload() {
-        return false;
+        return this.restoredFromNodeLocal;
     }
-    /**
-     * Get the path where S3 should download the archive to.
-     * When node-local caching is enabled, returns a .tempXXX path in the HostPath dir
-     * so the download goes directly there (no copy).
-     * Returns null when node-local is disabled (caller uses default temp dir).
-     */
     getNodeLocalDownloadPath() {
         return __awaiter(this, void 0, void 0, function* () {
-            return null;
+            return this.nodeLocal.getDownloadPath();
         });
     }
-    /**
-     * Commit a node-local download: atomic mv from .tempXXX to final path.
-     * Called after S3 download completes when the download went to a node-local temp path.
-     * Returns true if committed, false if another runner beat us.
-     */
     commitNodeLocalDownload(tempPath) {
         return __awaiter(this, void 0, void 0, function* () {
-            return false;
+            return this.nodeLocal.commitTempFile(tempPath);
         });
     }
-    /**
-     * The final committed path for this cache key on the node.
-     * Returns null when node-local is disabled.
-     */
     getNodeLocalFinalPath() {
-        return null;
+        return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
     }
-    /**
-     * Whether node-local caching is enabled for this container.
-     */
     isNodeLocalEnabled() {
-        return false;
+        return this.nodeLocal.enabled;
     }
-    /**
-     * Update the archive file path (e.g., when S3 download goes to a different location).
-     */
+    // ── Common helpers ───────────────────────────────────────────────
     setArchivePath(archivePath) {
         this.containerFile = archivePath;
     }
-    // Common helper methods for all container implementations
     wrapError(operation, error) {
         return new Error(`Failed to ${operation}: ${error instanceof Error ? error.message : error}`);
     }
@@ -97708,7 +97798,6 @@ class Container {
         const logPrefix = prefix || this.getLogPrefix();
         return new Error(`${logPrefix} ${message}`);
     }
-    // Default log prefix - subclasses can override
     getLogPrefix() {
         return "[CONTAINER]";
     }
@@ -98106,14 +98195,14 @@ exports.TarContainer = void 0;
 const tar_1 = __nccwpck_require__(6490);
 const core = __importStar(__nccwpck_require__(2186));
 const Container_1 = __nccwpck_require__(9620);
-const NodeLocalCache_1 = __nccwpck_require__(8033);
 class TarContainer extends Container_1.Container {
-    constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
-        super(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options);
+    constructor() {
+        super(...arguments);
         this.requiresCreateEmptyCache = false;
         this.requiresKeepArchive = false;
-        this.restoredFromNodeLocal = false;
-        this.nodeLocal = new NodeLocalCache_1.NodeLocalCache(options.nodeLocalCacheDir || "", cacheKey, ".tar");
+    }
+    nodeLocalExtension() {
+        return ".tar";
     }
     initialize() {
         return __awaiter(this, void 0, void 0, function* () {
@@ -98124,54 +98213,6 @@ class TarContainer extends Container_1.Container {
                 core.warning(`[Tar] Stale temp cleanup failed (non-fatal): ${e.message}`);
             }
         });
-    }
-    tryRestoreFromNodeLocal(restoreKeys) {
-        return __awaiter(this, void 0, void 0, function* () {
-            if (!this.nodeLocal.enabled)
-                return false;
-            // 1. Try exact key match
-            const localExists = yield this.nodeLocal.exists();
-            let localPath = localExists ? this.nodeLocal.localPath : null;
-            // 2. Try partial match from restore-keys
-            if (!localPath && restoreKeys && restoreKeys.length > 0) {
-                localPath = yield this.nodeLocal.findClosestMatch(restoreKeys);
-                if (localPath) {
-                    this.logInfo(`Node-local partial hit — using ${localPath}`);
-                }
-            }
-            if (!localPath)
-                return false;
-            this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
-            try {
-                this.containerFile = localPath;
-                yield this.restore();
-                this.restoredFromNodeLocal = true;
-                return true;
-            }
-            catch (error) {
-                core.warning(`${this.getLogPrefix()} Node-local restore failed, falling back to S3: ${error instanceof Error ? error.message : error}`);
-                return false;
-            }
-        });
-    }
-    shouldSkipS3Upload() {
-        return this.restoredFromNodeLocal;
-    }
-    getNodeLocalDownloadPath() {
-        return __awaiter(this, void 0, void 0, function* () {
-            return this.nodeLocal.getDownloadPath();
-        });
-    }
-    commitNodeLocalDownload(tempPath) {
-        return __awaiter(this, void 0, void 0, function* () {
-            return this.nodeLocal.commitTempFile(tempPath);
-        });
-    }
-    getNodeLocalFinalPath() {
-        return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
-    }
-    isNodeLocalEnabled() {
-        return this.nodeLocal.enabled;
     }
     getLogPrefix() {
         return "[TAR]";
@@ -98193,7 +98234,6 @@ class TarContainer extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             try {
                 this.logDebug(`Creating TAR archive: ${this.containerFile}`);
-                // TAR save implementation would go here
             }
             catch (error) {
                 throw this.wrapError("save TAR cache", error);
@@ -98250,14 +98290,14 @@ const core = __importStar(__nccwpck_require__(2186));
 const child_process_1 = __nccwpck_require__(2081);
 const path_1 = __nccwpck_require__(1017);
 const Container_1 = __nccwpck_require__(9620);
-const NodeLocalCache_1 = __nccwpck_require__(8033);
 class TarLz4Container extends Container_1.Container {
-    constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
-        super(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options);
+    constructor() {
+        super(...arguments);
         this.requiresCreateEmptyCache = false;
         this.requiresKeepArchive = false;
-        this.restoredFromNodeLocal = false;
-        this.nodeLocal = new NodeLocalCache_1.NodeLocalCache(options.nodeLocalCacheDir || "", cacheKey, ".tar.lz4");
+    }
+    nodeLocalExtension() {
+        return ".tar.lz4";
     }
     initialize() {
         return __awaiter(this, void 0, void 0, function* () {
@@ -98268,55 +98308,6 @@ class TarLz4Container extends Container_1.Container {
                 core.warning(`[TarLz4] Stale temp cleanup failed (non-fatal): ${e.message}`);
             }
         });
-    }
-    tryRestoreFromNodeLocal(restoreKeys) {
-        return __awaiter(this, void 0, void 0, function* () {
-            if (!this.nodeLocal.enabled)
-                return false;
-            // 1. Try exact key match
-            const localExists = yield this.nodeLocal.exists();
-            let localPath = localExists ? this.nodeLocal.localPath : null;
-            // 2. Try partial match from restore-keys
-            if (!localPath && restoreKeys && restoreKeys.length > 0) {
-                localPath = yield this.nodeLocal.findClosestMatch(restoreKeys);
-                if (localPath) {
-                    this.logInfo(`Node-local partial hit — using ${localPath}`);
-                }
-            }
-            if (!localPath)
-                return false;
-            this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
-            try {
-                // Point containerFile to the node-local archive and restore from it
-                this.containerFile = localPath;
-                yield this.restore();
-                this.restoredFromNodeLocal = true;
-                return true;
-            }
-            catch (error) {
-                core.warning(`${this.getLogPrefix()} Node-local restore failed, falling back to S3: ${error instanceof Error ? error.message : error}`);
-                return false;
-            }
-        });
-    }
-    shouldSkipS3Upload() {
-        return this.restoredFromNodeLocal;
-    }
-    getNodeLocalDownloadPath() {
-        return __awaiter(this, void 0, void 0, function* () {
-            return this.nodeLocal.getDownloadPath();
-        });
-    }
-    commitNodeLocalDownload(tempPath) {
-        return __awaiter(this, void 0, void 0, function* () {
-            return this.nodeLocal.commitTempFile(tempPath);
-        });
-    }
-    getNodeLocalFinalPath() {
-        return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
-    }
-    isNodeLocalEnabled() {
-        return this.nodeLocal.enabled;
     }
     getLogPrefix() {
         return "[TAR-LZ4]";
@@ -98477,7 +98468,6 @@ const fs = __importStar(__nccwpck_require__(3292));
 const path = __importStar(__nccwpck_require__(1017));
 const actionUtils_1 = __nccwpck_require__(6850);
 const Container_1 = __nccwpck_require__(9620);
-const NodeLocalCache_1 = __nccwpck_require__(8033);
 const MOUNT_TIMEOUT_MS = 60000;
 const MIN_DISK_HEADROOM_MB = 1024;
 /**
@@ -98496,13 +98486,11 @@ class VhdxContainer extends Container_1.Container {
         super(containerFile, compressionMethod, compressionLevel !== null && compressionLevel !== void 0 ? compressionLevel : "ntfs", baseDir, pathsToCache, cacheKey, options);
         this.requiresCreateEmptyCache = true;
         this.requiresKeepArchive = true;
-        this.restoredFromNodeLocal = false;
         if (!options.fsSize) {
             throw new Error("fsSize option is required for VhdxContainer");
         }
         this.fsSize = options.fsSize;
         this.bufferBytes = ((_a = options.bufferMb) !== null && _a !== void 0 ? _a : 512) * 1024 * 1024;
-        this.nodeLocal = new NodeLocalCache_1.NodeLocalCache(options.nodeLocalCacheDir || "", cacheKey, ".vhdx");
         // Security: validate paths
         this.checkPathTraversal(this.baseDir, this.containerFile);
         this.pathsToCache.forEach(p => this.checkPathTraversal(this.baseDir, p));
@@ -98510,6 +98498,9 @@ class VhdxContainer extends Container_1.Container {
         if (!/^[0-9]+[KMGT]?$/.test(this.fsSize)) {
             throw new Error(`Invalid filesystem size format: ${this.fsSize}. Must be a number followed by optional K, M, G, or T.`);
         }
+    }
+    nodeLocalExtension() {
+        return ".vhdx";
     }
     isSupportedMethod(method) {
         return method === "vhdx";
@@ -98564,25 +98555,6 @@ class VhdxContainer extends Container_1.Container {
                 return false;
             }
         });
-    }
-    shouldSkipS3Upload() {
-        return this.restoredFromNodeLocal;
-    }
-    getNodeLocalDownloadPath() {
-        return __awaiter(this, void 0, void 0, function* () {
-            return this.nodeLocal.getDownloadPath();
-        });
-    }
-    commitNodeLocalDownload(tempPath) {
-        return __awaiter(this, void 0, void 0, function* () {
-            return this.nodeLocal.commitTempFile(tempPath);
-        });
-    }
-    getNodeLocalFinalPath() {
-        return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
-    }
-    isNodeLocalEnabled() {
-        return this.nodeLocal.enabled;
     }
     getLogPrefix() {
         return "[VHDX]";

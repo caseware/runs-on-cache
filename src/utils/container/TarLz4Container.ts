@@ -9,38 +9,13 @@ import { execSync } from "child_process";
 import { dirname } from "path";
 
 import { Container, ContainerOptions } from "./Container";
-import { NodeLocalCache } from "./NodeLocalCache";
 
 export class TarLz4Container extends Container {
     requiresCreateEmptyCache = false;
     requiresKeepArchive = false;
 
-    private readonly nodeLocal: NodeLocalCache;
-    private restoredFromNodeLocal = false;
-
-    constructor(
-        containerFile: string,
-        compressionMethod: string,
-        compressionLevel: string | undefined,
-        baseDir: string,
-        pathsToCache: string[],
-        cacheKey: string,
-        options: ContainerOptions
-    ) {
-        super(
-            containerFile,
-            compressionMethod,
-            compressionLevel,
-            baseDir,
-            pathsToCache,
-            cacheKey,
-            options
-        );
-        this.nodeLocal = new NodeLocalCache(
-            options.nodeLocalCacheDir || "",
-            cacheKey,
-            ".tar.lz4"
-        );
+    protected nodeLocalExtension(): string {
+        return ".tar.lz4";
     }
 
     async initialize(): Promise<void> {
@@ -49,61 +24,6 @@ export class TarLz4Container extends Container {
         } catch (e) {
             core.warning(`[TarLz4] Stale temp cleanup failed (non-fatal): ${(e as Error).message}`);
         }
-    }
-
-    async tryRestoreFromNodeLocal(restoreKeys?: string[]): Promise<boolean> {
-        if (!this.nodeLocal.enabled) return false;
-
-        // 1. Try exact key match
-        const localExists = await this.nodeLocal.exists();
-        let localPath: string | null = localExists ? this.nodeLocal.localPath : null;
-
-        // 2. Try partial match from restore-keys
-        if (!localPath && restoreKeys && restoreKeys.length > 0) {
-            localPath = await this.nodeLocal.findClosestMatch(restoreKeys);
-            if (localPath) {
-                this.logInfo(`Node-local partial hit — using ${localPath}`);
-            }
-        }
-
-        if (!localPath) return false;
-
-        this.logInfo(`Node-local cache hit — restoring from ${localPath}`);
-
-        try {
-            // Point containerFile to the node-local archive and restore from it
-            this.containerFile = localPath;
-            await this.restore();
-            this.restoredFromNodeLocal = true;
-            return true;
-        } catch (error) {
-            core.warning(
-                `${this.getLogPrefix()} Node-local restore failed, falling back to S3: ${
-                    error instanceof Error ? error.message : error
-                }`
-            );
-            return false;
-        }
-    }
-
-    shouldSkipS3Upload(): boolean {
-        return this.restoredFromNodeLocal;
-    }
-
-    async getNodeLocalDownloadPath(): Promise<string | null> {
-        return this.nodeLocal.getDownloadPath();
-    }
-
-    async commitNodeLocalDownload(tempPath: string): Promise<boolean> {
-        return this.nodeLocal.commitTempFile(tempPath);
-    }
-
-    getNodeLocalFinalPath(): string | null {
-        return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
-    }
-
-    isNodeLocalEnabled(): boolean {
-        return this.nodeLocal.enabled;
     }
 
     protected getLogPrefix(): string {
