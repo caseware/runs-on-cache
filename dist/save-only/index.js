@@ -96278,7 +96278,16 @@ function saveRun(earlyExit) {
             //   1. Restore didn't complete (CACHE_SAVE_ENABLED not set)
             //   2. Job was cancelled (uploading a partial cache wastes time)
             // BTRFS cleanup always runs in the finally block regardless.
-            const cancelled = process.env["GITHUB_ACTION_STATUS"] === "cancelled";
+            // Debug: dump all GITHUB_* and STATE_* env vars so we can identify
+            // the correct cancellation signal for JS action post steps.
+            core.info("[post-step-debug] Env vars for cancellation detection:");
+            for (const [key, val] of Object.entries(process.env)) {
+                if (key.startsWith("GITHUB_") || key.startsWith("STATE_") || key.startsWith("RUNNER_")) {
+                    core.info(`  ${key}=${val}`);
+                }
+            }
+            const cancelled = process.env["GITHUB_JOB_STATUS"] === "cancelled" ||
+                process.env["GITHUB_ACTION_STATUS"] === "cancelled";
             if (cancelled) {
                 core.info("Skipping cache save — job was cancelled");
             }
