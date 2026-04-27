@@ -272,14 +272,21 @@ export class BtrfsImage {
             usedBytes = 512 * 1024 * 1024;
         }
 
-        const targetSize = usedBytes + this.opts.saveBufferBytes;
+        // Minimum 64 MB headroom beyond Device allocated — BTRFS internal
+        // structures (backup superblocks at 64 MB, chunk-tree slack) may
+        // reference offsets past the reported allocation.  Without this,
+        // btrfstune (UUID randomization on restore) fails with
+        // "No valid Btrfs found" on the truncated image.
+        const MIN_STRUCTURAL_HEADROOM = 64 * 1024 * 1024; // 64 MB
+        const buffer = Math.max(this.opts.saveBufferBytes, MIN_STRUCTURAL_HEADROOM);
+        const targetSize = usedBytes + buffer;
         const targetMb = Math.max(
             1,
             Math.ceil(targetSize / (1024 * 1024))
         );
 
         info(
-            `Resize target: ${targetMb} MB (effective usage: ${Math.ceil(usedBytes / (1024 * 1024))} MB + ${Math.ceil(this.opts.saveBufferBytes / (1024 * 1024))} MB save-buffer)`
+            `Resize target: ${targetMb} MB (effective usage: ${Math.ceil(usedBytes / (1024 * 1024))} MB + ${Math.ceil(buffer / (1024 * 1024))} MB headroom)`
         );
         try {
             await exec.exec(
@@ -404,13 +411,40 @@ export class BtrfsImage {
 
     async randomizeUuid(): Promise<void> {
         info("Randomizing BTRFS UUID on copy");
+
+        // Attach to a loop device first — btrfstune is more reliable on block
+        // devices than on raw files (especially after truncate to exact size).
+        let loopDev: string | undefined;
+        try {
+            const loResult = await exec.getExecOutput(
+                "sudo",
+                ["losetup", "--find", "--show", this.imageFile],
+                { cwd: this.opts.safeCwd, silent: !core.isDebug(), ignoreReturnCode: true }
+            );
+            if (loResult.exitCode === 0 && loResult.stdout.trim()) {
+                loopDev = loResult.stdout.trim();
+                info(`Attached ${this.imageFile} → ${loopDev} for UUID randomization`);
+            }
+        } catch { /* fall through to file-based approach */ }
+
+        const target = loopDev || this.imageFile;
         const result = await exec.getExecOutput(
             "sudo",
-            ["btrfstune", "-f", "-u", this.imageFile],
+            ["btrfstune", "-f", "-u", target],
             { cwd: this.opts.safeCwd, silent: !core.isDebug(), ignoreReturnCode: true }
         );
+
+        // Always detach loop device, even on failure
+        if (loopDev) {
+            try {
+                await exec.exec(
+                    "sudo", ["losetup", "-d", loopDev],
+                    { cwd: this.opts.safeCwd, silent: true, ignoreReturnCode: true }
+                );
+            } catch { /* best-effort */ }
+        }
+
         if (result.exitCode !== 0) {
-            // Collect diagnostics before throwing
             const stderr = result.stderr.trim();
             const stdout = result.stdout.trim();
             let fileSizeMb = "unknown";
@@ -430,7 +464,7 @@ export class BtrfsImage {
 
             core.warning(
                 `${LOG_PREFIX} btrfstune failed (exit ${result.exitCode}). ` +
-                `File: ${this.imageFile} (${fileSizeMb} MB). ` +
+                `Target: ${target}. File: ${this.imageFile} (${fileSizeMb} MB). ` +
                 `stderr: ${stderr || "(empty)"}. stdout: ${stdout || "(empty)"}. ` +
                 `df: ${dfOutput || "(unavailable)"}`
             );
