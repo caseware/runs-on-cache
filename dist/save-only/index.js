@@ -96841,10 +96841,14 @@ class BtrfsContainer extends Container_1.Container {
         this.checkPathTraversal(this.baseDir, this.containerFile);
         this.pathsToCache.forEach(p => this.checkPathTraversal(this.baseDir, p));
         // BtrfsImage handles all image-level operations (A)
+        // Save buffer: small fixed overhead (128 MB default) — keeps S3 images tight.
+        // RW restore headroom: dynamic target utilization (80% default).
+        const saveBufferMb = this.mountMode === "ro" ? 0 : Math.min((_a = options.bufferMb) !== null && _a !== void 0 ? _a : 128, 256);
         this.image = new BtrfsImage_1.BtrfsImage(containerFile, {
             compressionLevel: this.compressionLevel,
             saveCompressionLevel: saveCompLevel,
-            bufferBytes: ((_a = options.bufferMb) !== null && _a !== void 0 ? _a : 256) * 1024 * 1024,
+            saveBufferBytes: saveBufferMb * 1024 * 1024,
+            rwUtilizationTarget: 0.80,
             safeCwd: "" // set in initialize()
         });
     }
@@ -96939,6 +96943,7 @@ class BtrfsContainer extends Container_1.Container {
                 }
                 else {
                     yield this.mountImageReadWrite();
+                    yield this.image.expandForHeadroom(this.mountPoint);
                     yield this.image.checkHealth(this.mountPoint);
                 }
             }
@@ -97054,6 +97059,7 @@ class BtrfsContainer extends Container_1.Container {
             this.containerFile = localCopy;
             this.image.setImageFile(localCopy);
             yield this.mountImageReadWrite();
+            yield this.image.expandForHeadroom(this.mountPoint);
         });
     }
     // ── Bind mounts ──────────────────────────────────────────────────
@@ -97360,6 +97366,57 @@ class BtrfsImage {
             ]);
         });
     }
+    /**
+     * Expand a mounted RW image so utilization stays below rwUtilizationTarget.
+     * Called after mountRW on restore — the saved image is tight (small save-buffer),
+     * and the consumer may need write headroom.
+     */
+    expandForHeadroom(mountPoint) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const target = this.opts.rwUtilizationTarget;
+            if (target <= 0 || target >= 1)
+                return; // disabled or invalid
+            let usedBytes;
+            try {
+                const usageOutput = yield this.getBtrfsUsage(mountPoint);
+                usedBytes = this.parseUsedBytes(usageOutput);
+            }
+            catch (_a) {
+                core.debug(`${LOG_PREFIX} Cannot read usage for headroom expansion — skipping`);
+                return;
+            }
+            if (usedBytes === 0)
+                return; // empty image, nothing to expand
+            const desiredSize = Math.ceil(usedBytes / target);
+            const stat = yield fs.stat(this.imageFile);
+            const currentSize = stat.size;
+            if (desiredSize <= currentSize) {
+                const pct = Math.round((usedBytes / currentSize) * 100);
+                info(`RW headroom OK: ${pct}% utilization (target ≤${Math.round(target * 100)}%)`);
+                return;
+            }
+            const desiredMb = Math.ceil(desiredSize / (1024 * 1024));
+            info(`Expanding for RW headroom: ${Math.ceil(currentSize / (1024 * 1024))} MB → ${desiredMb} MB ` +
+                `(${Math.ceil(usedBytes / (1024 * 1024))} MB used, target ${Math.round(target * 100)}% utilization)`);
+            // Expand the backing file first (so the filesystem has backing space)
+            try {
+                yield exec.exec("truncate", ["-s", `${desiredMb}M`, this.imageFile], {
+                    cwd: this.opts.safeCwd
+                });
+            }
+            catch (e) {
+                core.warning(`${LOG_PREFIX} Backing file expansion failed: ${e instanceof Error ? e.message : e}`);
+                return;
+            }
+            // Expand the filesystem to fill the new backing space
+            try {
+                yield sudoExec("btrfs", ["filesystem", "resize", "max", mountPoint], this.opts.safeCwd);
+            }
+            catch (e) {
+                core.warning(`${LOG_PREFIX} Filesystem expand failed: ${e instanceof Error ? e.message : e}`);
+            }
+        });
+    }
     unmount(mountPoint) {
         return __awaiter(this, void 0, void 0, function* () {
             try {
@@ -97455,9 +97512,9 @@ class BtrfsImage {
                 core.warning(`Could not determine exact usage, using default buffer: ${error}`);
                 usedBytes = 512 * 1024 * 1024;
             }
-            const targetSize = usedBytes + this.opts.bufferBytes;
+            const targetSize = usedBytes + this.opts.saveBufferBytes;
             const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024)));
-            info(`Resize target: ${targetMb} MB (effective usage: ${Math.ceil(usedBytes / (1024 * 1024))} MB + ${Math.ceil(this.opts.bufferBytes / (1024 * 1024))} MB buffer)`);
+            info(`Resize target: ${targetMb} MB (effective usage: ${Math.ceil(usedBytes / (1024 * 1024))} MB + ${Math.ceil(this.opts.saveBufferBytes / (1024 * 1024))} MB save-buffer)`);
             try {
                 yield exec.exec("sudo", [
                     "btrfs",

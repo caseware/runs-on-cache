@@ -19,7 +19,10 @@ const LOG_PREFIX = "[BTRFS]";
 export interface BtrfsImageOptions {
     compressionLevel: string;
     saveCompressionLevel: string;
-    bufferBytes: number;
+    /** Buffer added on SAVE — small metadata overhead only (default 128 MB). */
+    saveBufferBytes: number;
+    /** Target utilization on RESTORE RW — dynamic headroom (default 0.80). */
+    rwUtilizationTarget: number;
     safeCwd: string;
 }
 
@@ -83,6 +86,60 @@ export class BtrfsImage {
             "rw",
             `compress=${this.opts.compressionLevel}`
         ]);
+    }
+
+    /**
+     * Expand a mounted RW image so utilization stays below rwUtilizationTarget.
+     * Called after mountRW on restore — the saved image is tight (small save-buffer),
+     * and the consumer may need write headroom.
+     */
+    async expandForHeadroom(mountPoint: string): Promise<void> {
+        const target = this.opts.rwUtilizationTarget;
+        if (target <= 0 || target >= 1) return; // disabled or invalid
+
+        let usedBytes: number;
+        try {
+            const usageOutput = await this.getBtrfsUsage(mountPoint);
+            usedBytes = this.parseUsedBytes(usageOutput);
+        } catch {
+            core.debug(`${LOG_PREFIX} Cannot read usage for headroom expansion — skipping`);
+            return;
+        }
+
+        if (usedBytes === 0) return; // empty image, nothing to expand
+
+        const desiredSize = Math.ceil(usedBytes / target);
+        const stat = await fs.stat(this.imageFile);
+        const currentSize = stat.size;
+
+        if (desiredSize <= currentSize) {
+            const pct = Math.round((usedBytes / currentSize) * 100);
+            info(`RW headroom OK: ${pct}% utilization (target ≤${Math.round(target * 100)}%)`);
+            return;
+        }
+
+        const desiredMb = Math.ceil(desiredSize / (1024 * 1024));
+        info(
+            `Expanding for RW headroom: ${Math.ceil(currentSize / (1024 * 1024))} MB → ${desiredMb} MB ` +
+            `(${Math.ceil(usedBytes / (1024 * 1024))} MB used, target ${Math.round(target * 100)}% utilization)`
+        );
+
+        // Expand the backing file first (so the filesystem has backing space)
+        try {
+            await exec.exec("truncate", ["-s", `${desiredMb}M`, this.imageFile], {
+                cwd: this.opts.safeCwd
+            });
+        } catch (e) {
+            core.warning(`${LOG_PREFIX} Backing file expansion failed: ${e instanceof Error ? e.message : e}`);
+            return;
+        }
+
+        // Expand the filesystem to fill the new backing space
+        try {
+            await sudoExec("btrfs", ["filesystem", "resize", "max", mountPoint], this.opts.safeCwd);
+        } catch (e) {
+            core.warning(`${LOG_PREFIX} Filesystem expand failed: ${e instanceof Error ? e.message : e}`);
+        }
     }
 
     async unmount(mountPoint: string): Promise<void> {
@@ -209,14 +266,14 @@ export class BtrfsImage {
             usedBytes = 512 * 1024 * 1024;
         }
 
-        const targetSize = usedBytes + this.opts.bufferBytes;
+        const targetSize = usedBytes + this.opts.saveBufferBytes;
         const targetMb = Math.max(
             1,
             Math.ceil(targetSize / (1024 * 1024))
         );
 
         info(
-            `Resize target: ${targetMb} MB (effective usage: ${Math.ceil(usedBytes / (1024 * 1024))} MB + ${Math.ceil(this.opts.bufferBytes / (1024 * 1024))} MB buffer)`
+            `Resize target: ${targetMb} MB (effective usage: ${Math.ceil(usedBytes / (1024 * 1024))} MB + ${Math.ceil(this.opts.saveBufferBytes / (1024 * 1024))} MB save-buffer)`
         );
         try {
             await exec.exec(

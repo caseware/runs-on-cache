@@ -77,10 +77,14 @@ export class BtrfsContainer extends Container {
         );
 
         // BtrfsImage handles all image-level operations (A)
+        // Save buffer: small fixed overhead (128 MB default) — keeps S3 images tight.
+        // RW restore headroom: dynamic target utilization (80% default).
+        const saveBufferMb = this.mountMode === "ro" ? 0 : Math.min(options.bufferMb ?? 128, 256);
         this.image = new BtrfsImage(containerFile, {
             compressionLevel: this.compressionLevel!,
             saveCompressionLevel: saveCompLevel,
-            bufferBytes: (options.bufferMb ?? 256) * 1024 * 1024,
+            saveBufferBytes: saveBufferMb * 1024 * 1024,
+            rwUtilizationTarget: 0.80,
             safeCwd: "" // set in initialize()
         });
     }
@@ -193,6 +197,7 @@ export class BtrfsContainer extends Container {
                 await this.mountImageReadOnly(this.containerFile);
             } else {
                 await this.mountImageReadWrite();
+                await this.image.expandForHeadroom(this.mountPoint!);
                 await this.image.checkHealth(this.mountPoint!);
             }
         } catch (error) {
@@ -326,6 +331,7 @@ export class BtrfsContainer extends Container {
         this.containerFile = localCopy;
         this.image.setImageFile(localCopy);
         await this.mountImageReadWrite();
+        await this.image.expandForHeadroom(this.mountPoint!);
     }
 
     // ── Bind mounts ──────────────────────────────────────────────────
