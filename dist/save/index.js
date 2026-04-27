@@ -96172,11 +96172,30 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.saveRun = exports.saveOnlyRun = exports.saveImpl = void 0;
 const cache = __importStar(__nccwpck_require__(7799));
 const core = __importStar(__nccwpck_require__(2186));
+const fs = __importStar(__nccwpck_require__(7147));
+const path = __importStar(__nccwpck_require__(1017));
 const constants_1 = __nccwpck_require__(9042);
 const stateProvider_1 = __nccwpck_require__(1527);
 const utils = __importStar(__nccwpck_require__(6850));
 const custom = __importStar(__nccwpck_require__(1082));
 const BtrfsCleanup_1 = __nccwpck_require__(3302);
+/**
+ * Marker file that workflows must create before the post step runs to
+ * signal that the job completed its main work and the cache is safe to
+ * upload.  Only checked for BTRFS caches — uploading a half-populated
+ * BTRFS image after a cancelled job would poison the S3 cache.
+ *
+ * Usage in workflow YAML (add as the last step after all main work):
+ *
+ *   - name: Mark cache save safe
+ *     if: success() || failure()
+ *     run: touch "${RUNNER_TEMP}/.cache-save-ok"
+ *
+ * The `if: success() || failure()` condition ensures the marker is NOT
+ * written when the job is cancelled.  The post step checks for this
+ * file and skips the S3 upload if it's missing.
+ */
+const CACHE_SAVE_MARKER = ".cache-save-ok";
 const canSaveToS3 = process.env["RUNS_ON_S3_BUCKET_CACHE"] !== undefined;
 // Catch and log any unhandled exceptions.  These exceptions can leak out of the uploadChunk method in
 // @actions/toolkit when a failed upload closes the file descriptor causing any in-process reads to
@@ -96276,28 +96295,33 @@ function saveRun(earlyExit) {
             // With post-if: "always()", the post step runs on success, failure,
             // AND cancellation. We skip the S3 upload when:
             //   1. Restore didn't complete (CACHE_SAVE_ENABLED not set)
-            //   2. Job was cancelled (uploading a partial cache wastes time)
+            //   2. For BTRFS caches: the marker file $RUNNER_TEMP/.cache-save-ok
+            //      is missing, meaning the job was cancelled or didn't complete
+            //      its main work (uploading a partial BTRFS image poisons S3).
             // BTRFS cleanup always runs in the finally block regardless.
-            // Debug: dump all GITHUB_* and STATE_* env vars so we can identify
-            // the correct cancellation signal for JS action post steps.
-            core.info("[post-step-debug] Env vars for cancellation detection:");
-            for (const [key, val] of Object.entries(process.env)) {
-                if (key.startsWith("GITHUB_") || key.startsWith("STATE_") || key.startsWith("RUNNER_")) {
-                    core.info(`  ${key}=${val}`);
-                }
-            }
-            const cancelled = process.env["GITHUB_JOB_STATUS"] === "cancelled" ||
-                process.env["GITHUB_ACTION_STATUS"] === "cancelled";
-            if (cancelled) {
-                core.info("Skipping cache save — job was cancelled");
+            const saveEnabled = core.getState("CACHE_SAVE_ENABLED") === "true";
+            if (!saveEnabled) {
+                core.info("Skipping cache save — restore step did not complete successfully");
             }
             else {
-                const saveEnabled = core.getState("CACHE_SAVE_ENABLED") === "true";
-                if (saveEnabled) {
-                    yield saveImpl(new stateProvider_1.StateProvider());
+                const isBtrfs = (core.getState("CUSTOM_COMPRESSION") ||
+                    core.getInput(constants_1.Inputs.CustomCompression) ||
+                    "") === "btrfs";
+                if (isBtrfs) {
+                    const runnerTemp = process.env["RUNNER_TEMP"] || "/tmp";
+                    const markerPath = path.join(runnerTemp, CACHE_SAVE_MARKER);
+                    if (!fs.existsSync(markerPath)) {
+                        core.warning("Skipping BTRFS cache save — marker file " +
+                            `${markerPath} not found. The job was likely ` +
+                            "cancelled before completing. Add a workflow step " +
+                            'to create this marker: touch "${RUNNER_TEMP}/.cache-save-ok"');
+                    }
+                    else {
+                        yield saveImpl(new stateProvider_1.StateProvider());
+                    }
                 }
                 else {
-                    core.info("Skipping cache save — restore step did not complete successfully");
+                    yield saveImpl(new stateProvider_1.StateProvider());
                 }
             }
         }
