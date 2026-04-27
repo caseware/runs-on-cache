@@ -95617,6 +95617,18 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             else {
                 // Supress all non-validation cache related errors because caching should be optional
                 core.warning(`Failed to restore: ${error.message}`);
+                // Fallback: create an empty BTRFS filesystem so the workspace
+                // still gets a mount and the save step can produce a new valid
+                // image (e.g. after a corrupted cache download).
+                if (cacheContainer && cacheContainer.requiresCreateEmptyCache) {
+                    try {
+                        core.info("Creating empty BTRFS cache as fallback after restore failure");
+                        yield cacheContainer.createEmptyCache();
+                    }
+                    catch (createError) {
+                        core.warning(`Fallback createEmptyCache also failed: ${createError.message}`);
+                    }
+                }
             }
         }
         finally {

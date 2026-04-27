@@ -233,6 +233,20 @@ export async function restoreCache(
         } else {
             // Supress all non-validation cache related errors because caching should be optional
             core.warning(`Failed to restore: ${(error as Error).message}`);
+
+            // Fallback: create an empty BTRFS filesystem so the workspace
+            // still gets a mount and the save step can produce a new valid
+            // image (e.g. after a corrupted cache download).
+            if (cacheContainer && cacheContainer.requiresCreateEmptyCache) {
+                try {
+                    core.info("Creating empty BTRFS cache as fallback after restore failure");
+                    await cacheContainer.createEmptyCache();
+                } catch (createError) {
+                    core.warning(
+                        `Fallback createEmptyCache also failed: ${(createError as Error).message}`
+                    );
+                }
+            }
         }
     } finally {
         if (!cacheContainer || !cacheContainer.requiresKeepArchive) {
