@@ -142,16 +142,21 @@ export async function saveOnlyRun(
 
 export async function saveRun(earlyExit?: boolean | undefined): Promise<void> {
     try {
-        // Only attempt save if the restore step completed successfully.
-        // The main step sets CACHE_SAVE_ENABLED on successful restore.
         // With post-if: "always()", the post step runs on success, failure,
-        // AND cancellation — but we skip the S3 upload when restore didn't
-        // complete. BTRFS cleanup always runs in the finally block below.
-        const saveEnabled = core.getState("CACHE_SAVE_ENABLED") === "true";
-        if (saveEnabled) {
-            await saveImpl(new StateProvider());
+        // AND cancellation. We skip the S3 upload when:
+        //   1. Restore didn't complete (CACHE_SAVE_ENABLED not set)
+        //   2. Job was cancelled (uploading a partial cache wastes time)
+        // BTRFS cleanup always runs in the finally block regardless.
+        const cancelled = process.env["GITHUB_ACTION_STATUS"] === "cancelled";
+        if (cancelled) {
+            core.info("Skipping cache save — job was cancelled");
         } else {
-            core.info("Skipping cache save — restore step did not complete successfully");
+            const saveEnabled = core.getState("CACHE_SAVE_ENABLED") === "true";
+            if (saveEnabled) {
+                await saveImpl(new StateProvider());
+            } else {
+                core.info("Skipping cache save — restore step did not complete successfully");
+            }
         }
     } catch (err) {
         console.error(err);

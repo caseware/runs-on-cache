@@ -77,13 +77,13 @@ export class BtrfsContainer extends Container {
         );
 
         // BtrfsImage handles all image-level operations (A)
-        // Save buffer: small fixed overhead (128 MB default) — keeps S3 images tight.
-        // RW restore headroom: dynamic target utilization (80% default).
-        const saveBufferMb = this.mountMode === "ro" ? 0 : Math.min(options.bufferMb ?? 128, 256);
+        // Save buffer: zero — the 50G sparse virtual size gives defrag/recompress
+        // all the room it needs. After defrag+sync, resize to exact Device allocated.
+        // RW restore headroom: dynamic 80% utilization target (expand after mount).
         this.image = new BtrfsImage(containerFile, {
             compressionLevel: this.compressionLevel!,
             saveCompressionLevel: saveCompLevel,
-            saveBufferBytes: saveBufferMb * 1024 * 1024,
+            saveBufferBytes: 0,
             rwUtilizationTarget: 0.80,
             safeCwd: "" // set in initialize()
         });

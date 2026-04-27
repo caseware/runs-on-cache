@@ -96514,7 +96514,6 @@ const Container_1 = __nccwpck_require__(9620);
 const BtrfsImage_1 = __nccwpck_require__(7517);
 class BtrfsContainer extends Container_1.Container {
     constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
-        var _a;
         if (!compressionLevel) {
             compressionLevel = "zstd:3";
         }
@@ -96542,13 +96541,13 @@ class BtrfsContainer extends Container_1.Container {
         this.checkPathTraversal(this.baseDir, this.containerFile);
         this.pathsToCache.forEach(p => this.checkPathTraversal(this.baseDir, p));
         // BtrfsImage handles all image-level operations (A)
-        // Save buffer: small fixed overhead (128 MB default) — keeps S3 images tight.
-        // RW restore headroom: dynamic target utilization (80% default).
-        const saveBufferMb = this.mountMode === "ro" ? 0 : Math.min((_a = options.bufferMb) !== null && _a !== void 0 ? _a : 128, 256);
+        // Save buffer: zero — the 50G sparse virtual size gives defrag/recompress
+        // all the room it needs. After defrag+sync, resize to exact Device allocated.
+        // RW restore headroom: dynamic 80% utilization target (expand after mount).
         this.image = new BtrfsImage_1.BtrfsImage(containerFile, {
             compressionLevel: this.compressionLevel,
             saveCompressionLevel: saveCompLevel,
-            saveBufferBytes: saveBufferMb * 1024 * 1024,
+            saveBufferBytes: 0,
             rwUtilizationTarget: 0.80,
             safeCwd: "" // set in initialize()
         });
