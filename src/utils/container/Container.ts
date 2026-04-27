@@ -118,14 +118,6 @@ export abstract class Container {
         return this.nodeLocal.enabled;
     }
 
-    /**
-     * Returns the active pool file path if restored from the DaemonSet pool, or null.
-     * Override in BtrfsContainer to return the tracked active-* file.
-     */
-    getPoolActiveFile(): string | null {
-        return null;
-    }
-
     // ── Common helpers ───────────────────────────────────────────────
 
     setArchivePath(archivePath: string): void {

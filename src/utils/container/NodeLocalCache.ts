@@ -40,13 +40,6 @@ export class NodeLocalCache {
     }
 
     /**
-     * The base cache directory path on the node.
-     */
-    get cacheDirectory(): string {
-        return this.cacheDir;
-    }
-
-    /**
      * The final path for this cache key on the node.
      * e.g. /opt/local-volumes/btrfs-cache/<cache-key>.btrfs
      */
