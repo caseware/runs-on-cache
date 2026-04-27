@@ -1090,15 +1090,13 @@ export class BtrfsContainer extends Container {
                 throw new Error("Mount point is not set");
             }
 
-            // Normalize absolute paths to relative before joining with baseDir.
-            // path.join('/workspace', '/absolute/path') concatenates instead of
-            // resolving, creating '/workspace/absolute/path' — a stray directory
-            // tree owned by root inside the workspace.
-            const relativePath = path.isAbsolute(p)
-                ? path.relative(this.baseDir, p)
-                : p;
-            const absPath = path.join(this.baseDir, relativePath);
-            const btrfsPath = path.join(this.mountPoint, relativePath);
+            // For absolute paths (e.g. $RUNNER_TEMP/git-cache/objects), use them
+            // directly as the workspace target — do NOT path.join(baseDir, p)
+            // because path.join concatenates, creating stray dirs inside workspace.
+            // For the BTRFS internal path, path.join(mountPoint, p) is correct:
+            // it strips the leading '/' and nests inside the mount.
+            const absPath = path.isAbsolute(p) ? p : path.join(this.baseDir, p);
+            const btrfsPath = path.join(this.mountPoint, p);
 
             core.debug(`[BTRFS] Bind-mounting ${btrfsPath} → ${absPath}${readOnly ? " (ro)" : ""}`);
 
@@ -1177,10 +1175,7 @@ export class BtrfsContainer extends Container {
     private async cleanStaleMounts(): Promise<void> {
         // Check bind mount targets (workspace paths like node_modules)
         for (const p of this.pathsToCache) {
-            const relativePath = path.isAbsolute(p)
-                ? path.relative(this.baseDir, p)
-                : p;
-            const absPath = path.join(this.baseDir, relativePath);
+            const absPath = path.isAbsolute(p) ? p : path.join(this.baseDir, p);
             await this.unmountIfMounted(absPath);
         }
 
@@ -1218,10 +1213,7 @@ export class BtrfsContainer extends Container {
 
             // First unmount all bind mounts
             for (const p of this.pathsToCache) {
-                const relativePath = path.isAbsolute(p)
-                    ? path.relative(this.baseDir, p)
-                    : p;
-                const absPath = path.join(this.baseDir, relativePath);
+                const absPath = path.isAbsolute(p) ? p : path.join(this.baseDir, p);
                 try {
                     const bindMountCheck = await exec.exec(
                         "mountpoint",
