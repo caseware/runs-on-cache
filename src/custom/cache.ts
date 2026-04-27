@@ -141,6 +141,11 @@ export async function restoreCache(
         if (restoredFromLocal) {
             core.info("Cache restored from node-local storage (fast path)");
             core.setOutput(Outputs.NodeLocalCacheHit, "true");
+            // Persist pool active file path so the save step can clean it up
+            const poolFile = cacheContainer.getPoolActiveFile();
+            if (poolFile) {
+                core.saveState("POOL_ACTIVE_FILE", poolFile);
+            }
             return primaryKey;
         }
 
@@ -422,6 +427,20 @@ export async function saveCache(
             }
         }
     } finally {
+        // Clean up active-* pool file after job completes (success or failure).
+        // The active file path was saved to state during restore; read it here.
+        // DaemonSet will replenish the pool. Stale-active cleanup is the safety net.
+        const activePoolFile = core.getState("POOL_ACTIVE_FILE");
+        if (activePoolFile) {
+            try {
+                const fsModule = await import("fs/promises");
+                await fsModule.unlink(activePoolFile);
+                core.info(`[Pool] Cleaned up active file: ${path.basename(activePoolFile)}`);
+            } catch (e) {
+                core.warning(`[Pool] Failed to clean up active file: ${e}`);
+            }
+        }
+
         // Try to delete the archive to save space
         try {
             await utils.unlinkFile(archivePath);

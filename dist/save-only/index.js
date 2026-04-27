@@ -95543,6 +95543,11 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             if (restoredFromLocal) {
                 core.info("Cache restored from node-local storage (fast path)");
                 core.setOutput(constants_1.Outputs.NodeLocalCacheHit, "true");
+                // Persist pool active file path so the save step can clean it up
+                const poolFile = cacheContainer.getPoolActiveFile();
+                if (poolFile) {
+                    core.saveState("POOL_ACTIVE_FILE", poolFile);
+                }
                 return primaryKey;
             }
             // path are needed to compute version
@@ -95776,6 +95781,20 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
             }
         }
         finally {
+            // Clean up active-* pool file after job completes (success or failure).
+            // The active file path was saved to state during restore; read it here.
+            // DaemonSet will replenish the pool. Stale-active cleanup is the safety net.
+            const activePoolFile = core.getState("POOL_ACTIVE_FILE");
+            if (activePoolFile) {
+                try {
+                    const fsModule = yield Promise.resolve().then(() => __importStar(__nccwpck_require__(3292)));
+                    yield fsModule.unlink(activePoolFile);
+                    core.info(`[Pool] Cleaned up active file: ${path.basename(activePoolFile)}`);
+                }
+                catch (e) {
+                    core.warning(`[Pool] Failed to clean up active file: ${e}`);
+                }
+            }
             // Try to delete the archive to save space
             try {
                 yield utils.unlinkFile(archivePath);
@@ -96815,6 +96834,7 @@ exports.BtrfsContainer = void 0;
  * adds the cache-action-specific orchestration (bind mounts, node-local, key tracking).
  */
 const core = __importStar(__nccwpck_require__(2186));
+const crypto = __importStar(__nccwpck_require__(6005));
 const exec = __importStar(__nccwpck_require__(1514));
 const fs = __importStar(__nccwpck_require__(3977));
 const os = __importStar(__nccwpck_require__(612));
@@ -96836,6 +96856,8 @@ class BtrfsContainer extends Container_1.Container {
         this.mountIsReadOnly = false;
         /** Per-run temp dir used as CWD for all exec calls. */
         this.safeCwd = "";
+        /** Tracks the active-* file path when restored from pool, for post-job cleanup. */
+        this.poolActiveFile = null;
         if (!options.fsSize) {
             throw new Error("fsSize option is required for BtrfsContainer");
         }
@@ -96905,6 +96927,31 @@ class BtrfsContainer extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             if (!this.nodeLocal.enabled)
                 return false;
+            // 0. Pool pre-stage fast path (RW only)
+            // DaemonSet pre-stages .pool-NN.btrfs copies with unique UUIDs.
+            // Atomic rename is O(1) on same filesystem — no copy needed.
+            if (this.mountMode === "rw") {
+                const poolFile = yield this.findPoolFile();
+                if (poolFile) {
+                    const runId = process.env["GITHUB_RUN_ID"] || crypto.randomUUID().slice(0, 8);
+                    const attempt = process.env["GITHUB_RUN_ATTEMPT"] || "1";
+                    const activeFile = path.join(path.dirname(poolFile), `active-${runId}-${attempt}.btrfs`);
+                    this.logInfo(`Pool hit — renaming ${path.basename(poolFile)} → ${path.basename(activeFile)}`);
+                    try {
+                        yield fs.rename(poolFile, activeFile);
+                        this.containerFile = activeFile;
+                        this.poolActiveFile = activeFile;
+                        this.image.setImageFile(activeFile);
+                        yield this.mountImageReadWrite();
+                        yield this.image.expandForHeadroom(this.mountPoint);
+                        this.restoredFromNodeLocal = true;
+                        return true;
+                    }
+                    catch (error) {
+                        core.warning(`${this.getLogPrefix()} Pool rename failed (race or missing file), falling through: ${error instanceof Error ? error.message : error}`);
+                    }
+                }
+            }
             // 1. Exact key match (fastest path)
             const localExists = yield this.nodeLocal.exists();
             if (localExists) {
@@ -97021,6 +97068,9 @@ class BtrfsContainer extends Container_1.Container {
     }
     shouldSkipS3Upload() {
         return this.mountIsReadOnly || this.saveAborted;
+    }
+    getPoolActiveFile() {
+        return this.poolActiveFile;
     }
     // ── Private: mount orchestration ─────────────────────────────────
     mountImageReadOnly(imageFile) {
@@ -97253,6 +97303,38 @@ class BtrfsContainer extends Container_1.Container {
                 cwd: this.safeCwd,
                 silent: !core.isDebug()
             });
+        });
+    }
+    /**
+     * Find an available pre-staged pool copy in the node-local cache dir.
+     * Returns the path to the first available .pool-NN.btrfs file, or null.
+     * Uses atomic rename to claim the file (prevents race with other runners).
+     */
+    findPoolFile() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.nodeLocal.enabled)
+                return null;
+            const cacheDir = this.nodeLocal.cacheDirectory;
+            try {
+                const entries = yield fs.readdir(cacheDir);
+                const poolFiles = entries
+                    .filter(e => e.startsWith(".pool-") && e.endsWith(".btrfs") && !e.includes("staging"))
+                    .sort();
+                for (const poolFile of poolFiles) {
+                    const fullPath = path.join(cacheDir, poolFile);
+                    try {
+                        yield fs.access(fullPath);
+                        return fullPath;
+                    }
+                    catch (_a) {
+                        continue; // File was grabbed by another runner
+                    }
+                }
+            }
+            catch (_b) {
+                // Cache dir doesn't exist or isn't readable
+            }
+            return null;
         });
     }
     checkPathTraversal(base, pathToCheck) {
@@ -98212,6 +98294,13 @@ class Container {
     isNodeLocalEnabled() {
         return this.nodeLocal.enabled;
     }
+    /**
+     * Returns the active pool file path if restored from the DaemonSet pool, or null.
+     * Override in BtrfsContainer to return the tracked active-* file.
+     */
+    getPoolActiveFile() {
+        return null;
+    }
     // ── Common helpers ───────────────────────────────────────────────
     setArchivePath(archivePath) {
         this.containerFile = archivePath;
@@ -98344,6 +98433,12 @@ class NodeLocalCache {
      */
     get enabled() {
         return this.cacheDir.length > 0;
+    }
+    /**
+     * The base cache directory path on the node.
+     */
+    get cacheDirectory() {
+        return this.cacheDir;
     }
     /**
      * The final path for this cache key on the node.
@@ -99424,6 +99519,14 @@ module.exports = require("net");
 
 "use strict";
 module.exports = require("node:child_process");
+
+/***/ }),
+
+/***/ 6005:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("node:crypto");
 
 /***/ }),
 

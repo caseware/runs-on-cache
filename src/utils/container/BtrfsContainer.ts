@@ -8,6 +8,7 @@
  * adds the cache-action-specific orchestration (bind mounts, node-local, key tracking).
  */
 import * as core from "@actions/core";
+import * as crypto from "node:crypto";
 import * as exec from "@actions/exec";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -32,6 +33,8 @@ export class BtrfsContainer extends Container {
     private mountIsReadOnly = false;
     /** Per-run temp dir used as CWD for all exec calls. */
     private safeCwd = "";
+    /** Tracks the active-* file path when restored from pool, for post-job cleanup. */
+    private poolActiveFile: string | null = null;
 
     constructor(
         containerFile: string,
@@ -138,6 +141,39 @@ export class BtrfsContainer extends Container {
 
     async tryRestoreFromNodeLocal(restoreKeys?: string[]): Promise<boolean> {
         if (!this.nodeLocal.enabled) return false;
+
+        // 0. Pool pre-stage fast path (RW only)
+        // DaemonSet pre-stages .pool-NN.btrfs copies with unique UUIDs.
+        // Atomic rename is O(1) on same filesystem — no copy needed.
+        if (this.mountMode === "rw") {
+            const poolFile = await this.findPoolFile();
+            if (poolFile) {
+                const runId = process.env["GITHUB_RUN_ID"] || crypto.randomUUID().slice(0, 8);
+                const attempt = process.env["GITHUB_RUN_ATTEMPT"] || "1";
+                const activeFile = path.join(
+                    path.dirname(poolFile),
+                    `active-${runId}-${attempt}.btrfs`
+                );
+                this.logInfo(`Pool hit — renaming ${path.basename(poolFile)} → ${path.basename(activeFile)}`);
+                try {
+                    await fs.rename(poolFile, activeFile);
+
+                    this.containerFile = activeFile;
+                    this.poolActiveFile = activeFile;
+                    this.image.setImageFile(activeFile);
+                    await this.mountImageReadWrite();
+                    await this.image.expandForHeadroom(this.mountPoint!);
+                    this.restoredFromNodeLocal = true;
+                    return true;
+                } catch (error) {
+                    core.warning(
+                        `${this.getLogPrefix()} Pool rename failed (race or missing file), falling through: ${
+                            error instanceof Error ? error.message : error
+                        }`
+                    );
+                }
+            }
+        }
 
         // 1. Exact key match (fastest path)
         const localExists = await this.nodeLocal.exists();
@@ -270,6 +306,10 @@ export class BtrfsContainer extends Container {
 
     shouldSkipS3Upload(): boolean {
         return this.mountIsReadOnly || this.saveAborted;
+    }
+
+    override getPoolActiveFile(): string | null {
+        return this.poolActiveFile;
     }
 
     // ── Private: mount orchestration ─────────────────────────────────
@@ -552,6 +592,36 @@ export class BtrfsContainer extends Container {
             cwd: this.safeCwd,
             silent: !core.isDebug()
         });
+    }
+
+    /**
+     * Find an available pre-staged pool copy in the node-local cache dir.
+     * Returns the path to the first available .pool-NN.btrfs file, or null.
+     * Uses atomic rename to claim the file (prevents race with other runners).
+     */
+    private async findPoolFile(): Promise<string | null> {
+        if (!this.nodeLocal.enabled) return null;
+
+        const cacheDir = this.nodeLocal.cacheDirectory;
+        try {
+            const entries = await fs.readdir(cacheDir);
+            const poolFiles = entries
+                .filter(e => e.startsWith(".pool-") && e.endsWith(".btrfs") && !e.includes("staging"))
+                .sort();
+
+            for (const poolFile of poolFiles) {
+                const fullPath = path.join(cacheDir, poolFile);
+                try {
+                    await fs.access(fullPath);
+                    return fullPath;
+                } catch {
+                    continue; // File was grabbed by another runner
+                }
+            }
+        } catch {
+            // Cache dir doesn't exist or isn't readable
+        }
+        return null;
     }
 
     private checkPathTraversal(base: string, pathToCheck: string): void {
