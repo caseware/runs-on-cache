@@ -207,6 +207,12 @@ export class BtrfsContainer extends Container {
             return this.mountImageReadWrite();
         } catch (error) {
             await this.image.cleanupLoopDevices(this.containerFile);
+            // Clean up the sparse file so the save step doesn't upload
+            // an empty 12GB BTRFS image to S3.
+            try {
+                await fs.unlink(this.containerFile);
+                this.logInfo("Cleaned up sparse file after mount failure");
+            } catch { /* file may not exist */ }
             throw this.wrapError("create empty BTRFS cache", error);
         }
     }
@@ -216,6 +222,12 @@ export class BtrfsContainer extends Container {
             await this.discoverMountInfo();
         } catch {
             this.logInfo("No BTRFS mount found — skipping save");
+            // Delete any stale container file (e.g. empty sparse image from
+            // failed createEmptyCache) to prevent the S3 upload from picking
+            // it up. Without this, a 12GB empty image gets uploaded.
+            try {
+                await fs.unlink(this.containerFile);
+            } catch { /* file may not exist */ }
             return;
         }
 

@@ -462,6 +462,28 @@ export class BtrfsImage {
                 );
             }
         }
+
+        // Verify loop devices actually work on this runner.
+        // K8s pods may lack /dev/loop-control even after modprobe.
+        try {
+            await exec.exec(
+                "sudo",
+                ["losetup", "--find"],
+                {
+                    cwd: this.opts.safeCwd,
+                    silent: !core.isDebug()
+                }
+            );
+        } catch (error) {
+            core.warning(
+                `${LOG_PREFIX} Loop devices are not available on this runner ` +
+                    `(losetup --find failed). BTRFS caching will not work — ` +
+                    `all caches will fall back to S3 download. ` +
+                    `Ensure the 'loop' kernel module is loaded and ` +
+                    `/dev/loop-control is accessible. ` +
+                    `${error instanceof Error ? error.message : error}`
+            );
+        }
     }
 
     // ── Private helpers ─────────────────────────────────────────────

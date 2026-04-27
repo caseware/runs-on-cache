@@ -96956,6 +96956,13 @@ class BtrfsContainer extends Container_1.Container {
             }
             catch (error) {
                 yield this.image.cleanupLoopDevices(this.containerFile);
+                // Clean up the sparse file so the save step doesn't upload
+                // an empty 12GB BTRFS image to S3.
+                try {
+                    yield fs.unlink(this.containerFile);
+                    this.logInfo("Cleaned up sparse file after mount failure");
+                }
+                catch ( /* file may not exist */_a) { /* file may not exist */ }
                 throw this.wrapError("create empty BTRFS cache", error);
             }
         });
@@ -96967,6 +96974,13 @@ class BtrfsContainer extends Container_1.Container {
             }
             catch (_a) {
                 this.logInfo("No BTRFS mount found — skipping save");
+                // Delete any stale container file (e.g. empty sparse image from
+                // failed createEmptyCache) to prevent the S3 upload from picking
+                // it up. Without this, a 12GB empty image gets uploaded.
+                try {
+                    yield fs.unlink(this.containerFile);
+                }
+                catch ( /* file may not exist */_b) { /* file may not exist */ }
                 return;
             }
             if (!this.mountPoint) {
@@ -97645,6 +97659,22 @@ class BtrfsImage {
                 catch (error) {
                     core.debug(`${LOG_PREFIX} modprobe ${mod} failed (module likely built-in): ${error instanceof Error ? error.message : error}`);
                 }
+            }
+            // Verify loop devices actually work on this runner.
+            // K8s pods may lack /dev/loop-control even after modprobe.
+            try {
+                yield exec.exec("sudo", ["losetup", "--find"], {
+                    cwd: this.opts.safeCwd,
+                    silent: !core.isDebug()
+                });
+            }
+            catch (error) {
+                core.warning(`${LOG_PREFIX} Loop devices are not available on this runner ` +
+                    `(losetup --find failed). BTRFS caching will not work — ` +
+                    `all caches will fall back to S3 download. ` +
+                    `Ensure the 'loop' kernel module is loaded and ` +
+                    `/dev/loop-control is accessible. ` +
+                    `${error instanceof Error ? error.message : error}`);
             }
         });
     }
