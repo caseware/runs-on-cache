@@ -192,6 +192,18 @@ export class BtrfsImage {
                     error instanceof Error ? error.message : error
                 }`
             );
+            // Lazy unmount as fallback — detaches mount point even if busy.
+            // Required when the workspace dir is still a CWD of running procs.
+            try {
+                await sudoExec("umount", ["-l", target], this.opts.safeCwd);
+                core.info(`${LOG_PREFIX} Lazy-unmounted ${target}`);
+            } catch (lazyErr) {
+                core.warning(
+                    `${LOG_PREFIX} Lazy umount also failed for ${target}: ${
+                        lazyErr instanceof Error ? lazyErr.message : lazyErr
+                    }`
+                );
+            }
         }
     }
 
