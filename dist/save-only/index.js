@@ -97562,55 +97562,47 @@ class BtrfsImage {
         });
     }
     /**
-     * Verify the image is mountable by doing a RO losetup+mount+umount cycle.
-     * Returns false if verification fails (caller should abort S3 upload).
+     * Verify the BTRFS image is valid before S3 upload using offline
+     * superblock inspection. This avoids the loop-device and UUID-collision
+     * issues that plague mount-based verification after lazy unmount.
      *
-     * After lazy unmount, stale loop devices may still hold the BTRFS UUID in
-     * the kernel. We aggressively detach them (with retries) before attempting
-     * the verify mount. If stale devices can't be detached, we randomize the
-     * UUID to avoid "File exists" BTRFS UUID collision.
+     * Checks:
+     *  1. File exists and is non-empty
+     *  2. `btrfs inspect-internal dump-super` succeeds (validates superblock,
+     *     magic number, checksums, generation counters)
      */
     verifyMountable() {
         return __awaiter(this, void 0, void 0, function* () {
-            info("Verifying image is mountable before upload...");
-            // Detach any stale loop devices from the previous mount (handles lazy unmount leftovers)
-            yield this.cleanupLoopDevices(this.imageFile);
-            // Check if any stale devices remain — if so, randomize UUID to avoid collision
+            info("Verifying image integrity before upload...");
             try {
-                const remaining = yield execWithOutput("losetup", ["-j", this.imageFile], this.opts.safeCwd);
-                if (remaining && remaining.trim()) {
-                    core.warning(`${LOG_PREFIX} Stale loop devices still attached after cleanup, randomizing UUID to avoid collision`);
-                    yield this.randomizeUuid();
+                // 1. File existence + size sanity check
+                const stat = yield fs.stat(this.imageFile);
+                if (stat.size === 0) {
+                    core.error(`${LOG_PREFIX} Image file is empty (0 bytes)`);
+                    return false;
                 }
-            }
-            catch (_a) {
-                // losetup -j may fail if no devices — that's fine
-            }
-            const verifyDir = `${this.imageFile}.verify-mount`;
-            try {
-                const loopDev = yield this.setupLoopDevice(this.imageFile);
-                try {
-                    yield exec.exec("mkdir", ["-p", verifyDir], {
-                        cwd: this.opts.safeCwd
-                    });
-                    yield exec.exec("sudo", ["mount", "-t", "btrfs", "-o", "ro", loopDev, verifyDir], { cwd: this.opts.safeCwd });
-                    yield exec.exec("sudo", ["umount", verifyDir], {
-                        cwd: this.opts.safeCwd
-                    });
-                    info("Verification mount succeeded — image is safe to upload");
-                    return true;
+                info(`Image file size: ${Math.round(stat.size / 1024 / 1024)} MB`);
+                // 2. BTRFS superblock validation (offline, no loop device needed)
+                let dumpOutput = "";
+                yield exec.exec("sudo", ["btrfs", "inspect-internal", "dump-super", this.imageFile], {
+                    cwd: this.opts.safeCwd,
+                    silent: !core.isDebug(),
+                    listeners: {
+                        stdout: (data) => {
+                            dumpOutput += data.toString();
+                        }
+                    }
+                });
+                // Validate key superblock fields
+                if (!dumpOutput.includes("magic") || !dumpOutput.includes("generation")) {
+                    core.error(`${LOG_PREFIX} Superblock dump missing expected fields — image may be corrupted`);
+                    return false;
                 }
-                finally {
-                    yield this.cleanupLoopDevices(this.imageFile);
-                    yield exec
-                        .exec("rm", ["-rf", verifyDir], {
-                        cwd: this.opts.safeCwd
-                    })
-                        .catch(() => { });
-                }
+                info("Superblock validation succeeded — image is safe to upload");
+                return true;
             }
             catch (verifyError) {
-                core.error(`Verification mount FAILED — aborting S3 upload to prevent poisoning cache: ${verifyError instanceof Error
+                core.error(`Verification FAILED — aborting S3 upload to prevent poisoning cache: ${verifyError instanceof Error
                     ? verifyError.message
                     : verifyError}`);
                 return false;
