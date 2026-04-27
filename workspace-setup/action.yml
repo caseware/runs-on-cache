@@ -160,10 +160,17 @@ runs:
         force-save: ${{ inputs.force-save }}
         fail-on-save-error: ${{ inputs.fail-on-save-error }}
 
-    # Clean stale NX daemon runtime dir so the next NX invocation
-    # (e.g. postinstall's nx run-many) starts a fresh daemon instead
-    # of finding a PID from the machine that saved the cache.
-    - name: Clean stale NX daemon state
+    # Pre-start NX daemon from cached workspace-data so postinstall's
+    # nx run-many connects to a warm graph instead of loading cold (~50s).
+    # Must remove stale d/ first — it has a PID from the cache-save machine.
+    - name: Pre-start NX daemon
       if: runner.os == 'Linux'
       shell: bash
-      run: rm -rf .nx/workspace-data/d
+      run: |
+        if [ -d ".nx/workspace-data" ] && [ -d "node_modules/.bin" ]; then
+          rm -rf .nx/workspace-data/d
+          ./node_modules/.bin/nx daemon --start &>/dev/null &
+          echo "NX daemon pre-started (PID: $!)"
+        else
+          echo "No workspace-data or node_modules — skipping daemon pre-start"
+        fi
