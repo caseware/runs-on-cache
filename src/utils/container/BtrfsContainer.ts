@@ -1090,8 +1090,15 @@ export class BtrfsContainer extends Container {
                 throw new Error("Mount point is not set");
             }
 
-            const absPath = path.join(this.baseDir, p);
-            const btrfsPath = path.join(this.mountPoint, p);
+            // Normalize absolute paths to relative before joining with baseDir.
+            // path.join('/workspace', '/absolute/path') concatenates instead of
+            // resolving, creating '/workspace/absolute/path' — a stray directory
+            // tree owned by root inside the workspace.
+            const relativePath = path.isAbsolute(p)
+                ? path.relative(this.baseDir, p)
+                : p;
+            const absPath = path.join(this.baseDir, relativePath);
+            const btrfsPath = path.join(this.mountPoint, relativePath);
 
             core.debug(`[BTRFS] Bind-mounting ${btrfsPath} → ${absPath}${readOnly ? " (ro)" : ""}`);
 
@@ -1170,7 +1177,10 @@ export class BtrfsContainer extends Container {
     private async cleanStaleMounts(): Promise<void> {
         // Check bind mount targets (workspace paths like node_modules)
         for (const p of this.pathsToCache) {
-            const absPath = path.join(this.baseDir, p);
+            const relativePath = path.isAbsolute(p)
+                ? path.relative(this.baseDir, p)
+                : p;
+            const absPath = path.join(this.baseDir, relativePath);
             await this.unmountIfMounted(absPath);
         }
 
@@ -1208,7 +1218,10 @@ export class BtrfsContainer extends Container {
 
             // First unmount all bind mounts
             for (const p of this.pathsToCache) {
-                const absPath = path.join(this.baseDir, p);
+                const relativePath = path.isAbsolute(p)
+                    ? path.relative(this.baseDir, p)
+                    : p;
+                const absPath = path.join(this.baseDir, relativePath);
                 try {
                     const bindMountCheck = await exec.exec(
                         "mountpoint",

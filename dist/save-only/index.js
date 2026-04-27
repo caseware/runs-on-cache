@@ -96160,6 +96160,8 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.saveRun = exports.saveOnlyRun = exports.saveImpl = void 0;
 const cache = __importStar(__nccwpck_require__(7799));
 const core = __importStar(__nccwpck_require__(2186));
+const path = __importStar(__nccwpck_require__(9411));
+const node_os_1 = __nccwpck_require__(612);
 const constants_1 = __nccwpck_require__(9042);
 const stateProvider_1 = __nccwpck_require__(1527);
 const utils = __importStar(__nccwpck_require__(6850));
@@ -96292,22 +96294,143 @@ function saveRun(earlyExit) {
 }
 exports.saveRun = saveRun;
 /**
- * Clean up any active BTRFS mounts and loop devices.
- * Idempotent — safe to call even if no BTRFS mounts exist.
+ * Clean up BTRFS mounts and loop devices belonging to THIS cache entry only.
+ * Scoped cleanup prevents one post step from killing mounts that other cache
+ * entries still need for their save operations.
+ *
+ * Falls back to global cleanup only if the cache key is unknown (e.g. restore
+ * failed before saving state).
  */
 function btrfsCleanup() {
     return __awaiter(this, void 0, void 0, function* () {
         if (process.platform !== "linux")
             return;
+        // Reconstruct this cache entry's temp directory from state.
+        // Each runs-on-cache instance saves its primary key in state during restore.
+        const cacheKey = core.getState(constants_1.State.CachePrimaryKey) ||
+            core.getInput(constants_1.Inputs.Key);
+        if (cacheKey) {
+            const safeKey = cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, "_");
+            const baseTempDir = process.env["RUNNER_TEMP"] || (0, node_os_1.tmpdir)();
+            const entryTempDir = path.join(baseTempDir, safeKey);
+            core.info(`[BTRFS cleanup] Scoped cleanup for: ${entryTempDir}`);
+            yield scopedBtrfsCleanup(entryTempDir);
+        }
+        else {
+            core.info("[BTRFS cleanup] No cache key in state — running global cleanup");
+            yield globalBtrfsCleanup();
+        }
+    });
+}
+/**
+ * Unmount only BTRFS mounts whose target starts with entryTempDir (the
+ * cache-key-specific temp directory), plus any bind mounts that originate
+ * from that directory. Then detach only loop devices backing .btrfs files
+ * inside entryTempDir.
+ */
+function scopedBtrfsCleanup(entryTempDir) {
+    return __awaiter(this, void 0, void 0, function* () {
         try {
-            // Find all BTRFS mounts
+            const output = (0, child_process_1.execSync)("findmnt -t btrfs -n -o TARGET,SOURCE", {
+                encoding: "utf8",
+                timeout: 10000
+            }).trim();
+            if (!output)
+                return;
+            // Collect mounts belonging to this entry:
+            // 1. Main mount: target starts with entryTempDir (e.g. .../mount)
+            // 2. Bind mounts: source (the device/path) references entryTempDir
+            const allMounts = output
+                .split("\n")
+                .map(l => l.trim())
+                .filter(l => l.length > 0);
+            const ownedMounts = [];
+            for (const line of allMounts) {
+                const parts = line.split(/\s+/);
+                const target = parts[0];
+                const source = parts.slice(1).join(" ");
+                if (target.startsWith(entryTempDir) ||
+                    source.includes(entryTempDir)) {
+                    ownedMounts.push(target);
+                }
+            }
+            // Also find bind mounts whose source device maps back to our loop device.
+            // findmnt for bind mounts shows the same device as the main mount.
+            // We first identify the loop device, then find all bind mounts using it.
+            let loopDevice = "";
+            try {
+                const losetupOutput = (0, child_process_1.execSync)("losetup -a", {
+                    encoding: "utf8",
+                    timeout: 10000
+                }).trim();
+                for (const line of losetupOutput.split("\n")) {
+                    if (line.includes(entryTempDir) || line.includes(entryTempDir.replace(/\//g, "/"))) {
+                        loopDevice = line.split(":")[0];
+                        break;
+                    }
+                }
+            }
+            catch ( /* no loop devices */_a) { /* no loop devices */ }
+            if (loopDevice) {
+                for (const line of allMounts) {
+                    const parts = line.split(/\s+/);
+                    const target = parts[0];
+                    const source = parts.slice(1).join(" ");
+                    if (source.includes(loopDevice) && !ownedMounts.includes(target)) {
+                        ownedMounts.push(target);
+                    }
+                }
+            }
+            // Unmount in reverse order (bind mounts before main mount)
+            ownedMounts.reverse();
+            for (const mount of ownedMounts) {
+                try {
+                    core.info(`[BTRFS cleanup] Unmounting: ${mount}`);
+                    (0, child_process_1.execSync)(`sudo umount "${mount}"`, {
+                        encoding: "utf8",
+                        timeout: 30000
+                    });
+                }
+                catch (_b) {
+                    try {
+                        (0, child_process_1.execSync)(`sudo umount -l "${mount}"`, {
+                            encoding: "utf8",
+                            timeout: 30000
+                        });
+                    }
+                    catch ( /* already unmounted */_c) { /* already unmounted */ }
+                }
+            }
+            // Detach only loop devices backing .btrfs files in our temp dir
+            if (loopDevice) {
+                core.info(`[BTRFS cleanup] Detaching loop device: ${loopDevice}`);
+                try {
+                    (0, child_process_1.execSync)(`sudo losetup -d "${loopDevice}"`, {
+                        encoding: "utf8",
+                        timeout: 10000
+                    });
+                }
+                catch ( /* already detached */_d) { /* already detached */ }
+            }
+        }
+        catch (_e) {
+            // findmnt not available or failed — nothing to clean
+        }
+    });
+}
+/**
+ * Global fallback: clean up ALL BTRFS mounts and loop devices.
+ * Only used when the cache key is unknown (restore failed before saving state).
+ */
+function globalBtrfsCleanup() {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
             const output = (0, child_process_1.execSync)("findmnt -t btrfs -n -o TARGET", {
                 encoding: "utf8",
                 timeout: 10000
             }).trim();
             if (!output)
                 return;
-            // Unmount in reverse order (bind mounts before main mounts)
             const mounts = output
                 .split("\n")
                 .map(m => m.trim())
@@ -96322,19 +96445,15 @@ function btrfsCleanup() {
                     });
                 }
                 catch (_a) {
-                    // Fallback to lazy unmount
                     try {
                         (0, child_process_1.execSync)(`sudo umount -l "${mount}"`, {
                             encoding: "utf8",
                             timeout: 30000
                         });
                     }
-                    catch (_b) {
-                        /* already unmounted */
-                    }
+                    catch ( /* already unmounted */_b) { /* already unmounted */ }
                 }
             }
-            // Detach orphaned loop devices backing .btrfs files
             try {
                 const losetupOutput = (0, child_process_1.execSync)("losetup -a", {
                     encoding: "utf8",
@@ -96353,15 +96472,11 @@ function btrfsCleanup() {
                                 timeout: 10000
                             });
                         }
-                        catch (_c) {
-                            /* already detached */
-                        }
+                        catch ( /* already detached */_c) { /* already detached */ }
                     }
                 }
             }
-            catch (_d) {
-                /* no loop devices or command failed */
-            }
+            catch ( /* no loop devices or command failed */_d) { /* no loop devices or command failed */ }
         }
         catch (_e) {
             // findmnt not available or no BTRFS mounts — nothing to clean
@@ -97508,8 +97623,15 @@ class BtrfsContainer extends Container_1.Container {
                 if (!this.mountPoint) {
                     throw new Error("Mount point is not set");
                 }
-                const absPath = path.join(this.baseDir, p);
-                const btrfsPath = path.join(this.mountPoint, p);
+                // Normalize absolute paths to relative before joining with baseDir.
+                // path.join('/workspace', '/absolute/path') concatenates instead of
+                // resolving, creating '/workspace/absolute/path' — a stray directory
+                // tree owned by root inside the workspace.
+                const relativePath = path.isAbsolute(p)
+                    ? path.relative(this.baseDir, p)
+                    : p;
+                const absPath = path.join(this.baseDir, relativePath);
+                const btrfsPath = path.join(this.mountPoint, relativePath);
                 core.debug(`[BTRFS] Bind-mounting ${btrfsPath} → ${absPath}${readOnly ? " (ro)" : ""}`);
                 try {
                     if (readOnly) {
@@ -97582,7 +97704,10 @@ class BtrfsContainer extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             // Check bind mount targets (workspace paths like node_modules)
             for (const p of this.pathsToCache) {
-                const absPath = path.join(this.baseDir, p);
+                const relativePath = path.isAbsolute(p)
+                    ? path.relative(this.baseDir, p)
+                    : p;
+                const absPath = path.join(this.baseDir, relativePath);
                 yield this.unmountIfMounted(absPath);
             }
             // Check the main BTRFS mount point
@@ -97618,7 +97743,10 @@ class BtrfsContainer extends Container_1.Container {
                 yield exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
                 // First unmount all bind mounts
                 for (const p of this.pathsToCache) {
-                    const absPath = path.join(this.baseDir, p);
+                    const relativePath = path.isAbsolute(p)
+                        ? path.relative(this.baseDir, p)
+                        : p;
+                    const absPath = path.join(this.baseDir, relativePath);
                     try {
                         const bindMountCheck = yield exec.exec("mountpoint", [absPath], {
                             cwd: this.safeCwd,

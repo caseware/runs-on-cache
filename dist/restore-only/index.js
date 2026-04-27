@@ -97408,8 +97408,15 @@ class BtrfsContainer extends Container_1.Container {
                 if (!this.mountPoint) {
                     throw new Error("Mount point is not set");
                 }
-                const absPath = path.join(this.baseDir, p);
-                const btrfsPath = path.join(this.mountPoint, p);
+                // Normalize absolute paths to relative before joining with baseDir.
+                // path.join('/workspace', '/absolute/path') concatenates instead of
+                // resolving, creating '/workspace/absolute/path' — a stray directory
+                // tree owned by root inside the workspace.
+                const relativePath = path.isAbsolute(p)
+                    ? path.relative(this.baseDir, p)
+                    : p;
+                const absPath = path.join(this.baseDir, relativePath);
+                const btrfsPath = path.join(this.mountPoint, relativePath);
                 core.debug(`[BTRFS] Bind-mounting ${btrfsPath} → ${absPath}${readOnly ? " (ro)" : ""}`);
                 try {
                     if (readOnly) {
@@ -97482,7 +97489,10 @@ class BtrfsContainer extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             // Check bind mount targets (workspace paths like node_modules)
             for (const p of this.pathsToCache) {
-                const absPath = path.join(this.baseDir, p);
+                const relativePath = path.isAbsolute(p)
+                    ? path.relative(this.baseDir, p)
+                    : p;
+                const absPath = path.join(this.baseDir, relativePath);
                 yield this.unmountIfMounted(absPath);
             }
             // Check the main BTRFS mount point
@@ -97518,7 +97528,10 @@ class BtrfsContainer extends Container_1.Container {
                 yield exec.exec("sync", [], { cwd: this.safeCwd, silent: !core.isDebug() });
                 // First unmount all bind mounts
                 for (const p of this.pathsToCache) {
-                    const absPath = path.join(this.baseDir, p);
+                    const relativePath = path.isAbsolute(p)
+                        ? path.relative(this.baseDir, p)
+                        : p;
+                    const absPath = path.join(this.baseDir, relativePath);
                     try {
                         const bindMountCheck = yield exec.exec("mountpoint", [absPath], {
                             cwd: this.safeCwd,
