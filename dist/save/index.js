@@ -96952,8 +96952,18 @@ class BtrfsContainer extends Container_1.Container {
                     yield this.mountImageReadOnly(this.containerFile);
                 }
                 else {
-                    yield this.mountImageReadWrite();
-                    yield this.image.expandForHeadroom(this.mountPoint);
+                    // When the container file lives in the node-local WORM dir
+                    // (S3 download → node-local commit), we must copy + randomize
+                    // UUID before RW mount. Without this, two runners on the same
+                    // node get exit code 32 (EEXIST) from BTRFS UUID collision.
+                    if (this.isInNodeLocalDir()) {
+                        this.logInfo("Container file is in node-local WORM dir — copying for RW mount");
+                        yield this.copyAndMountReadWrite(this.containerFile);
+                    }
+                    else {
+                        yield this.mountImageReadWrite();
+                        yield this.image.expandForHeadroom(this.mountPoint);
+                    }
                     yield this.image.checkHealth(this.mountPoint);
                 }
             }
@@ -97247,6 +97257,17 @@ class BtrfsContainer extends Container_1.Container {
         });
     }
     // ── Helpers ──────────────────────────────────────────────────────
+    /**
+     * Check if the container file is inside the node-local WORM cache dir.
+     * When true, we must copy + UUID-randomize before RW mount to avoid
+     * UUID collisions with other runners sharing the same WORM source.
+     */
+    isInNodeLocalDir() {
+        if (!this.nodeLocal.enabled)
+            return false;
+        const cacheDir = path.dirname(this.nodeLocal.localPath);
+        return this.containerFile.startsWith(cacheDir + "/");
+    }
     execSudo(command, args = []) {
         return __awaiter(this, void 0, void 0, function* () {
             yield exec.exec("sudo", [command, ...args], {
