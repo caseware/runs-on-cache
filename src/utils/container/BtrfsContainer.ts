@@ -258,6 +258,9 @@ export class BtrfsContainer extends Container {
         const ok = await this.image.verifyMountable();
         if (!ok) {
             this.saveAborted = true;
+            throw new Error(
+                "BTRFS verification mount failed — aborting save to prevent cache poisoning"
+            );
         }
 
         this.logDebug(

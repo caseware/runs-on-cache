@@ -96704,6 +96704,7 @@ class BtrfsContainer extends Container_1.Container {
             const ok = yield this.image.verifyMountable();
             if (!ok) {
                 this.saveAborted = true;
+                throw new Error("BTRFS verification mount failed — aborting save to prevent cache poisoning");
             }
             this.logDebug(`Save completed. Container file ready for upload: ${this.containerFile}`);
         });
@@ -97135,12 +97136,7 @@ class BtrfsImage {
                 }
                 if (this.activeLoopDevice) {
                     core.debug(`${LOG_PREFIX} Detaching loop device: ${this.activeLoopDevice}`);
-                    try {
-                        yield sudoExec("losetup", ["-d", this.activeLoopDevice], this.opts.safeCwd);
-                    }
-                    catch (_a) {
-                        core.debug(`Failed to detach loop device ${this.activeLoopDevice}`);
-                    }
+                    yield this.detachLoopWithRetry(this.activeLoopDevice);
                     this.activeLoopDevice = undefined;
                 }
             }
@@ -97263,10 +97259,28 @@ class BtrfsImage {
     /**
      * Verify the image is mountable by doing a RO losetup+mount+umount cycle.
      * Returns false if verification fails (caller should abort S3 upload).
+     *
+     * After lazy unmount, stale loop devices may still hold the BTRFS UUID in
+     * the kernel. We aggressively detach them (with retries) before attempting
+     * the verify mount. If stale devices can't be detached, we randomize the
+     * UUID to avoid "File exists" BTRFS UUID collision.
      */
     verifyMountable() {
         return __awaiter(this, void 0, void 0, function* () {
             info("Verifying image is mountable before upload...");
+            // Detach any stale loop devices from the previous mount (handles lazy unmount leftovers)
+            yield this.cleanupLoopDevices(this.imageFile);
+            // Check if any stale devices remain — if so, randomize UUID to avoid collision
+            try {
+                const remaining = yield execWithOutput("losetup", ["-j", this.imageFile], this.opts.safeCwd);
+                if (remaining && remaining.trim()) {
+                    core.warning(`${LOG_PREFIX} Stale loop devices still attached after cleanup, randomizing UUID to avoid collision`);
+                    yield this.randomizeUuid();
+                }
+            }
+            catch (_a) {
+                // losetup -j may fail if no devices — that's fine
+            }
             const verifyDir = `${this.imageFile}.verify-mount`;
             try {
                 const loopDev = yield this.setupLoopDevice(this.imageFile);
@@ -97347,17 +97361,35 @@ class BtrfsImage {
                     .filter(d => d.startsWith("/dev/loop"));
                 for (const device of devices) {
                     core.debug(`${LOG_PREFIX} Cleaning up leaked loop device: ${device}`);
-                    try {
-                        yield sudoExec("losetup", ["-d", device], this.opts.safeCwd);
-                    }
-                    catch (_a) {
-                        core.warning(`${LOG_PREFIX} Failed to detach loop device ${device}`);
+                    yield this.detachLoopWithRetry(device);
+                }
+            }
+            catch (_a) {
+                // losetup -j may fail if no loop devices exist
+            }
+        });
+    }
+    /**
+     * Detach a loop device with retry logic.
+     * After lazy unmount, the kernel may keep the device busy briefly while
+     * BTRFS finishes releasing its references. Retries with delay handle this.
+     */
+    detachLoopWithRetry(device, maxRetries = 5) {
+        return __awaiter(this, void 0, void 0, function* () {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    yield sudoExec("losetup", ["-d", device], this.opts.safeCwd);
+                    core.debug(`${LOG_PREFIX} Detached ${device} (attempt ${i + 1})`);
+                    return;
+                }
+                catch (_a) {
+                    if (i < maxRetries - 1) {
+                        core.debug(`${LOG_PREFIX} ${device} still busy, retrying in ${(i + 1)}s...`);
+                        yield new Promise(resolve => setTimeout(resolve, (i + 1) * 1000));
                     }
                 }
             }
-            catch (_b) {
-                // losetup -j may fail if no loop devices exist
-            }
+            core.warning(`${LOG_PREFIX} Could not detach loop device ${device} after ${maxRetries} retries`);
         });
     }
     // ── Prerequisites ───────────────────────────────────────────────
