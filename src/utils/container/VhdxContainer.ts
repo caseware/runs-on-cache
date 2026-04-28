@@ -286,10 +286,15 @@ export class VhdxContainer extends Container {
             try {
                 await fs.access(absPath);
                 this.logDebug(`Removing stale VHD from previous attempt: ${absPath}`);
-                await this.psExec(
-                    `Dismount-DiskImage -ImagePath '${absPath}' -ErrorAction SilentlyContinue | Out-Null`
-                );
+                try {
+                    await this.psExec(
+                        `Dismount-DiskImage -ImagePath '${absPath}' -ErrorAction SilentlyContinue | Out-Null`
+                    );
+                } catch {
+                    // Dismount may fail if not mounted — continue to unlink
+                }
                 await fs.unlink(absPath);
+                this.logDebug("Stale VHD removed successfully");
             } catch {
                 // File doesn't exist — expected on first attempt
             }
@@ -302,7 +307,7 @@ export class VhdxContainer extends Container {
                 `create partition primary`,
                 `format fs=ntfs quick compress`,
                 `assign`
-            ].join("\n");
+            ].join("\r\n");
 
             const tempDir = await createCacheKeySpecificTempDirectory(
                 this.cacheKey
@@ -311,9 +316,28 @@ export class VhdxContainer extends Container {
             await fs.mkdir(tempDir, { recursive: true });
             await fs.writeFile(scriptPath, scriptContent, "utf-8");
 
-            await exec.exec("diskpart", ["/s", scriptPath], {
-                silent: !core.isDebug()
+            this.logDebug(`diskpart script at ${scriptPath}:\n${scriptContent}`);
+
+            let diskpartOut = "";
+            let diskpartErr = "";
+            const diskpartRc = await exec.exec("diskpart", ["/s", scriptPath], {
+                silent: !core.isDebug(),
+                ignoreReturnCode: true,
+                listeners: {
+                    stdout: (data: Buffer) => { diskpartOut += data.toString(); },
+                    stderr: (data: Buffer) => { diskpartErr += data.toString(); }
+                }
             });
+            if (diskpartRc !== 0) {
+                core.warning(
+                    `${this.getLogPrefix()} diskpart exited ${diskpartRc}.\n` +
+                    `stdout: ${diskpartOut}\nstderr: ${diskpartErr}`
+                );
+                throw new Error(
+                    `diskpart failed (rc=${diskpartRc}): ${diskpartErr || diskpartOut}`
+                );
+            }
+            this.logDebug(`diskpart succeeded: ${diskpartOut.slice(0, 500)}`);
 
             // Discover which drive letter was assigned
             await this.discoverMountedDrive();
@@ -325,12 +349,29 @@ export class VhdxContainer extends Container {
             }
 
             // Enable NTFS compression on the root of the volume
-            await exec.exec("compact", [
+            let compactOut = "";
+            let compactErr = "";
+            const compactRc = await exec.exec("compact", [
                 "/c",
                 "/s",
                 `/i`,
                 `${this.mountDriveLetter}:\\`
-            ], { silent: !core.isDebug() });
+            ], {
+                silent: !core.isDebug(),
+                ignoreReturnCode: true,
+                listeners: {
+                    stdout: (data: Buffer) => { compactOut += data.toString(); },
+                    stderr: (data: Buffer) => { compactErr += data.toString(); }
+                }
+            });
+            if (compactRc !== 0) {
+                core.warning(
+                    `${this.getLogPrefix()} compact exited ${compactRc}.\n` +
+                    `stdout: ${compactOut}\nstderr: ${compactErr}`
+                );
+                // compact failure is non-fatal — NTFS compression is optional
+                this.logInfo("Continuing without NTFS compression");
+            }
 
             // Create junction points
             await this.createJunctions();

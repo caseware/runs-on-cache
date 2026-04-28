@@ -98938,10 +98938,16 @@ class VhdxContainer extends Container_1.Container {
                 try {
                     yield fs.access(absPath);
                     this.logDebug(`Removing stale VHD from previous attempt: ${absPath}`);
-                    yield this.psExec(`Dismount-DiskImage -ImagePath '${absPath}' -ErrorAction SilentlyContinue | Out-Null`);
+                    try {
+                        yield this.psExec(`Dismount-DiskImage -ImagePath '${absPath}' -ErrorAction SilentlyContinue | Out-Null`);
+                    }
+                    catch (_a) {
+                        // Dismount may fail if not mounted — continue to unlink
+                    }
                     yield fs.unlink(absPath);
+                    this.logDebug("Stale VHD removed successfully");
                 }
-                catch (_a) {
+                catch (_b) {
                     // File doesn't exist — expected on first attempt
                 }
                 // Use diskpart to create a dynamic VHDX
@@ -98952,26 +98958,55 @@ class VhdxContainer extends Container_1.Container {
                     `create partition primary`,
                     `format fs=ntfs quick compress`,
                     `assign`
-                ].join("\n");
+                ].join("\r\n");
                 const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
                 const scriptPath = path.join(tempDir, "create-vhdx.txt");
                 yield fs.mkdir(tempDir, { recursive: true });
                 yield fs.writeFile(scriptPath, scriptContent, "utf-8");
-                yield exec.exec("diskpart", ["/s", scriptPath], {
-                    silent: !core.isDebug()
+                this.logDebug(`diskpart script at ${scriptPath}:\n${scriptContent}`);
+                let diskpartOut = "";
+                let diskpartErr = "";
+                const diskpartRc = yield exec.exec("diskpart", ["/s", scriptPath], {
+                    silent: !core.isDebug(),
+                    ignoreReturnCode: true,
+                    listeners: {
+                        stdout: (data) => { diskpartOut += data.toString(); },
+                        stderr: (data) => { diskpartErr += data.toString(); }
+                    }
                 });
+                if (diskpartRc !== 0) {
+                    core.warning(`${this.getLogPrefix()} diskpart exited ${diskpartRc}.\n` +
+                        `stdout: ${diskpartOut}\nstderr: ${diskpartErr}`);
+                    throw new Error(`diskpart failed (rc=${diskpartRc}): ${diskpartErr || diskpartOut}`);
+                }
+                this.logDebug(`diskpart succeeded: ${diskpartOut.slice(0, 500)}`);
                 // Discover which drive letter was assigned
                 yield this.discoverMountedDrive();
                 if (!this.mountDriveLetter) {
                     throw new Error("VHDX created and attached but no drive letter was assigned");
                 }
                 // Enable NTFS compression on the root of the volume
-                yield exec.exec("compact", [
+                let compactOut = "";
+                let compactErr = "";
+                const compactRc = yield exec.exec("compact", [
                     "/c",
                     "/s",
                     `/i`,
                     `${this.mountDriveLetter}:\\`
-                ], { silent: !core.isDebug() });
+                ], {
+                    silent: !core.isDebug(),
+                    ignoreReturnCode: true,
+                    listeners: {
+                        stdout: (data) => { compactOut += data.toString(); },
+                        stderr: (data) => { compactErr += data.toString(); }
+                    }
+                });
+                if (compactRc !== 0) {
+                    core.warning(`${this.getLogPrefix()} compact exited ${compactRc}.\n` +
+                        `stdout: ${compactOut}\nstderr: ${compactErr}`);
+                    // compact failure is non-fatal — NTFS compression is optional
+                    this.logInfo("Continuing without NTFS compression");
+                }
                 // Create junction points
                 yield this.createJunctions();
             }
