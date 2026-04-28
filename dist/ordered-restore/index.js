@@ -97155,37 +97155,40 @@ class BtrfsImage {
         });
     }
     /**
-     * Expand a mounted RW image so utilization stays below rwUtilizationTarget.
-     * Called after mountRW on restore — the saved image is tight (small save-buffer),
-     * and the consumer may need write headroom.
+     * Expand a mounted RW image to fill up to rwUtilizationTarget of the
+     * runner's available disk space.  Called after mountRW on restore — the
+     * saved image is tight (small save-buffer) and the consumer needs room
+     * for checkout deltas, build artifacts, etc.
+     *
+     * Strategy: the image file currently consumes `currentSize` bytes on the
+     * host.  The host also has `availOnHost` bytes free (not counting the
+     * image).  The total space budget is `currentSize + availOnHost`.
+     * We expand to `budget * target` (default 80%), leaving the remaining
+     * 20% for non-cache host needs (logs, temp files, other jobs).
      */
     expandForHeadroom(mountPoint) {
         return __awaiter(this, void 0, void 0, function* () {
             const target = this.opts.rwUtilizationTarget;
             if (target <= 0 || target >= 1)
                 return; // disabled or invalid
-            let usedBytes;
-            try {
-                const usageOutput = yield this.getBtrfsUsage(mountPoint);
-                usedBytes = this.parseUsedBytes(usageOutput);
-            }
-            catch (_a) {
-                core.debug(`${LOG_PREFIX} Cannot read usage for headroom expansion — skipping`);
-                return;
-            }
-            if (usedBytes === 0)
-                return; // empty image, nothing to expand
-            const desiredSize = Math.ceil(usedBytes / target);
             const stat = yield fs.stat(this.imageFile);
             const currentSize = stat.size;
+            // Available disk on the host partition where the image file lives
+            const imageDir = path.dirname(this.imageFile);
+            const availOnHost = yield checkDiskSpace(imageDir, this.opts.safeCwd);
+            // Total budget = current image footprint + remaining free space
+            const totalBudget = currentSize + availOnHost;
+            const desiredSize = Math.floor(totalBudget * target);
             if (desiredSize <= currentSize) {
-                const pct = Math.round((usedBytes / currentSize) * 100);
-                info(`RW headroom OK: ${pct}% utilization (target ≤${Math.round(target * 100)}%)`);
+                info(`RW headroom: image already at ${Math.ceil(currentSize / (1024 * 1024))} MB, ` +
+                    `budget ${Math.ceil(totalBudget / (1024 * 1024))} MB — no expansion needed`);
                 return;
             }
+            const currentMb = Math.ceil(currentSize / (1024 * 1024));
             const desiredMb = Math.ceil(desiredSize / (1024 * 1024));
-            info(`Expanding for RW headroom: ${Math.ceil(currentSize / (1024 * 1024))} MB → ${desiredMb} MB ` +
-                `(${Math.ceil(usedBytes / (1024 * 1024))} MB used, target ${Math.round(target * 100)}% utilization)`);
+            const availMb = Math.ceil(availOnHost / (1024 * 1024));
+            info(`Expanding for RW headroom: ${currentMb} MB → ${desiredMb} MB ` +
+                `(${availMb} MB free on host, target ${Math.round(target * 100)}% of ${Math.ceil(totalBudget / (1024 * 1024))} MB budget)`);
             // Expand the backing file first (so the filesystem has backing space)
             try {
                 yield exec.exec("truncate", ["-s", `${desiredMb}M`, this.imageFile], {
