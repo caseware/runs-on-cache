@@ -165,7 +165,7 @@ runs:
     # ── Restore workspace cache ───────────────────────────────────────
     - name: Restore workspace cache
       id: workspace-cache
-      uses: caseware/runs-on-cache@add-btrfs-lz4
+      uses: caseware/runs-on-cache@add-vhdx-windows
       with:
         path: .
         key: ${{ steps.ws-cache-key-linux.outputs.key || steps.ws-cache-key-windows.outputs.key }}
