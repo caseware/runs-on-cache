@@ -169,16 +169,8 @@ runs:
       run: |
         if [ -d ".nx/workspace-data" ] && [ -d "node_modules/.bin" ]; then
           rm -rf .nx/workspace-data/d
-          echo "--- Cached workspace-data contents ---"
-          ls -lh .nx/workspace-data/ 2>/dev/null || true
-          echo "--- Starting NX daemon ---"
-          ./node_modules/.bin/nx daemon --start 2>&1 &
-          DAEMON_PID=$!
-          echo "NX daemon pre-started (PID: $DAEMON_PID)"
-          # Give daemon a moment then dump its log
-          sleep 2
-          echo "--- Daemon log (2s after start) ---"
-          cat .nx/workspace-data/d/daemon.log 2>/dev/null || echo "No daemon log yet"
+          ./node_modules/.bin/nx daemon --start &>/dev/null &
+          echo "NX daemon pre-started (PID: $!)"
         else
           echo "No workspace-data or node_modules — skipping daemon pre-start"
         fi
