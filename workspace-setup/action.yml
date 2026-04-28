@@ -22,8 +22,9 @@ inputs:
     default: 'ust1-cache-code-github-actions-develop-1'
   custom-compression:
     description: >-
-      Custom compression method (btrfs or vhdx).
-      Defaults to auto-detect: btrfs on Linux, vhdx on Windows.
+      Custom compression method (btrfs, vhdx, or lz4).
+      Defaults to auto-detect: btrfs on Linux, vhdx on Windows (if Hyper-V
+      available), lz4 otherwise.
     required: false
     default: ''
   force-save:
@@ -146,6 +147,35 @@ runs:
         "EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
         Write-Host "Cache key: $exactKey"
 
+    # ── Check Hyper-V capability (Windows) ─────────────────────────────
+    # VHDX requires Hyper-V / diskpart privileges (self-hosted runners).
+    # GitHub-hosted runners (windows-2022 etc.) lack these — fall back to lz4.
+    - name: Check Hyper-V capability (Windows)
+      if: runner.os == 'Windows'
+      id: hyperv-check
+      shell: pwsh
+      run: |
+        try {
+          $diskpartTest = & diskpart /s (New-Item -ItemType File -Path "$env:RUNNER_TEMP\diskpart-test.txt" -Value "list disk" -Force).FullName 2>&1
+          $hasHyperV = ($LASTEXITCODE -eq 0)
+        } catch {
+          $hasHyperV = $false
+        }
+        if ($hasHyperV) {
+          # Verify we can actually create VHDs by checking for Virtual Disk Service
+          try {
+            $vdsTest = Get-Service -Name "vds" -ErrorAction Stop
+            $hasHyperV = $true
+            Write-Host "Hyper-V / diskpart available — using VHDX"
+          } catch {
+            $hasHyperV = $false
+            Write-Host "Virtual Disk Service not available — falling back to lz4"
+          }
+        } else {
+          Write-Host "diskpart not usable — falling back to lz4"
+        }
+        "available=$($hasHyperV.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
     # ── Auto-detect compression method ────────────────────────────────
     - name: Resolve compression method
       id: resolve-compression
@@ -154,7 +184,12 @@ runs:
         INPUT="${{ inputs.custom-compression }}"
         if [ -z "$INPUT" ]; then
           if [ "$RUNNER_OS" = "Windows" ]; then
-            echo "method=vhdx" >> "$GITHUB_OUTPUT"
+            # Use VHDX only if Hyper-V / diskpart is available (self-hosted runners)
+            if [ "${{ steps.hyperv-check.outputs.available }}" = "true" ]; then
+              echo "method=vhdx" >> "$GITHUB_OUTPUT"
+            else
+              echo "method=lz4" >> "$GITHUB_OUTPUT"
+            fi
           else
             echo "method=btrfs" >> "$GITHUB_OUTPUT"
           fi
