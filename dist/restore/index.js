@@ -98966,8 +98966,19 @@ class VhdxContainer extends Container_1.Container {
                 const sizeMb = this.parseSizeToMb(this.fsSize);
                 yield this.checkDiskSpace(path.dirname(this.containerFile));
                 this.logInfo(`Creating dynamic VHDX: ${this.containerFile} (max ${sizeMb} MB)`);
-                // Use diskpart to create a dynamic VHDX
                 const absPath = path.resolve(this.containerFile);
+                // Clean up any stale VHD from a previous failed attempt.
+                // diskpart will fail with E_INVALIDARG if the file already exists.
+                try {
+                    yield fs.access(absPath);
+                    this.logDebug(`Removing stale VHD from previous attempt: ${absPath}`);
+                    yield this.psExec(`Dismount-DiskImage -ImagePath '${absPath}' -ErrorAction SilentlyContinue | Out-Null`);
+                    yield fs.unlink(absPath);
+                }
+                catch (_a) {
+                    // File doesn't exist — expected on first attempt
+                }
+                // Use diskpart to create a dynamic VHDX
                 const scriptContent = [
                     `create vdisk file="${absPath}" maximum=${sizeMb} type=expandable`,
                     `select vdisk file="${absPath}"`,
@@ -99071,8 +99082,16 @@ class VhdxContainer extends Container_1.Container {
                 const absPath = path.join(this.baseDir, p);
                 const vhdxPath = path.join(`${this.mountDriveLetter}:\\`, p);
                 this.logDebug(`Creating junction: ${absPath} → ${vhdxPath}`);
-                // Ensure the target directory exists on the VHDX volume
-                yield fs.mkdir(vhdxPath, { recursive: true });
+                // Ensure the target directory exists on the VHDX volume.
+                // Skip mkdir when vhdxPath IS the drive root (e.g. "E:\") —
+                // the root already exists after mount and mkdir EPERM's on it.
+                const isDriveRoot = /^[A-Z]:\\?$/i.test(vhdxPath);
+                if (isDriveRoot) {
+                    yield fs.access(vhdxPath);
+                }
+                else {
+                    yield fs.mkdir(vhdxPath, { recursive: true });
+                }
                 // Remove existing directory/junction at the workspace path
                 try {
                     const stat = yield fs.lstat(absPath);
