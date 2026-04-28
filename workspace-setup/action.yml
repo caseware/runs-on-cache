@@ -34,6 +34,13 @@ inputs:
     description: 'Fail the job if the save pipeline errors.'
     required: false
     default: 'false'
+  cold-run:
+    description: >-
+      Skip restore-keys so only today's exact key is checked.
+      If today's cache doesn't exist yet, the restore finds nothing
+      and a fresh image is created — eliminating accumulated cruft.
+    required: false
+    default: 'false'
 outputs:
   cache-hit:
     description: 'Whether an exact cache key matched'
@@ -91,15 +98,20 @@ runs:
         PREFIX="workspace-cache-v1-${RUNNER_OS}-${ARCH}"
         EXACT_KEY="${PREFIX}-${TODAY}"
         # Build restore keys: last 7 days + bare prefix (max 10 keys total incl primary)
+        # On cold runs, skip restore-keys so only today's exact key is tried.
         RESTORE_KEYS=""
-        for i in $(seq 1 7); do
-          DAY="$(date -u -d "${i} days ago" +'%Y-%m-%d' 2>/dev/null || date -u -v-${i}d +'%Y-%m-%d' 2>/dev/null)"
-          if [ -n "$DAY" ]; then
-            RESTORE_KEYS="${RESTORE_KEYS}${PREFIX}-${DAY}
-        "
-          fi
-        done
-        RESTORE_KEYS="${RESTORE_KEYS}${PREFIX}-"
+        if [ "${{ inputs.cold-run }}" != "true" ]; then
+          for i in $(seq 1 7); do
+            DAY="$(date -u -d "${i} days ago" +'%Y-%m-%d' 2>/dev/null || date -u -v-${i}d +'%Y-%m-%d' 2>/dev/null)"
+            if [ -n "$DAY" ]; then
+              RESTORE_KEYS="${RESTORE_KEYS}${PREFIX}-${DAY}
+          "
+            fi
+          done
+          RESTORE_KEYS="${RESTORE_KEYS}${PREFIX}-"
+        else
+          echo "Cold run — skipping restore-keys (only exact key: ${EXACT_KEY})"
+        fi
         echo "key=${EXACT_KEY}" >> "$GITHUB_OUTPUT"
         {
           echo "restore-keys<<EOF"
@@ -119,11 +131,15 @@ runs:
         $prefix = "workspace-cache-v1-$($env:RUNNER_OS)-$arch"
         $exactKey = "$prefix-$today"
         $restoreKeys = @()
-        for ($i = 1; $i -le 7; $i++) {
-          $day = (Get-Date).ToUniversalTime().AddDays(-$i).ToString("yyyy-MM-dd")
-          $restoreKeys += "$prefix-$day"
+        if ("${{ inputs.cold-run }}" -ne "true") {
+          for ($i = 1; $i -le 7; $i++) {
+            $day = (Get-Date).ToUniversalTime().AddDays(-$i).ToString("yyyy-MM-dd")
+            $restoreKeys += "$prefix-$day"
+          }
+          $restoreKeys += "$prefix-"
+        } else {
+          Write-Host "Cold run — skipping restore-keys (only exact key: $exactKey)"
         }
-        $restoreKeys += "$prefix-"
         "key=$exactKey" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
         "restore-keys<<EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
         ($restoreKeys -join "`n") | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
