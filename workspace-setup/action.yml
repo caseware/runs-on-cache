@@ -185,8 +185,9 @@ runs:
       run: |
         if [ -d ".nx/workspace-data" ] && [ -d "node_modules/.bin" ]; then
           rm -rf .nx/workspace-data/d
-          ./node_modules/.bin/nx daemon --start &>/dev/null &
-          echo "NX daemon pre-started (PID: $!)"
+          NX_DAEMON_LOG="${RUNNER_TEMP}/nx-daemon-prestart.log"
+          ./node_modules/.bin/nx daemon --start > "$NX_DAEMON_LOG" 2>&1 &
+          echo "NX daemon pre-started (PID: $!) — log: $NX_DAEMON_LOG"
         else
           echo "No workspace-data or node_modules — skipping daemon pre-start"
         fi
