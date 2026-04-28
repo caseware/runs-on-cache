@@ -97,7 +97,14 @@ runs:
       run: |
         ARCH="$(uname -m)"
         TODAY="$(date -u +'%Y-%m-%d')"
-        PREFIX="workspace-cache-v1-${RUNNER_OS}-${ARCH}"
+        # Runner class: k8s pods vs EC2/GH-hosted have different UIDs,
+        # so each needs its own cache image to avoid ownership mismatches.
+        if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
+          RUNNER_CLASS="k8s"
+        else
+          RUNNER_CLASS="gh"
+        fi
+        PREFIX="workspace-cache-v1-${RUNNER_OS}-${ARCH}-${RUNNER_CLASS}"
         EXACT_KEY="${PREFIX}-${TODAY}"
         # Build restore keys: last 7 days + bare prefix (max 10 keys total incl primary)
         # On cold runs, skip restore-keys so only today's exact key is tried.
@@ -177,26 +184,6 @@ runs:
         fs-size: 50G
         force-save: ${{ inputs.force-save }}
         fail-on-save-error: ${{ inputs.fail-on-save-error }}
-
-    # Fix file ownership if the BTRFS image was created by a different user
-    # (e.g. K8s runner uid vs EC2 runner uid). Without this, checkout and
-    # yarn install fail with Permission denied on .git/index.lock etc.
-    - name: Fix BTRFS mount ownership
-      if: runner.os == 'Linux' && steps.workspace-cache.outputs.cache-hit != ''
-      shell: bash
-      run: |
-        CURRENT_UID=$(id -u)
-        # Check a representative file — if it matches, skip the expensive chown
-        if [ -d ".git" ]; then
-          FILE_UID=$(stat -c %u .git 2>/dev/null || echo "$CURRENT_UID")
-          if [ "$FILE_UID" != "$CURRENT_UID" ]; then
-            echo "[BTRFS] Ownership mismatch (file uid=$FILE_UID, runner uid=$CURRENT_UID) — fixing..."
-            sudo chown -R "$CURRENT_UID:$(id -g)" .
-            echo "[BTRFS] Ownership fixed"
-          else
-            echo "[BTRFS] Ownership OK (uid=$CURRENT_UID)"
-          fi
-        fi
 
     # Pre-start NX daemon from cached workspace-data so postinstall's
     # nx run-many connects to a warm graph instead of loading cold (~50s).
