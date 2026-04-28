@@ -67,6 +67,7 @@ runs:
       shell: bash
       run: |
         echo "AWS_REGION=${AWS_REGION:-us-east-1}" >> "$GITHUB_ENV"
+        echo "RUNS_ON_AWS_REGION=${AWS_REGION:-us-east-1}" >> "$GITHUB_ENV"
         echo "RUNS_ON_S3_BUCKET_CACHE=${{ inputs.s3-bucket }}" >> "$GITHUB_ENV"
 
     # ── S3 env vars (Windows) ─────────────────────────────────────────
@@ -76,6 +77,7 @@ runs:
       run: |
         $region = if ($env:AWS_REGION) { $env:AWS_REGION } else { "us-east-1" }
         "AWS_REGION=$region" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        "RUNS_ON_AWS_REGION=$region" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
         "RUNS_ON_S3_BUCKET_CACHE=${{ inputs.s3-bucket }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
     # ── Install btrfs-progs (Linux only) ──────────────────────────────
@@ -175,6 +177,26 @@ runs:
         fs-size: 50G
         force-save: ${{ inputs.force-save }}
         fail-on-save-error: ${{ inputs.fail-on-save-error }}
+
+    # Fix file ownership if the BTRFS image was created by a different user
+    # (e.g. K8s runner uid vs EC2 runner uid). Without this, checkout and
+    # yarn install fail with Permission denied on .git/index.lock etc.
+    - name: Fix BTRFS mount ownership
+      if: runner.os == 'Linux' && steps.workspace-cache.outputs.cache-hit != ''
+      shell: bash
+      run: |
+        CURRENT_UID=$(id -u)
+        # Check a representative file — if it matches, skip the expensive chown
+        if [ -d ".git" ]; then
+          FILE_UID=$(stat -c %u .git 2>/dev/null || echo "$CURRENT_UID")
+          if [ "$FILE_UID" != "$CURRENT_UID" ]; then
+            echo "[BTRFS] Ownership mismatch (file uid=$FILE_UID, runner uid=$CURRENT_UID) — fixing..."
+            sudo chown -R "$CURRENT_UID:$(id -g)" .
+            echo "[BTRFS] Ownership fixed"
+          else
+            echo "[BTRFS] Ownership OK (uid=$CURRENT_UID)"
+          fi
+        fi
 
     # Pre-start NX daemon from cached workspace-data so postinstall's
     # nx run-many connects to a warm graph instead of loading cold (~50s).
