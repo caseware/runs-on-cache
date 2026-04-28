@@ -279,8 +279,22 @@ export class VhdxContainer extends Container {
                 `Creating dynamic VHDX: ${this.containerFile} (max ${sizeMb} MB)`
             );
 
-            // Use diskpart to create a dynamic VHDX
             const absPath = path.resolve(this.containerFile);
+
+            // Clean up any stale VHD from a previous failed attempt.
+            // diskpart will fail with E_INVALIDARG if the file already exists.
+            try {
+                await fs.access(absPath);
+                this.logDebug(`Removing stale VHD from previous attempt: ${absPath}`);
+                await this.psExec(
+                    `Dismount-DiskImage -ImagePath '${absPath}' -ErrorAction SilentlyContinue | Out-Null`
+                );
+                await fs.unlink(absPath);
+            } catch {
+                // File doesn't exist — expected on first attempt
+            }
+
+            // Use diskpart to create a dynamic VHDX
             const scriptContent = [
                 `create vdisk file="${absPath}" maximum=${sizeMb} type=expandable`,
                 `select vdisk file="${absPath}"`,
@@ -424,8 +438,15 @@ export class VhdxContainer extends Container {
 
             this.logDebug(`Creating junction: ${absPath} → ${vhdxPath}`);
 
-            // Ensure the target directory exists on the VHDX volume
-            await fs.mkdir(vhdxPath, { recursive: true });
+            // Ensure the target directory exists on the VHDX volume.
+            // Skip mkdir when vhdxPath IS the drive root (e.g. "E:\") —
+            // the root already exists after mount and mkdir EPERM's on it.
+            const isDriveRoot = /^[A-Z]:\\?$/i.test(vhdxPath);
+            if (isDriveRoot) {
+                await fs.access(vhdxPath);
+            } else {
+                await fs.mkdir(vhdxPath, { recursive: true });
+            }
 
             // Remove existing directory/junction at the workspace path
             try {
