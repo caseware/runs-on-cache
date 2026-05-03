@@ -96179,6 +96179,7 @@ const stateProvider_1 = __nccwpck_require__(1527);
 const utils = __importStar(__nccwpck_require__(6850));
 const custom = __importStar(__nccwpck_require__(1082));
 const BtrfsCleanup_1 = __nccwpck_require__(3302);
+const NodeLocalCleanup_1 = __nccwpck_require__(5995);
 /**
  * Marker file that workflows must create before the post step runs to
  * signal that the job completed its main work and the cache is safe to
@@ -96291,6 +96292,7 @@ exports.saveOnlyRun = saveOnlyRun;
 function saveRun(earlyExit) {
     var _a;
     return __awaiter(this, void 0, void 0, function* () {
+        let saveSafe = false;
         try {
             // With post-if: "always()", the post step runs on success, failure,
             // AND cancellation. We skip the S3 upload when:
@@ -96318,10 +96320,12 @@ function saveRun(earlyExit) {
                     }
                     else {
                         yield saveImpl(new stateProvider_1.StateProvider());
+                        saveSafe = true;
                     }
                 }
                 else {
                     yield saveImpl(new stateProvider_1.StateProvider());
+                    saveSafe = true;
                 }
             }
         }
@@ -96334,6 +96338,10 @@ function saveRun(earlyExit) {
             const cacheKey = core.getState(constants_1.State.CachePrimaryKey) ||
                 core.getInput(constants_1.Inputs.Key);
             yield (0, BtrfsCleanup_1.cleanupForCacheKey)(cacheKey);
+            // Clean up node-local images after the job.
+            // If save succeeded, the image was already committed back to
+            // node-local by saveCache. Otherwise the stale source is dead.
+            yield (0, NodeLocalCleanup_1.cleanupNodeLocalImage)(cacheKey, saveSafe);
         }
         if (earlyExit) {
             // Respect core.setFailed() which sets process.exitCode = 1.
@@ -98752,6 +98760,113 @@ class NodeLocalCache {
     }
 }
 exports.NodeLocalCache = NodeLocalCache;
+
+
+/***/ }),
+
+/***/ 5995:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.cleanupNodeLocalImage = void 0;
+/**
+ * NodeLocalCleanup — post-job cleanup of node-local BTRFS images.
+ *
+ * After a runner job finishes, the node-local image is either:
+ *   - Dead (job cancelled/failed, save skipped) → delete it
+ *   - Safe (save succeeded, image committed back to node-local) → keep it
+ *
+ * Without this cleanup, stale images from cancelled/failed jobs accumulate
+ * on the node until external eviction kicks in (hours/days).
+ */
+const core = __importStar(__nccwpck_require__(2186));
+const fs = __importStar(__nccwpck_require__(3977));
+const path = __importStar(__nccwpck_require__(9411));
+const constants_1 = __nccwpck_require__(9042);
+const LOG_PREFIX = "[NodeLocal cleanup]";
+/**
+ * Clean up the node-local image after a job completes.
+ *
+ * @param cacheKey  The cache key used for this entry.
+ * @param saveSafe  Whether the save completed successfully (marker present + save ran).
+ *                  When true, the saved image was already committed back to node-local
+ *                  with the proper cache-key name — we keep it.
+ *                  When false, the stale source image is deleted.
+ */
+function cleanupNodeLocalImage(cacheKey, saveSafe) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) ||
+            process.env["NODE_LOCAL_CACHE_DIR"] ||
+            "";
+        if (!nodeLocalCacheDir || !cacheKey)
+            return;
+        const isBtrfs = (core.getState("CUSTOM_COMPRESSION") ||
+            core.getInput(constants_1.Inputs.CustomCompression) ||
+            "") === "btrfs";
+        if (!isBtrfs)
+            return;
+        const sanitizedKey = cacheKey.replace(/[/\\:*?"<>|]/g, "-");
+        const localPath = path.join(nodeLocalCacheDir, `${sanitizedKey}.btrfs`);
+        try {
+            yield fs.access(localPath);
+        }
+        catch (_a) {
+            core.debug(`${LOG_PREFIX} No node-local file found at ${localPath}`);
+            return;
+        }
+        if (saveSafe) {
+            core.info(`${LOG_PREFIX} Save succeeded — keeping node-local image: ${path.basename(localPath)}`);
+        }
+        else {
+            try {
+                yield fs.unlink(localPath);
+                core.info(`${LOG_PREFIX} Deleted stale node-local image: ${path.basename(localPath)}`);
+            }
+            catch (error) {
+                const code = error.code;
+                if (code === "ENOENT") {
+                    return;
+                }
+                core.warning(`${LOG_PREFIX} Failed to delete stale image ${path.basename(localPath)}: ${error instanceof Error ? error.message : error}`);
+            }
+        }
+    });
+}
+exports.cleanupNodeLocalImage = cleanupNodeLocalImage;
 
 
 /***/ }),
