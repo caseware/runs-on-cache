@@ -13,6 +13,7 @@ import * as utils from "./utils/actionUtils";
 
 import * as custom from "./custom/cache";
 import { cleanupForCacheKey } from "./utils/container/BtrfsCleanup";
+import { cleanupNodeLocalImage } from "./utils/container/NodeLocalCleanup";
 
 /**
  * Marker file that workflows must create before the post step runs to
@@ -161,6 +162,7 @@ export async function saveOnlyRun(
 }
 
 export async function saveRun(earlyExit?: boolean | undefined): Promise<void> {
+    let saveSafe = false;
     try {
         // With post-if: "always()", the post step runs on success, failure,
         // AND cancellation. We skip the S3 upload when:
@@ -191,9 +193,11 @@ export async function saveRun(earlyExit?: boolean | undefined): Promise<void> {
                     );
                 } else {
                     await saveImpl(new StateProvider());
+                    saveSafe = true;
                 }
             } else {
                 await saveImpl(new StateProvider());
+                saveSafe = true;
             }
         }
     } catch (err) {
@@ -205,6 +209,11 @@ export async function saveRun(earlyExit?: boolean | undefined): Promise<void> {
             core.getState(State.CachePrimaryKey) ||
             core.getInput(Inputs.Key);
         await cleanupForCacheKey(cacheKey);
+
+        // Clean up node-local images after the job.
+        // If save succeeded, the image was already committed back to
+        // node-local by saveCache. Otherwise the stale source is dead.
+        await cleanupNodeLocalImage(cacheKey, saveSafe);
     }
 
     if (earlyExit) {
