@@ -95111,7 +95111,8 @@ var Inputs;
     Inputs["SaveCompressionLevel"] = "save-compression-level";
     Inputs["NodeLocalCacheDir"] = "node-local-cache-dir";
     Inputs["MountMode"] = "mount-mode";
-    Inputs["FailOnSaveError"] = "fail-on-save-error"; // Input for failing the action on save errors (useful for cache validation tests)
+    Inputs["FailOnSaveError"] = "fail-on-save-error";
+    Inputs["CleanupNodeLocal"] = "cleanup-node-local"; // Input for always deleting the node-local image after the job (default: false — only stale images are deleted)
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {
@@ -96341,7 +96342,9 @@ function saveRun(earlyExit) {
             // Clean up node-local images after the job.
             // If save succeeded, the image was already committed back to
             // node-local by saveCache. Otherwise the stale source is dead.
-            yield (0, NodeLocalCleanup_1.cleanupNodeLocalImage)(cacheKey, saveSafe);
+            // Consumers can force cleanup of safe images too via cleanup-node-local.
+            const alwaysCleanup = (core.getInput(constants_1.Inputs.CleanupNodeLocal) || "false").toLowerCase() === "true";
+            yield (0, NodeLocalCleanup_1.cleanupNodeLocalImage)(cacheKey, saveSafe, alwaysCleanup);
         }
         if (earlyExit) {
             // Respect core.setFailed() which sets process.exitCode = 1.
@@ -98809,6 +98812,7 @@ exports.cleanupNodeLocalImage = void 0;
  * After a runner job finishes, the node-local image is either:
  *   - Dead (job cancelled/failed, save skipped) → delete it
  *   - Safe (save succeeded, image committed back to node-local) → keep it
+ *     (unless the consumer opted into always-cleanup via cleanup-node-local)
  *
  * Without this cleanup, stale images from cancelled/failed jobs accumulate
  * on the node until external eviction kicks in (hours/days).
@@ -98821,13 +98825,11 @@ const LOG_PREFIX = "[NodeLocal cleanup]";
 /**
  * Clean up the node-local image after a job completes.
  *
- * @param cacheKey  The cache key used for this entry.
- * @param saveSafe  Whether the save completed successfully (marker present + save ran).
- *                  When true, the saved image was already committed back to node-local
- *                  with the proper cache-key name — we keep it.
- *                  When false, the stale source image is deleted.
+ * @param cacheKey       The cache key used for this entry.
+ * @param saveSafe       Whether the save completed successfully.
+ * @param alwaysCleanup  When true, delete the image even if save succeeded.
  */
-function cleanupNodeLocalImage(cacheKey, saveSafe) {
+function cleanupNodeLocalImage(cacheKey, saveSafe, alwaysCleanup) {
     return __awaiter(this, void 0, void 0, function* () {
         const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) ||
             process.env["NODE_LOCAL_CACHE_DIR"] ||
@@ -98848,21 +98850,21 @@ function cleanupNodeLocalImage(cacheKey, saveSafe) {
             core.debug(`${LOG_PREFIX} No node-local file found at ${localPath}`);
             return;
         }
-        if (saveSafe) {
+        if (saveSafe && !alwaysCleanup) {
             core.info(`${LOG_PREFIX} Save succeeded — keeping node-local image: ${path.basename(localPath)}`);
+            return;
         }
-        else {
-            try {
-                yield fs.unlink(localPath);
-                core.info(`${LOG_PREFIX} Deleted stale node-local image: ${path.basename(localPath)}`);
+        const reason = !saveSafe ? "stale (save skipped/failed)" : "cleanup-node-local enabled";
+        try {
+            yield fs.unlink(localPath);
+            core.info(`${LOG_PREFIX} Deleted node-local image (${reason}): ${path.basename(localPath)}`);
+        }
+        catch (error) {
+            const code = error.code;
+            if (code === "ENOENT") {
+                return;
             }
-            catch (error) {
-                const code = error.code;
-                if (code === "ENOENT") {
-                    return;
-                }
-                core.warning(`${LOG_PREFIX} Failed to delete stale image ${path.basename(localPath)}: ${error instanceof Error ? error.message : error}`);
-            }
+            core.warning(`${LOG_PREFIX} Failed to delete image ${path.basename(localPath)}: ${error instanceof Error ? error.message : error}`);
         }
     });
 }

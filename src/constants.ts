@@ -17,7 +17,8 @@ export enum Inputs {
     SaveCompressionLevel = "save-compression-level", // Input for btrfs defrag compression before upload
     NodeLocalCacheDir = "node-local-cache-dir", // Input for node-local persistent cache directory (HostPath mount)
     MountMode = "mount-mode", // Input for mount mode: "ro" (read-only, default for node_modules) or "rw" (read-write, for mutable caches)
-    FailOnSaveError = "fail-on-save-error" // Input for failing the action on save errors (useful for cache validation tests)
+    FailOnSaveError = "fail-on-save-error", // Input for failing the action on save errors (useful for cache validation tests)
+    CleanupNodeLocal = "cleanup-node-local" // Input for always deleting the node-local image after the job (default: false — only stale images are deleted)
 }
 
 export enum Outputs {

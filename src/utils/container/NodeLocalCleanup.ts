@@ -4,6 +4,7 @@
  * After a runner job finishes, the node-local image is either:
  *   - Dead (job cancelled/failed, save skipped) → delete it
  *   - Safe (save succeeded, image committed back to node-local) → keep it
+ *     (unless the consumer opted into always-cleanup via cleanup-node-local)
  *
  * Without this cleanup, stale images from cancelled/failed jobs accumulate
  * on the node until external eviction kicks in (hours/days).
@@ -19,15 +20,14 @@ const LOG_PREFIX = "[NodeLocal cleanup]";
 /**
  * Clean up the node-local image after a job completes.
  *
- * @param cacheKey  The cache key used for this entry.
- * @param saveSafe  Whether the save completed successfully (marker present + save ran).
- *                  When true, the saved image was already committed back to node-local
- *                  with the proper cache-key name — we keep it.
- *                  When false, the stale source image is deleted.
+ * @param cacheKey       The cache key used for this entry.
+ * @param saveSafe       Whether the save completed successfully.
+ * @param alwaysCleanup  When true, delete the image even if save succeeded.
  */
 export async function cleanupNodeLocalImage(
     cacheKey: string,
-    saveSafe: boolean
+    saveSafe: boolean,
+    alwaysCleanup: boolean
 ): Promise<void> {
     const nodeLocalCacheDir =
         core.getInput(Inputs.NodeLocalCacheDir) ||
@@ -54,26 +54,28 @@ export async function cleanupNodeLocalImage(
         return;
     }
 
-    if (saveSafe) {
+    if (saveSafe && !alwaysCleanup) {
         core.info(
             `${LOG_PREFIX} Save succeeded — keeping node-local image: ${path.basename(localPath)}`
         );
-    } else {
-        try {
-            await fs.unlink(localPath);
-            core.info(
-                `${LOG_PREFIX} Deleted stale node-local image: ${path.basename(localPath)}`
-            );
-        } catch (error) {
-            const code = (error as NodeJS.ErrnoException).code;
-            if (code === "ENOENT") {
-                return;
-            }
-            core.warning(
-                `${LOG_PREFIX} Failed to delete stale image ${path.basename(localPath)}: ${
-                    error instanceof Error ? error.message : error
-                }`
-            );
+        return;
+    }
+
+    const reason = !saveSafe ? "stale (save skipped/failed)" : "cleanup-node-local enabled";
+    try {
+        await fs.unlink(localPath);
+        core.info(
+            `${LOG_PREFIX} Deleted node-local image (${reason}): ${path.basename(localPath)}`
+        );
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") {
+            return;
         }
+        core.warning(
+            `${LOG_PREFIX} Failed to delete image ${path.basename(localPath)}: ${
+                error instanceof Error ? error.message : error
+            }`
+        );
     }
 }

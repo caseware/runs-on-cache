@@ -64,6 +64,10 @@ inputs:
     description: 'Fail the action if cache save encounters an error (useful for cache validation tests)'
     default: 'false'
     required: false
+  cleanup-node-local:
+    description: 'Always delete the node-local image after the job, even if the save succeeded. Default: false (only stale/failed images are deleted; successful images are kept as restore bases for future jobs on the same node).'
+    default: 'false'
+    required: false
   mount-mode:
     description: |
       Mount mode for restored cache:

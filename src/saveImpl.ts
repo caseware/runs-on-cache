@@ -213,7 +213,10 @@ export async function saveRun(earlyExit?: boolean | undefined): Promise<void> {
         // Clean up node-local images after the job.
         // If save succeeded, the image was already committed back to
         // node-local by saveCache. Otherwise the stale source is dead.
-        await cleanupNodeLocalImage(cacheKey, saveSafe);
+        // Consumers can force cleanup of safe images too via cleanup-node-local.
+        const alwaysCleanup =
+            (core.getInput(Inputs.CleanupNodeLocal) || "false").toLowerCase() === "true";
+        await cleanupNodeLocalImage(cacheKey, saveSafe, alwaysCleanup);
     }
 
     if (earlyExit) {

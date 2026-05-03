@@ -95111,7 +95111,8 @@ var Inputs;
     Inputs["SaveCompressionLevel"] = "save-compression-level";
     Inputs["NodeLocalCacheDir"] = "node-local-cache-dir";
     Inputs["MountMode"] = "mount-mode";
-    Inputs["FailOnSaveError"] = "fail-on-save-error"; // Input for failing the action on save errors (useful for cache validation tests)
+    Inputs["FailOnSaveError"] = "fail-on-save-error";
+    Inputs["CleanupNodeLocal"] = "cleanup-node-local"; // Input for always deleting the node-local image after the job (default: false — only stale images are deleted)
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {
