@@ -95112,7 +95112,7 @@ var Inputs;
     Inputs["NodeLocalCacheDir"] = "node-local-cache-dir";
     Inputs["MountMode"] = "mount-mode";
     Inputs["FailOnSaveError"] = "fail-on-save-error";
-    Inputs["CleanupNodeLocal"] = "cleanup-node-local"; // Input for always deleting the node-local image after the job (default: false — only stale images are deleted)
+    Inputs["CleanupNodeLocal"] = "cleanup-node-local"; // Input for node-local image cleanup policy: "none" | "stale" (default) | "always"
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {

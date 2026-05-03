@@ -95112,7 +95112,7 @@ var Inputs;
     Inputs["NodeLocalCacheDir"] = "node-local-cache-dir";
     Inputs["MountMode"] = "mount-mode";
     Inputs["FailOnSaveError"] = "fail-on-save-error";
-    Inputs["CleanupNodeLocal"] = "cleanup-node-local"; // Input for always deleting the node-local image after the job (default: false — only stale images are deleted)
+    Inputs["CleanupNodeLocal"] = "cleanup-node-local"; // Input for node-local image cleanup policy: "none" | "stale" (default) | "always"
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {
@@ -96339,12 +96339,10 @@ function saveRun(earlyExit) {
             const cacheKey = core.getState(constants_1.State.CachePrimaryKey) ||
                 core.getInput(constants_1.Inputs.Key);
             yield (0, BtrfsCleanup_1.cleanupForCacheKey)(cacheKey);
-            // Clean up node-local images after the job.
-            // If save succeeded, the image was already committed back to
-            // node-local by saveCache. Otherwise the stale source is dead.
-            // Consumers can force cleanup of safe images too via cleanup-node-local.
-            const alwaysCleanup = (core.getInput(constants_1.Inputs.CleanupNodeLocal) || "false").toLowerCase() === "true";
-            yield (0, NodeLocalCleanup_1.cleanupNodeLocalImage)(cacheKey, saveSafe, alwaysCleanup);
+            // Clean up node-local images based on the cleanup-node-local policy.
+            const rawPolicy = (core.getInput(constants_1.Inputs.CleanupNodeLocal) || "stale").toLowerCase();
+            const cleanupPolicy = rawPolicy === "none" || rawPolicy === "always" ? rawPolicy : "stale";
+            yield (0, NodeLocalCleanup_1.cleanupNodeLocalImage)(cacheKey, saveSafe, cleanupPolicy);
         }
         if (earlyExit) {
             // Respect core.setFailed() which sets process.exitCode = 1.
@@ -98809,28 +98807,20 @@ exports.cleanupNodeLocalImage = void 0;
 /**
  * NodeLocalCleanup — post-job cleanup of node-local BTRFS images.
  *
- * After a runner job finishes, the node-local image is either:
- *   - Dead (job cancelled/failed, save skipped) → delete it
- *   - Safe (save succeeded, image committed back to node-local) → keep it
- *     (unless the consumer opted into always-cleanup via cleanup-node-local)
- *
- * Without this cleanup, stale images from cancelled/failed jobs accumulate
- * on the node until external eviction kicks in (hours/days).
+ * Policy (set via the cleanup-node-local input):
+ *   "none"   — no cleanup; images stay on disk regardless of outcome
+ *   "stale"  — (default) delete failed/cancelled; keep successful
+ *   "always" — delete after every job, even if save succeeded
  */
 const core = __importStar(__nccwpck_require__(2186));
 const fs = __importStar(__nccwpck_require__(3977));
 const path = __importStar(__nccwpck_require__(9411));
 const constants_1 = __nccwpck_require__(9042);
 const LOG_PREFIX = "[NodeLocal cleanup]";
-/**
- * Clean up the node-local image after a job completes.
- *
- * @param cacheKey       The cache key used for this entry.
- * @param saveSafe       Whether the save completed successfully.
- * @param alwaysCleanup  When true, delete the image even if save succeeded.
- */
-function cleanupNodeLocalImage(cacheKey, saveSafe, alwaysCleanup) {
+function cleanupNodeLocalImage(cacheKey, saveSafe, policy) {
     return __awaiter(this, void 0, void 0, function* () {
+        if (policy === "none")
+            return;
         const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) ||
             process.env["NODE_LOCAL_CACHE_DIR"] ||
             "";
@@ -98850,11 +98840,11 @@ function cleanupNodeLocalImage(cacheKey, saveSafe, alwaysCleanup) {
             core.debug(`${LOG_PREFIX} No node-local file found at ${localPath}`);
             return;
         }
-        if (saveSafe && !alwaysCleanup) {
+        if (saveSafe && policy !== "always") {
             core.info(`${LOG_PREFIX} Save succeeded — keeping node-local image: ${path.basename(localPath)}`);
             return;
         }
-        const reason = !saveSafe ? "stale (save skipped/failed)" : "cleanup-node-local enabled";
+        const reason = !saveSafe ? "stale (save skipped/failed)" : "policy=always";
         try {
             yield fs.unlink(localPath);
             core.info(`${LOG_PREFIX} Deleted node-local image (${reason}): ${path.basename(localPath)}`);

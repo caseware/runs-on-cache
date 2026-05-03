@@ -1,13 +1,10 @@
 /**
  * NodeLocalCleanup — post-job cleanup of node-local BTRFS images.
  *
- * After a runner job finishes, the node-local image is either:
- *   - Dead (job cancelled/failed, save skipped) → delete it
- *   - Safe (save succeeded, image committed back to node-local) → keep it
- *     (unless the consumer opted into always-cleanup via cleanup-node-local)
- *
- * Without this cleanup, stale images from cancelled/failed jobs accumulate
- * on the node until external eviction kicks in (hours/days).
+ * Policy (set via the cleanup-node-local input):
+ *   "none"   — no cleanup; images stay on disk regardless of outcome
+ *   "stale"  — (default) delete failed/cancelled; keep successful
+ *   "always" — delete after every job, even if save succeeded
  */
 import * as core from "@actions/core";
 import * as fs from "node:fs/promises";
@@ -17,18 +14,15 @@ import { Inputs } from "../../constants";
 
 const LOG_PREFIX = "[NodeLocal cleanup]";
 
-/**
- * Clean up the node-local image after a job completes.
- *
- * @param cacheKey       The cache key used for this entry.
- * @param saveSafe       Whether the save completed successfully.
- * @param alwaysCleanup  When true, delete the image even if save succeeded.
- */
+export type CleanupPolicy = "none" | "stale" | "always";
+
 export async function cleanupNodeLocalImage(
     cacheKey: string,
     saveSafe: boolean,
-    alwaysCleanup: boolean
+    policy: CleanupPolicy
 ): Promise<void> {
+    if (policy === "none") return;
+
     const nodeLocalCacheDir =
         core.getInput(Inputs.NodeLocalCacheDir) ||
         process.env["NODE_LOCAL_CACHE_DIR"] ||
@@ -54,14 +48,14 @@ export async function cleanupNodeLocalImage(
         return;
     }
 
-    if (saveSafe && !alwaysCleanup) {
+    if (saveSafe && policy !== "always") {
         core.info(
             `${LOG_PREFIX} Save succeeded — keeping node-local image: ${path.basename(localPath)}`
         );
         return;
     }
 
-    const reason = !saveSafe ? "stale (save skipped/failed)" : "cleanup-node-local enabled";
+    const reason = !saveSafe ? "stale (save skipped/failed)" : "policy=always";
     try {
         await fs.unlink(localPath);
         core.info(
