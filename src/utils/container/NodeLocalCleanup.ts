@@ -1,6 +1,8 @@
 /**
  * NodeLocalCleanup — post-job cleanup of node-local BTRFS images.
  *
+ * Handles both WORM images and .active-* job copies.
+ *
  * Policy (set via the cleanup-node-local input):
  *   "none"   — no cleanup; images stay on disk regardless of outcome
  *   "stale"  — (default) delete failed/cancelled; keep successful
@@ -38,6 +40,29 @@ export async function cleanupNodeLocalImage(
 
     if (!isBtrfs) return;
 
+    // Clean up the .active-* file used by this job (always, regardless of policy)
+    // The containerFile path is saved in state during restore — it points to the
+    // .active-* file if a pool copy was acquired or a WORM copy was made.
+    const containerFile = core.getState("BTRFS_CONTAINER_FILE") || "";
+    if (containerFile && path.basename(containerFile).startsWith(".active-")) {
+        try {
+            await fs.unlink(containerFile);
+            core.info(
+                `${LOG_PREFIX} Deleted active job file: ${path.basename(containerFile)}`
+            );
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code !== "ENOENT") {
+                core.warning(
+                    `${LOG_PREFIX} Failed to delete active file ${path.basename(containerFile)}: ${
+                        error instanceof Error ? error.message : error
+                    }`
+                );
+            }
+        }
+    }
+
+    // Handle WORM image cleanup (existing behavior)
     const sanitizedKey = cacheKey.replace(/[/\\:*?"<>|]/g, "-");
     const localPath = path.join(nodeLocalCacheDir, `${sanitizedKey}.btrfs`);
 

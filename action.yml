@@ -72,6 +72,10 @@ inputs:
         "always" — delete the image after every job, even if the save succeeded.
     default: 'stale'
     required: false
+  max-node-local-gb:
+    description: 'Maximum total size (GB) for node-local WORM images. When exceeded, oldest images are evicted (LRU). Set to 0 to disable. Default: 30.'
+    default: '30'
+    required: false
   mount-mode:
     description: |
       Mount mode for restored cache:

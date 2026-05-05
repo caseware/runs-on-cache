@@ -4,20 +4,26 @@ import * as path from "path";
 import * as crypto from "crypto";
 
 const STALE_TEMP_FILE_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
+const STALE_ACTIVE_FILE_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
 
 /**
  * NodeLocalCache provides node-level persistent caching via a HostPath-mounted directory.
  *
  * Architecture:
  *   /opt/local-volumes/btrfs-cache/   (HostPath mount on EKS nodes)
- *     ├── <cache-key>.btrfs           (final WORM images)
+ *     ├── <cache-key>.btrfs           (final WORM images — 1 per cache key)
+ *     ├── .pool-<key>-NN.btrfs        (prestaged copies with unique UUIDs, created by cache-warmer)
+ *     ├── .active-<id>.btrfs          (in-use by a running job — acquired from pool via atomic rename)
  *     ├── <cache-key>.tar.lz4         (final tar archives)
  *     └── .temp<random>.btrfs         (in-progress population, cleaned after 12h)
  *
  * Flow:
  *   1. Check if node-local file exists for the cache key → instant mount (~1-2s)
- *   2. If missing, download from S3 → write to .tempXXX → atomic mv → mount
- *   3. Prune stale .temp* files older than 12 hours
+ *   2. Try to acquire a prestaged pool copy (.pool-*) via atomic rename → .active-*
+ *   3. If no pool copy, copy from WORM + UUID randomize (fallback)
+ *   4. If missing entirely, download from S3 → write to .tempXXX → atomic mv → mount
+ *   5. Prune stale .temp* and .active-* files older than 12 hours
+ *   6. LRU eviction: if total WORM size exceeds budget, evict oldest images
  *
  * This class is shared by BtrfsContainer, VhdxContainer, TarLz4Container, and TarContainer.
  */
@@ -275,6 +281,262 @@ export class NodeLocalCache {
             );
             return null;
         }
+    }
+
+    // ── Pool copy acquisition ─────────────────────────────────────────
+
+    /**
+     * Try to acquire a prestaged pool copy for this cache key.
+     *
+     * The cache-warmer DaemonSet creates `.pool-{sanitized-key}-NN.btrfs`
+     * files, each with a unique BTRFS UUID (randomized during prestage).
+     * This method atomically renames the first available pool copy to
+     * `.active-{unique_id}.btrfs`, making it exclusively owned by this job.
+     *
+     * Returns the acquired file path, or null if no pool copy is available.
+     */
+    async tryAcquirePoolCopy(): Promise<string | null> {
+        if (!this.enabled) return null;
+
+        const sanitizedKey = this.sanitizeKey(this.cacheKey);
+        const poolPrefix = `.pool-${sanitizedKey}-`;
+
+        try {
+            const entries = await fs.readdir(this.cacheDir);
+            const poolFiles = entries
+                .filter(e => e.startsWith(poolPrefix) && e.endsWith(this.extension) && !e.includes("staging"))
+                .sort();
+
+            if (poolFiles.length === 0) {
+                core.debug("[NodeLocal] No pool copies available");
+                return null;
+            }
+
+            // Try each pool file — another job may race us for the same slot
+            for (const poolFile of poolFiles) {
+                const sourcePath = path.join(this.cacheDir, poolFile);
+                const activeId = crypto.randomBytes(8).toString("hex");
+                const activePath = path.join(
+                    this.cacheDir,
+                    `.active-${activeId}${this.extension}`
+                );
+
+                try {
+                    await fs.rename(sourcePath, activePath);
+                    core.info(
+                        `[NodeLocal] Acquired pool copy: ${poolFile} → ${path.basename(activePath)}`
+                    );
+                    return activePath;
+                } catch (error) {
+                    const code = (error as NodeJS.ErrnoException).code;
+                    if (code === "ENOENT") {
+                        // Another job grabbed it first — try next slot
+                        core.debug(`[NodeLocal] Pool copy ${poolFile} already taken, trying next`);
+                        continue;
+                    }
+                    core.warning(
+                        `[NodeLocal] Failed to acquire pool copy ${poolFile}: ${
+                            error instanceof Error ? error.message : error
+                        }`
+                    );
+                }
+            }
+
+            core.debug("[NodeLocal] All pool copies taken by other jobs");
+            return null;
+        } catch (error) {
+            core.debug(
+                `[NodeLocal] tryAcquirePoolCopy failed: ${error instanceof Error ? error.message : error}`
+            );
+            return null;
+        }
+    }
+
+    /**
+     * Create an .active-* path for a fallback copy (when no pool copy available).
+     * The copy is placed in the same directory as the WORM image so that
+     * `fs.rename()` from WORM to active is a same-filesystem atomic operation.
+     */
+    createActivePath(): string {
+        const activeId = crypto.randomBytes(8).toString("hex");
+        return path.join(
+            this.cacheDir,
+            `.active-${activeId}${this.extension}`
+        );
+    }
+
+    // ── LRU eviction ────────────────────────────────────────────────
+
+    /**
+     * Evict oldest WORM images when total size exceeds the budget.
+     * Called before downloading new images on cache miss.
+     *
+     * Skips files that are:
+     *   - Pool copies (.pool-*)
+     *   - Active job copies (.active-*)
+     *   - Temp files (.temp*)
+     *   - Currently mounted (checked via /proc/mounts)
+     *
+     * @param maxGb Maximum total size in GB for WORM images. 0 disables.
+     */
+    async evictLRU(maxGb: number): Promise<number> {
+        if (!this.enabled || maxGb <= 0) return 0;
+
+        const maxBytes = maxGb * 1024 * 1024 * 1024;
+        let evicted = 0;
+
+        try {
+            const entries = await fs.readdir(this.cacheDir);
+            const wormFiles: { name: string; size: number; mtimeMs: number }[] = [];
+
+            for (const entry of entries) {
+                // Skip non-WORM files
+                if (entry.startsWith(".")) continue; // .pool-*, .active-*, .temp*
+                if (!entry.endsWith(this.extension)) continue;
+
+                const fullPath = path.join(this.cacheDir, entry);
+                try {
+                    const stat = await fs.stat(fullPath);
+                    wormFiles.push({ name: entry, size: stat.size, mtimeMs: stat.mtimeMs });
+                } catch {
+                    // File may have been removed
+                }
+            }
+
+            const totalSize = wormFiles.reduce((sum, f) => sum + f.size, 0);
+            if (totalSize <= maxBytes) {
+                core.debug(
+                    `[NodeLocal] LRU: ${Math.ceil(totalSize / (1024 * 1024))} MB within ` +
+                    `${maxGb} GB budget — no eviction needed`
+                );
+                return 0;
+            }
+
+            core.info(
+                `[NodeLocal] LRU: ${Math.ceil(totalSize / (1024 * 1024))} MB exceeds ` +
+                `${maxGb} GB budget — evicting oldest images`
+            );
+
+            // Sort oldest first
+            wormFiles.sort((a, b) => a.mtimeMs - b.mtimeMs);
+
+            // Check which files are mounted (skip those)
+            const mountedFiles = await this.getMountedFiles();
+
+            let currentSize = totalSize;
+            for (const file of wormFiles) {
+                if (currentSize <= maxBytes) break;
+
+                // Never evict the current cache key's image
+                const sanitizedCurrent = `${this.sanitizeKey(this.cacheKey)}${this.extension}`;
+                if (file.name === sanitizedCurrent) {
+                    core.debug(`[NodeLocal] LRU: skipping current key ${file.name}`);
+                    continue;
+                }
+
+                const fullPath = path.join(this.cacheDir, file.name);
+
+                // Skip mounted files
+                if (mountedFiles.has(fullPath)) {
+                    core.debug(`[NodeLocal] LRU: skipping mounted ${file.name}`);
+                    continue;
+                }
+
+                core.info(
+                    `[NodeLocal] LRU: evicting ${file.name} ` +
+                    `(${Math.ceil(file.size / (1024 * 1024))} MB, ` +
+                    `${Math.floor((Date.now() - file.mtimeMs) / 3600000)}h old)`
+                );
+                await this.removeSafe(fullPath);
+                currentSize -= file.size;
+                evicted++;
+            }
+
+            if (evicted > 0) {
+                core.info(
+                    `[NodeLocal] LRU: evicted ${evicted} image(s), ` +
+                    `${Math.ceil(currentSize / (1024 * 1024))} MB remaining`
+                );
+            }
+        } catch (error) {
+            core.warning(
+                `[NodeLocal] LRU eviction failed: ${error instanceof Error ? error.message : error}`
+            );
+        }
+
+        return evicted;
+    }
+
+    /**
+     * Clean up stale .active-* files from crashed/killed jobs.
+     */
+    async cleanupStaleActiveFiles(): Promise<number> {
+        if (!this.enabled) return 0;
+
+        let cleaned = 0;
+        try {
+            const entries = await fs.readdir(this.cacheDir);
+            const now = Date.now();
+            const mountedFiles = await this.getMountedFiles();
+
+            for (const entry of entries) {
+                if (!entry.startsWith(".active-")) continue;
+
+                const fullPath = path.join(this.cacheDir, entry);
+
+                // Skip if currently mounted
+                if (mountedFiles.has(fullPath)) continue;
+
+                try {
+                    const stat = await fs.stat(fullPath);
+                    const ageMs = now - stat.mtimeMs;
+
+                    if (ageMs > STALE_ACTIVE_FILE_AGE_MS) {
+                        core.info(
+                            `[NodeLocal] Removing stale active file (${Math.floor(ageMs / 3600000)}h old): ${entry}`
+                        );
+                        await this.removeSafe(fullPath);
+                        cleaned++;
+                    }
+                } catch {
+                    // stat failed — file may have been cleaned
+                }
+            }
+
+            if (cleaned > 0) {
+                core.info(`[NodeLocal] Cleaned ${cleaned} stale active file(s)`);
+            }
+        } catch (error) {
+            core.debug(`[NodeLocal] Active cleanup skipped: ${error instanceof Error ? error.message : error}`);
+        }
+
+        return cleaned;
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────
+
+    /**
+     * Get the set of files currently mounted as loop devices.
+     * Reads /proc/mounts to find BTRFS loop-backed mounts.
+     */
+    private async getMountedFiles(): Promise<Set<string>> {
+        const mounted = new Set<string>();
+        try {
+            const { exec: execCmd, getExecOutput } = await import("@actions/exec");
+            const result = await getExecOutput("losetup", ["-l", "-n", "-O", "BACK-FILE"], {
+                silent: true,
+                ignoreReturnCode: true
+            });
+            if (result.exitCode === 0) {
+                for (const line of result.stdout.split("\n")) {
+                    const trimmed = line.trim();
+                    if (trimmed) mounted.add(trimmed);
+                }
+            }
+        } catch {
+            // losetup may not be available
+        }
+        return mounted;
     }
 
     /**

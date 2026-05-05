@@ -13,6 +13,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { Inputs } from "../../constants";
 import { createCacheKeySpecificTempDirectory } from "../actionUtils";
 import { Container, ContainerOptions } from "./Container";
 import { BtrfsImage, validateFsSize, validateCompressionLevel } from "./BtrfsImage";
@@ -110,9 +111,26 @@ export class BtrfsContainer extends Container {
 
         try {
             await this.nodeLocal.cleanupStaleTempFiles();
+            await this.nodeLocal.cleanupStaleActiveFiles();
         } catch (e) {
             core.warning(
-                `${this.getLogPrefix()} Stale temp cleanup failed (non-fatal): ${
+                `${this.getLogPrefix()} Stale cleanup failed (non-fatal): ${
+                    (e as Error).message
+                }`
+            );
+        }
+
+        // LRU eviction: remove oldest WORM images if disk budget exceeded
+        try {
+            const maxGb = parseFloat(
+                core.getInput(Inputs.MaxNodeLocalGb) || "30"
+            );
+            if (maxGb > 0) {
+                await this.nodeLocal.evictLRU(maxGb);
+            }
+        } catch (e) {
+            core.warning(
+                `${this.getLogPrefix()} LRU eviction failed (non-fatal): ${
                     (e as Error).message
                 }`
             );
@@ -147,6 +165,13 @@ export class BtrfsContainer extends Container {
 
             try {
                 if (this.mountMode === "rw") {
+                    // Try pool copy first (pre-randomized UUID, atomic rename)
+                    const poolCopy = await this.tryAcquirePoolAndMount();
+                    if (poolCopy) {
+                        this.restoredFromNodeLocal = true;
+                        return true;
+                    }
+                    // Fallback: copy from WORM + UUID randomize
                     await this.copyAndMountReadWrite(localPath);
                 } else {
                     await this.mountImageReadOnly(localPath);
@@ -172,6 +197,7 @@ export class BtrfsContainer extends Container {
                     this.logInfo(
                         `Node-local partial hit — copying ${path.basename(closestMatch)} for RW augmentation`
                     );
+                    // Pool copies are keyed to exact match; partial hits always copy
                     await this.copyAndMountReadWrite(closestMatch);
                     this.restoredFromNodeLocal = true;
                     return true;
@@ -201,10 +227,14 @@ export class BtrfsContainer extends Container {
                 // UUID before RW mount. Without this, two runners on the same
                 // node get exit code 32 (EEXIST) from BTRFS UUID collision.
                 if (this.isInNodeLocalDir()) {
-                    this.logInfo(
-                        "Container file is in node-local WORM dir — copying for RW mount"
-                    );
-                    await this.copyAndMountReadWrite(this.containerFile);
+                    // Try pool copy first (pre-randomized, atomic rename)
+                    const poolMounted = await this.tryAcquirePoolAndMount();
+                    if (!poolMounted) {
+                        this.logInfo(
+                            "No pool copy available — copying from WORM for RW mount"
+                        );
+                        await this.copyAndMountReadWrite(this.containerFile);
+                    }
                 } else {
                     await this.mountImageReadWrite();
                     await this.image.expandForHeadroom(this.mountPoint!);
@@ -351,19 +381,53 @@ export class BtrfsContainer extends Container {
         }
     }
 
-    private async copyAndMountReadWrite(imageFile: string): Promise<void> {
-        const tempDir = await createCacheKeySpecificTempDirectory(
-            this.cacheKey
-        );
-        const localCopy = path.join(tempDir, "cache.btrfs");
+    /**
+     * Try to acquire a pool copy and mount it directly (no copy, no UUID randomization).
+     * Pool copies are pre-randomized by the cache-warmer DaemonSet.
+     */
+    private async tryAcquirePoolAndMount(): Promise<boolean> {
+        const activePath = await this.nodeLocal.tryAcquirePoolCopy();
+        if (!activePath) return false;
 
-        this.logInfo(`Copying for RW mount: ${imageFile} → ${localCopy}`);
-        await fs.copyFile(imageFile, localCopy);
+        try {
+            this.logInfo(
+                `Mounting prestaged pool copy: ${path.basename(activePath)}`
+            );
+            this.image.setImageFile(activePath);
+            this.containerFile = activePath;
+            core.saveState("BTRFS_CONTAINER_FILE", activePath);
+            await this.mountImageReadWrite();
+            await this.image.expandForHeadroom(this.mountPoint!);
+            return true;
+        } catch (error) {
+            core.warning(
+                `${this.getLogPrefix()} Pool copy mount failed, will fall back to copy: ${
+                    error instanceof Error ? error.message : error
+                }`
+            );
+            // Clean up the failed active file
+            try { await fs.unlink(activePath); } catch { /* ignore */ }
+            return false;
+        }
+    }
+
+    private async copyAndMountReadWrite(imageFile: string): Promise<void> {
+        // Place the copy in the same directory as the WORM image when possible
+        // so that cleanup is centralized and the file is on the same filesystem.
+        const activePath = this.nodeLocal.enabled
+            ? this.nodeLocal.createActivePath()
+            : path.join(
+                  await createCacheKeySpecificTempDirectory(this.cacheKey),
+                  "cache.btrfs"
+              );
+
+        this.logInfo(`Copying for RW mount: ${imageFile} → ${activePath}`);
+        await fs.copyFile(imageFile, activePath);
 
         // Verify copy integrity: file size must match original
         const [srcStat, dstStat] = await Promise.all([
             fs.stat(imageFile),
-            fs.stat(localCopy)
+            fs.stat(activePath)
         ]);
         if (srcStat.size !== dstStat.size) {
             throw new Error(
@@ -375,10 +439,11 @@ export class BtrfsContainer extends Container {
         );
 
         // Randomize UUID so kernel doesn't reject duplicate of node-local original
-        this.image.setImageFile(localCopy);
+        this.image.setImageFile(activePath);
         await this.image.randomizeUuid();
 
-        this.containerFile = localCopy;
+        this.containerFile = activePath;
+        core.saveState("BTRFS_CONTAINER_FILE", activePath);
         await this.mountImageReadWrite();
         await this.image.expandForHeadroom(this.mountPoint!);
     }
