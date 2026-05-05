@@ -4,7 +4,7 @@ import * as path from "path";
 import * as crypto from "crypto";
 
 const STALE_TEMP_FILE_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
-const STALE_ACTIVE_FILE_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
+const STALE_ACTIVE_FILE_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours (max GitHub job duration)
 
 /**
  * NodeLocalCache provides node-level persistent caching via a HostPath-mounted directory.

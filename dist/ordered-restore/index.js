@@ -98203,7 +98203,7 @@ const fs = __importStar(__nccwpck_require__(3292));
 const path = __importStar(__nccwpck_require__(1017));
 const crypto = __importStar(__nccwpck_require__(6113));
 const STALE_TEMP_FILE_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
-const STALE_ACTIVE_FILE_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
+const STALE_ACTIVE_FILE_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours (max GitHub job duration)
 /**
  * NodeLocalCache provides node-level persistent caching via a HostPath-mounted directory.
  *
