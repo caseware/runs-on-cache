@@ -58,6 +58,13 @@ export async function restoreImpl(
         // (INPUT_* env vars may not be reliably set in post steps)
         core.saveState("CUSTOM_COMPRESSION", customCompression);
         core.saveState("CUSTOM_COMPRESSION_LEVEL", customCompressionLevel);
+        // Persist fail-on-save-error too: the save runs in the post step, where
+        // action INPUT_* env vars are not reliably present, so reading the input
+        // there would silently default to false and swallow save failures.
+        core.saveState(
+            "FAIL_ON_SAVE_ERROR",
+            String(utils.getInputAsBool(Inputs.FailOnSaveError))
+        );
 
         let cacheKey: string | undefined;
 

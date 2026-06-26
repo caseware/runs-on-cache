@@ -221,6 +221,17 @@ export async function saveRun(earlyExit?: boolean | undefined): Promise<void> {
         }
     } catch (err) {
         console.error(err);
+        // The save runs in the post step. Swallowing the error here makes the
+        // step exit 0 and the job go GREEN despite a failed/poisoned save —
+        // the worst outcome. When fail-on-save-error was set (persisted to
+        // state during restore, since post-step inputs are unreliable), mark
+        // the step failed so it exits non-zero.
+        const failOnSaveError = core.getState("FAIL_ON_SAVE_ERROR") === "true";
+        if (failOnSaveError) {
+            core.setFailed(
+                `Cache save failed: ${err instanceof Error ? err.message : err}`
+            );
+        }
     } finally {
         // Always clean up BTRFS mounts, even if save was skipped or failed.
         // Uses shared BtrfsCleanup (C) — scoped to this cache entry's key.

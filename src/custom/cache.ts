@@ -429,6 +429,11 @@ export async function saveCache(
         } else {
             let failOnError = false;
             try { failOnError = core.getBooleanInput(Inputs.FailOnSaveError, { required: false }); } catch { /* input not set */ }
+            // Post-step fallback: action inputs are not reliably present in the
+            // post step, so getBooleanInput throws/defaults to false and the
+            // save failure would be swallowed (job goes green). Fall back to the
+            // value persisted to state during restore.
+            if (!failOnError && core.getState("FAIL_ON_SAVE_ERROR") === "true") { failOnError = true; }
             if (failOnError) {
                 core.setFailed(`Cache save failed: ${typedError.message}`);
             } else {
@@ -487,6 +492,11 @@ export async function saveCacheSync(
         } else {
             let failOnError = false;
             try { failOnError = core.getBooleanInput(Inputs.FailOnSaveError, { required: false }); } catch { /* input not set */ }
+            // Post-step fallback: action inputs are not reliably present in the
+            // post step, so getBooleanInput throws/defaults to false and the
+            // save failure would be swallowed (job goes green). Fall back to the
+            // value persisted to state during restore.
+            if (!failOnError && core.getState("FAIL_ON_SAVE_ERROR") === "true") { failOnError = true; }
             if (failOnError) {
                 core.setFailed(`Cache save failed: ${typedError.message}`);
             } else {

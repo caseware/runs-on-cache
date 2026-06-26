@@ -81,7 +81,9 @@ export class NodeLocalCache {
                 // mkdir or access failed — try with sudo (runners have privileged: true)
                 const { exec: execCmd } = await import("@actions/exec");
                 await execCmd("sudo", ["mkdir", "-p", this.cacheDir], { silent: true });
-                await execCmd("sudo", ["chown", `${process.getuid()}:${process.getgid()}`, this.cacheDir], { silent: true });
+                // getuid/getgid are typed optional (undefined on Windows) under
+                // @types/node 24; this path is Linux-runner-only, so assert.
+                await execCmd("sudo", ["chown", `${process.getuid!()}:${process.getgid!()}`, this.cacheDir], { silent: true });
                 await fs.access(this.cacheDir, (await import("fs")).constants.W_OK);
             }
 

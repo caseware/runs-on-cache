@@ -1,4 +1,5 @@
 import * as core from "@actions/core";
+import * as exec from "@actions/exec";
 import * as path from "path";
 
 import { ContainerFactory } from "../src/utils/container/ContainerFactory";
@@ -9,6 +10,7 @@ jest.mock("@actions/exec");
 jest.mock("@actions/core");
 
 const mockedCore = jest.mocked(core);
+const mockedExec = jest.mocked(exec);
 
 const TEST_BASE_DIR = "/home/runner/work/repo";
 const TEST_CACHE_KEY = "Linux-node-abc123";
@@ -132,6 +134,87 @@ describe("parseZstdLevel", () => {
 
     test("out-of-range → 3", () => {
         expect(parseZstdLevel("zstd:99")).toBe(3);
+    });
+});
+
+describe("XfsContainer.onMountDiscovered (Problem 1: verify-raw-exists)", () => {
+    test("repoints the image at the live loop backing file so verify finds the raw image", async () => {
+        const container = createXfsContainer();
+        // Simulate the save process: setupRawImagePath() points the image at a
+        // fresh-process safeCwd path that was never created in this process.
+        await (
+            container as unknown as { setupRawImagePath(): Promise<void> }
+        ).setupRawImagePath();
+
+        // losetup -nO BACK-FILE /dev/loop7 → the REAL backing file from the
+        // restore process's safeCwd (different from this process's path).
+        const realBackFile = "/tmp/xfs-restoreProc/cache.xfs";
+        mockedExec.getExecOutput.mockResolvedValueOnce({
+            exitCode: 0,
+            stdout: `${realBackFile}\n`,
+            stderr: ""
+        });
+
+        await (
+            container as unknown as {
+                onMountDiscovered(source: string): Promise<void>;
+            }
+        ).onMountDiscovered("/dev/loop7");
+
+        // The image (what verifyMountable stats) now resolves to the real file.
+        const image = (container as unknown as { xfsImage: { getImageFile(): string } })
+            .xfsImage;
+        expect(image.getImageFile()).toBe(realBackFile);
+    });
+
+    test("strips a trailing '(deleted)' marker from the backing file", async () => {
+        const container = createXfsContainer();
+        await (
+            container as unknown as { setupRawImagePath(): Promise<void> }
+        ).setupRawImagePath();
+
+        mockedExec.getExecOutput.mockResolvedValueOnce({
+            exitCode: 0,
+            stdout: "/tmp/xfs-restoreProc/cache.xfs (deleted)\n",
+            stderr: ""
+        });
+
+        await (
+            container as unknown as {
+                onMountDiscovered(source: string): Promise<void>;
+            }
+        ).onMountDiscovered("/dev/loop7");
+
+        const image = (container as unknown as { xfsImage: { getImageFile(): string } })
+            .xfsImage;
+        expect(image.getImageFile()).toBe("/tmp/xfs-restoreProc/cache.xfs");
+    });
+
+    test("ignores non-loop sources (no losetup lookup)", async () => {
+        const container = createXfsContainer();
+        await (
+            container as unknown as { onMountDiscovered(s: string): Promise<void> }
+        ).onMountDiscovered("/dev/sda1");
+        expect(mockedExec.getExecOutput).not.toHaveBeenCalled();
+    });
+});
+
+describe("XfsContainer.copyImage (Problem 2: sparse-preserving copy)", () => {
+    test("uses `cp --sparse=always` (not fs.copyFile) to keep the image sparse", async () => {
+        const container = createXfsContainer();
+        mockedExec.exec.mockResolvedValueOnce(0);
+
+        await (
+            container as unknown as {
+                copyImage(src: string, dst: string): Promise<void>;
+            }
+        ).copyImage("/tmp/src.xfs", "/tmp/dst.xfs");
+
+        expect(mockedExec.exec).toHaveBeenCalledWith(
+            "cp",
+            ["--sparse=always", "/tmp/src.xfs", "/tmp/dst.xfs"],
+            expect.any(Object)
+        );
     });
 });
 

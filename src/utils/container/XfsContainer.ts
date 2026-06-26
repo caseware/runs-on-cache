@@ -27,8 +27,11 @@
  */
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
+import { createReadStream, createWriteStream } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { pipeline } from "node:stream/promises";
+import * as zlib from "node:zlib";
 
 import { ContainerOptions } from "./Container";
 import { LoopContainer } from "./LoopContainer";
@@ -139,6 +142,72 @@ export class XfsContainer extends LoopContainer {
     }
 
     /**
+     * The save step runs in a SEPARATE process from restore/createEmptyCache,
+     * so its per-run mkdtemp safeCwd differs and setupRawImagePath() points
+     * rawImageFile at a <safeCwd>/cache.xfs that was never created in THIS
+     * process — the real raw image lives in the restore process's safeCwd. The
+     * loop mount survives across processes (kernel state), so discoverMountInfo
+     * finds it, but getImageFile() would resolve to the wrong, non-existent
+     * path → the live ENOENT seen in verifyMountable (stat '<safeCwd>/cache.xfs').
+     *
+     * Recover the real backing file from the live loop device (`losetup`) and
+     * re-point rawImageFile + the XfsImage at it, so verifyMountable() and
+     * finalizeSaveArtifact() operate on the file that actually exists.
+     */
+    protected async onMountDiscovered(source: string): Promise<void> {
+        if (!source.startsWith("/dev/loop")) return;
+        try {
+            const out = await exec.getExecOutput(
+                "losetup",
+                ["-nO", "BACK-FILE", source],
+                {
+                    cwd: this.safeCwd,
+                    silent: !core.isDebug(),
+                    ignoreReturnCode: true
+                }
+            );
+            // losetup may append " (deleted)" if the backing file was unlinked.
+            const backFile = out.stdout
+                .trim()
+                .replace(/\s*\(deleted\)\s*$/, "")
+                .trim();
+            if (out.exitCode === 0 && backFile) {
+                this.logInfo(
+                    `Resolved live xfs backing file from ${source}: ${backFile}`
+                );
+                this.rawImageFile = backFile;
+                this.xfsImage.setImageFile(backFile);
+            } else {
+                core.warning(
+                    `${this.getLogPrefix()} Could not resolve backing file for ${source}; ` +
+                        `verify will use ${this.rawImageFile}`
+                );
+            }
+        } catch (err) {
+            core.warning(
+                `${this.getLogPrefix()} losetup BACK-FILE lookup failed for ${source}: ${
+                    err instanceof Error ? err.message : err
+                }`
+            );
+        }
+    }
+
+    /**
+     * Sparse-preserving copy of the raw xfs image. The raw image is a sparse
+     * 25G file (truncate -s 25G + mkfs.xfs) with only ~7-15G of actual data
+     * blocks allocated. fs.copyFile does NOT preserve holes on Linux and would
+     * balloon the copy to 25G physical on disk, so we use
+     * `cp --sparse=always` (via the async exec helper, never execFileSync) to
+     * keep the copy sparse end-to-end.
+     */
+    protected async copyImage(src: string, dst: string): Promise<void> {
+        await exec.exec("cp", ["--sparse=always", src, dst], {
+            cwd: this.safeCwd,
+            silent: !core.isDebug()
+        });
+    }
+
+    /**
      * Keep XfsImage.imageFile in sync with Container.containerFile ONLY for the
      * raw-image case. When containerFile points at a compressed S3 artifact we
      * must NOT point the image at it — restore() decompresses to rawImageFile
@@ -178,7 +247,9 @@ export class XfsContainer extends LoopContainer {
                 this.logInfo(
                     "Persisting RAW xfs image to node-local (not the compressed archive)"
                 );
-                await fs.copyFile(this.rawImageFile, tempPath);
+                // Sparse-preserving copy — the kept node-local WORM image must
+                // stay sparse (Problem 2); fs.copyFile would balloon it to 25G.
+                await this.copyImage(this.rawImageFile, tempPath);
             } else {
                 // Restore path: tempPath holds the freshly downloaded COMPRESSED
                 // artifact. Decompress it in place so the node-local WORM copy is
@@ -214,12 +285,17 @@ export class XfsContainer extends LoopContainer {
         this.logInfo(
             `Compressing raw XFS image with zstd -${this.zstdLevel}: ${rawFile} → ${archive}`
         );
-        // -f overwrite, -o output, keep source (no --rm) so node-local commit
-        // can still copy the raw image afterwards.
-        await exec.exec(
-            "zstd",
-            [`-${this.zstdLevel}`, "-f", "-o", archive, rawFile],
-            { cwd: this.safeCwd, silent: !core.isDebug() }
+        // Stream via Node's built-in zlib zstd (node24) — no `zstd` CLI / exec.
+        // The source is kept (we read it, never remove it) so the node-local
+        // commit can still copy the RAW image afterwards.
+        await pipeline(
+            createReadStream(rawFile),
+            zlib.createZstdCompress({
+                params: {
+                    [zlib.constants.ZSTD_c_compressionLevel]: this.zstdLevel
+                }
+            }),
+            createWriteStream(archive)
         );
 
         const [srcStat, dstStat] = await Promise.all([
@@ -239,10 +315,16 @@ export class XfsContainer extends LoopContainer {
         this.logInfo(
             `Decompressing artifact with zstd: ${archive} → ${rawFile}`
         );
-        // -d decompress, -f overwrite, -o output, keep source.
-        await exec.exec("zstd", ["-d", "-f", "-o", rawFile, archive], {
-            cwd: this.safeCwd,
-            silent: !core.isDebug()
-        });
+        // Stream via Node's built-in zlib zstd (node24) — no `zstd` CLI / exec.
+        // NOTE: streaming decompress writes a NORMAL (non-sparse) file. That is
+        // acceptable here because the decompressed output is a transient working
+        // image that is immediately loop-mounted and (on restore) expanded; the
+        // SAVED / kept node-local copy is produced by sparse-preserving copies
+        // (see commitNodeLocalDownload / copyAndMountReadWrite), per Problem 2.
+        await pipeline(
+            createReadStream(archive),
+            zlib.createZstdDecompress(),
+            createWriteStream(rawFile)
+        );
     }
 }

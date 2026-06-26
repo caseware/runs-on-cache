@@ -121,6 +121,21 @@ export abstract class LoopContainer extends Container {
     }
 
     /**
+     * Called from discoverMountInfo() once the live mount is found, with the
+     * mount SOURCE (the loop device, e.g. "/dev/loop5"). The save step runs in a
+     * SEPARATE process from restore/createEmptyCache, so its per-run mkdtemp
+     * safeCwd — and therefore the default rawImageFile / image path computed in
+     * setupRawImagePath() — does NOT point at the image that is actually mounted.
+     * btrfs is immune (it mounts the stable containerFile path directly), so the
+     * default is a no-op. xfs overrides this to resolve the real backing file
+     * from the loop device and re-point rawImageFile / the image at it, so
+     * verifyMountable() and finalizeSaveArtifact() operate on the file that
+     * actually exists. See XfsContainer.onMountDiscovered.
+     */
+    // eslint-disable-next-line @typescript-eslint/no-empty-function,@typescript-eslint/no-unused-vars
+    protected async onMountDiscovered(source: string): Promise<void> {}
+
+    /**
      * Whether the standard (non-node-local) RW restore must copy+UUID-randomize
      * before mounting. btrfs does this when containerFile is in the node-local
      * WORM dir; xfs never (its raw image always lives in safeCwd).
@@ -406,7 +421,7 @@ export abstract class LoopContainer extends Container {
         const localCopy = path.join(tempDir, this.localCopyName());
 
         this.logInfo(`Copying for RW mount: ${imageFile} → ${localCopy}`);
-        await fs.copyFile(imageFile, localCopy);
+        await this.copyImage(imageFile, localCopy);
 
         // Verify copy integrity: file size must match original
         const [srcStat, dstStat] = await Promise.all([
@@ -615,11 +630,13 @@ export abstract class LoopContainer extends Container {
                 const options = parts.slice(2).join(" ");
 
                 if (mountPoint === expectedMountPoint) {
+                    const source = parts[1];
                     this.logDebug(
-                        `Found existing mount: ${parts[1]} → ${mountPoint} (${options})`
+                        `Found existing mount: ${source} → ${mountPoint} (${options})`
                     );
                     this.mountPoint = mountPoint;
                     this.mountIsReadOnly = /\bro\b/.test(options);
+                    await this.onMountDiscovered(source);
                     this.logDebug(
                         `Using image: ${this.rawImageFile} (readOnly=${this.mountIsReadOnly})`
                     );
@@ -685,6 +702,17 @@ export abstract class LoopContainer extends Container {
         if (!this.nodeLocal.enabled) return false;
         const cacheDir = path.dirname(this.nodeLocal.localPath);
         return this.containerFile.startsWith(cacheDir + "/");
+    }
+
+    /**
+     * Copy a raw loop image. Default uses fs.copyFile (btrfs: the image was
+     * already compressed/right-sized via resize+truncate, so a plain copy is
+     * fine). xfs overrides this with a sparse-preserving copy because the raw
+     * xfs image is a sparse 25G file and fs.copyFile would balloon it to 25G
+     * physical on disk (see XfsContainer.copyImage).
+     */
+    protected async copyImage(src: string, dst: string): Promise<void> {
+        await fs.copyFile(src, dst);
     }
 
     protected async execSudo(
