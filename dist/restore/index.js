@@ -99957,51 +99957,12 @@ class XfsImage extends LoopImage_1.LoopImage {
                     return false;
                 }
                 this.info(`Image file size: ${Math.round(stat.size / 1024 / 1024)} MB`);
-                // 2. xfs_repair -n (read-only check, no modifications). Attach to a
-                //    loop device first — xfs_repair operates on block devices.
-                let loopDev;
-                try {
-                    const loResult = yield exec.getExecOutput("sudo", ["losetup", "--find", "--show", imageFile], {
-                        cwd: this.safeCwd,
-                        silent: !core.isDebug(),
-                        ignoreReturnCode: true
-                    });
-                    if (loResult.exitCode === 0 && loResult.stdout.trim()) {
-                        loopDev = loResult.stdout.trim();
-                    }
-                }
-                catch (_a) {
-                    /* fall through to test-mount approach */
-                }
-                if (loopDev) {
-                    try {
-                        const result = yield exec.getExecOutput("sudo", ["xfs_repair", "-n", loopDev], {
-                            cwd: "/tmp",
-                            silent: !core.isDebug(),
-                            ignoreReturnCode: true
-                        });
-                        if (result.exitCode !== 0) {
-                            core.error(`${LOG_PREFIX} xfs_repair -n exited ${result.exitCode} — image may be corrupted. stderr: ${result.stderr.slice(0, 500)}`);
-                            return false;
-                        }
-                        this.info("xfs_repair -n succeeded — image is safe to upload");
-                        return true;
-                    }
-                    finally {
-                        try {
-                            yield exec.exec("sudo", ["losetup", "-d", loopDev], {
-                                cwd: this.safeCwd,
-                                silent: true,
-                                ignoreReturnCode: true
-                            });
-                        }
-                        catch (_b) {
-                            /* best-effort */
-                        }
-                    }
-                }
-                // 3. Fallback: test loop-mount RO then unmount.
-                core.warning(`${LOG_PREFIX} Could not attach loop device for xfs_repair — falling back to test mount`);
+                // 2. PRIMARY check: a clean RO loop-mount + unmount. This is the
+                //    real "is it mountable" signal AND it replays/clears any dirty
+                //    XFS log. xfs_repair -n (below) refuses to replay a dirty log
+                //    and exits 1 with "valuable metadata changes in a log" even
+                //    though the image is perfectly valid — so mounting must come
+                //    first and is authoritative.
                 const testMount = path.join(this.safeCwd, "verify-mount");
                 try {
                     yield this.mountRO(testMount);
