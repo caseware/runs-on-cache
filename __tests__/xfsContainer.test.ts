@@ -2,9 +2,14 @@ import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 import * as path from "path";
 
+import * as fsPromises from "node:fs/promises";
+
 import { ContainerFactory } from "../src/utils/container/ContainerFactory";
 import { XfsContainer } from "../src/utils/container/XfsContainer";
-import { parseZstdLevel } from "../src/utils/container/XfsImage";
+import { parseZstdLevel, XfsImage } from "../src/utils/container/XfsImage";
+
+jest.mock("node:fs/promises");
+const mockedFs = jest.mocked(fsPromises);
 
 jest.mock("@actions/exec");
 jest.mock("@actions/core");

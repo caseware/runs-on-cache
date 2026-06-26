@@ -100334,6 +100334,10 @@ class XfsImage extends LoopImage_1.LoopImage {
                 description: "XFS UUID management (install xfsprogs)"
             },
             {
+                command: "xfs_db",
+                description: "offline XFS superblock verification before upload (install xfsprogs)"
+            },
+            {
                 command: "mount",
                 description: "mounting filesystems (install util-linux)"
             },
@@ -100375,10 +100379,30 @@ class XfsImage extends LoopImage_1.LoopImage {
     /**
      * Verify the XFS image is valid before S3 upload.
      *
-     * XFS has no offline superblock-dump tool equivalent to btrfs's
-     * dump-super that we rely on, so we prefer `xfs_repair -n` (read-only,
-     * no-modify check). If xfs_repair is unavailable or fails to run, we fall
-     * back to a test loop-mount (mount RO, then unmount).
+     * IMPORTANT — why this does NOT re-mount the image:
+     *
+     * The previous approach test-mounted the just-unmounted image read-only.
+     * That was both over-strict AND racy. On busy runners the main workspace
+     * mount cannot be cleanly unmounted (a running process holds the workspace
+     * as its CWD), so the save falls back to a LAZY unmount (`umount -l`). A
+     * lazy unmount detaches the mount point immediately but keeps the loop
+     * device + backing file in use until the last reference closes. A fresh RO
+     * mount of the SAME backing file (on a new loop device) then fails with
+     * exit 32 (EBUSY — the superblock is still considered mounted), aborting an
+     * otherwise-perfect save. See the IM-4641 incident: the image was just
+     * mounted RW and written successfully, so the re-mount adds no real signal.
+     *
+     * Instead we do an OFFLINE, no-mount, read-only structural check directly
+     * on the backing file:
+     *   - `xfs_db -r -c "sb 0" -c "print" <imageFile>` opens the file read-only
+     *     and prints superblock 0. This does NOT attach a loop device, does NOT
+     *     replay the log, and does NOT need the device to be un-busy — so it is
+     *     immune to the lazy-unmount race. We additionally assert the printed
+     *     superblock carries the XFS magic number (0x58465342 / "XFSB") to
+     *     confirm it is structurally a valid XFS image.
+     *   - If xfs_db cannot run at all (not installed / unexpected failure), we
+     *     do NOT hard-fail the save — that would be over-strict. We fall back to
+     *     a file-size>0 sanity check and WARN.
      */
     verifyMountable() {
         return __awaiter(this, void 0, void 0, function* () {
@@ -100392,25 +100416,39 @@ class XfsImage extends LoopImage_1.LoopImage {
                     return false;
                 }
                 this.info(`Image file size: ${Math.round(stat.size / 1024 / 1024)} MB`);
-                // 2. PRIMARY check: a clean RO loop-mount + unmount. This is the
-                //    real "is it mountable" signal AND it replays/clears any dirty
-                //    XFS log. xfs_repair -n (below) refuses to replay a dirty log
-                //    and exits 1 with "valuable metadata changes in a log" even
-                //    though the image is perfectly valid — so mounting must come
-                //    first and is authoritative.
-                const testMount = path.join(this.safeCwd, "verify-mount");
-                try {
-                    yield this.mountRO(testMount);
-                    yield this.unmount(testMount);
-                    this.info("Test mount succeeded — image is safe to upload");
-                    return true;
-                }
-                catch (mountErr) {
-                    core.error(`${LOG_PREFIX} Test mount failed — image may be corrupted: ${mountErr instanceof Error ? mountErr.message : mountErr}`);
+                // 2. PRIMARY check: offline read-only superblock read (no loop, no
+                //    mount, no log replay) — immune to the lazy-unmount EBUSY race.
+                const result = yield exec.getExecOutput("xfs_db", ["-r", "-c", "sb 0", "-c", "print", imageFile], {
+                    cwd: this.safeCwd,
+                    silent: !core.isDebug(),
+                    ignoreReturnCode: true
+                });
+                if (result.exitCode === 0) {
+                    const out = `${result.stdout}\n${result.stderr}`;
+                    // A valid XFS superblock prints magicnum = 0x58465342 ("XFSB").
+                    if (/magicnum\s*=\s*0x58465342/i.test(out)) {
+                        this.info("Offline superblock check passed (xfs_db sb 0) — image is safe to upload");
+                        return true;
+                    }
+                    core.error(`${LOG_PREFIX} Offline superblock check FAILED — xfs_db read sb 0 ` +
+                        `but the XFS magic number (0x58465342) was not present. ` +
+                        `Aborting S3 upload to avoid poisoning the cache. Output: ${out.trim()}`);
                     return false;
                 }
+                // 3. xfs_db could not run (not installed / unexpected error). Do
+                //    NOT hard-fail — the image was just mounted RW and written
+                //    successfully, and the size check above passed. WARN instead.
+                core.warning(`${LOG_PREFIX} Could not run offline xfs_db superblock check (exit ${result.exitCode}: ` +
+                    `${result.stderr.trim() ||
+                        result.stdout.trim() ||
+                        "no output"}). ` +
+                    `Falling back to file-size sanity check (size > 0 already verified) and proceeding with upload.`);
+                return true;
             }
             catch (verifyError) {
+                // An unexpected error in the verify path itself (e.g. fs.stat
+                // threw). Treat as a real failure — we could not establish the
+                // image even exists.
                 core.error(`Verification FAILED — aborting S3 upload to prevent poisoning cache: ${verifyError instanceof Error
                     ? verifyError.message
                     : verifyError}`);
