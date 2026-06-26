@@ -64,6 +64,22 @@ export class NodeLocalCache {
     }
 
     /**
+     * Whether a node-local image was placed by the cache-warmer DaemonSet
+     * (pre-warmed) vs left by a prior runner on this node. The cache-warmer
+     * writes a sidecar stamp file "<image>.prewarmed" next to images it
+     * prestages; its presence distinguishes "prewarmed" from "node-local" for
+     * metrics. Best-effort: returns false if the stamp is absent/unreadable.
+     */
+    async isPrewarmed(imagePath: string = this.localPath): Promise<boolean> {
+        try {
+            await fs.access(`${imagePath}.prewarmed`);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
      * Create a temp file path for atomic population.
      * Returns the path to write to before calling commitTempFile().
      */

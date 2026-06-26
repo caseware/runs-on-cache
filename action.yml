@@ -96,6 +96,8 @@ outputs:
     description: 'A boolean value to indicate an exact match was found for the primary key'
   node-local-cache-hit:
     description: 'Whether the cache was restored from node-local storage: "true" (node-local hit), "false" (S3 fallback), or "disabled" (node-local not configured)'
+  cache-source:
+    description: 'Precise provenance of the restored image: "prewarmed" (DaemonSet-prestaged node-local image), "node-local" (node-local image left by a prior runner), "s3" (downloaded from the S3 bucket), or "cold-boot" (no cache found)'
 runs:
   using: 'node24'
   main: 'dist/restore/index.js'

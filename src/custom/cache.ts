@@ -141,6 +141,12 @@ export async function restoreCache(
         if (restoredFromLocal) {
             core.info("Cache restored from node-local storage (fast path)");
             core.setOutput(Outputs.NodeLocalCacheHit, "true");
+            // "prewarmed" (DaemonSet-prestaged) vs "node-local" (prior runner)
+            // — set by tryRestoreFromNodeLocal based on the prewarm stamp.
+            core.setOutput(
+                Outputs.CacheSource,
+                cacheContainer.getRestoreSource() || "node-local"
+            );
             return primaryKey;
         }
 
@@ -155,6 +161,7 @@ export async function restoreCache(
             // Cache not found
             core.debug("Cache not found");
             core.setOutput(Outputs.NodeLocalCacheHit, nodeLocalEnabled ? "false" : "disabled");
+            core.setOutput(Outputs.CacheSource, "cold-boot");
             if (cacheContainer && cacheContainer.requiresCreateEmptyCache) {
                 await cacheContainer.createEmptyCache();
                 core.debug(
@@ -224,6 +231,7 @@ export async function restoreCache(
 
         // Report node-local cache miss (S3 fallback) or disabled
         core.setOutput(Outputs.NodeLocalCacheHit, nodeLocalEnabled ? "false" : "disabled");
+        core.setOutput(Outputs.CacheSource, "s3");
 
         return cacheEntry.cacheKey;
     } catch (error) {

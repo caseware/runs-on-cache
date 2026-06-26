@@ -95119,7 +95119,15 @@ var Outputs;
     Outputs["CacheHit"] = "cache-hit";
     Outputs["CachePrimaryKey"] = "cache-primary-key";
     Outputs["CacheMatchedKey"] = "cache-matched-key";
-    Outputs["NodeLocalCacheHit"] = "node-local-cache-hit"; // Output from restore action: "true" | "false" | "disabled"
+    Outputs["NodeLocalCacheHit"] = "node-local-cache-hit";
+    // Output from restore action: precise provenance of the restored image.
+    //   prewarmed  : node-local hostPath hit on a DaemonSet-prestaged image
+    //                (carries the prewarm stamp file)
+    //   node-local : node-local hostPath hit on an image left by a prior runner
+    //                on this node (no prewarm stamp)
+    //   s3         : downloaded from the S3 bucket (node-local missed)
+    //   cold-boot  : no cache found (empty image created)
+    Outputs["CacheSource"] = "cache-source";
 })(Outputs = exports.Outputs || (exports.Outputs = {}));
 var State;
 (function (State) {
@@ -95544,6 +95552,9 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             if (restoredFromLocal) {
                 core.info("Cache restored from node-local storage (fast path)");
                 core.setOutput(constants_1.Outputs.NodeLocalCacheHit, "true");
+                // "prewarmed" (DaemonSet-prestaged) vs "node-local" (prior runner)
+                // — set by tryRestoreFromNodeLocal based on the prewarm stamp.
+                core.setOutput(constants_1.Outputs.CacheSource, cacheContainer.getRestoreSource() || "node-local");
                 return primaryKey;
             }
             // path are needed to compute version
@@ -95556,6 +95567,7 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
                 // Cache not found
                 core.debug("Cache not found");
                 core.setOutput(constants_1.Outputs.NodeLocalCacheHit, nodeLocalEnabled ? "false" : "disabled");
+                core.setOutput(constants_1.Outputs.CacheSource, "cold-boot");
                 if (cacheContainer && cacheContainer.requiresCreateEmptyCache) {
                     yield cacheContainer.createEmptyCache();
                     core.debug(`Created empty cache container of type ${cacheContainer.constructor.name}`);
@@ -95608,6 +95620,7 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             core.info("Cache restored successfully from S3");
             // Report node-local cache miss (S3 fallback) or disabled
             core.setOutput(constants_1.Outputs.NodeLocalCacheHit, nodeLocalEnabled ? "false" : "disabled");
+            core.setOutput(constants_1.Outputs.CacheSource, "s3");
             return cacheEntry.cacheKey;
         }
         catch (error) {
@@ -97067,6 +97080,10 @@ exports.Container = void 0;
 const core = __importStar(__nccwpck_require__(2186));
 const NodeLocalCache_1 = __nccwpck_require__(8033);
 class Container {
+    /** Precise restore provenance for metrics (see restoreSource). */
+    getRestoreSource() {
+        return this.restoreSource;
+    }
     constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options = {}) {
         this.containerFile = containerFile;
         this.compressionMethod = compressionMethod;
@@ -97395,6 +97412,9 @@ class LoopContainer extends Container_1.Container {
                         yield this.mountImageReadOnly(localPath);
                     }
                     this.restoredFromNodeLocal = true;
+                    this.restoreSource = (yield this.nodeLocal.isPrewarmed(localPath))
+                        ? "prewarmed"
+                        : "node-local";
                     return true;
                 }
                 catch (error) {
@@ -97410,6 +97430,9 @@ class LoopContainer extends Container_1.Container {
                         this.logInfo(`Node-local partial hit — copying ${path.basename(closestMatch)} for RW augmentation`);
                         yield this.copyAndMountReadWrite(closestMatch);
                         this.restoredFromNodeLocal = true;
+                        this.restoreSource = (yield this.nodeLocal.isPrewarmed(closestMatch))
+                            ? "prewarmed"
+                            : "node-local";
                         return true;
                     }
                     catch (error) {
@@ -97988,12 +98011,54 @@ class LoopImage {
                 core.warning(`${this.logPrefix} Backing file expansion failed: ${e instanceof Error ? e.message : e}`);
                 return;
             }
-            // Grow the filesystem to fill the new backing space (fs-specific).
+            // CRITICAL: truncating the backing file does NOT tell the already-
+            // attached loop device about the new size — it still exposes the old
+            // capacity. Growing the filesystem onto that stale, smaller block
+            // device leaves the fs believing it has space the loop device won't
+            // back, which surfaces as EIO on later writes/rmdir (see the gh-runner
+            // warm-restore failure: checkout's clean hit
+            // "EIO: i/o error, rmdir .cypress/.../ansi-styles"). Refresh the loop
+            // device capacity with `losetup -c` BEFORE growing the filesystem.
+            const loopDev = yield this.findLoopDeviceFor(this.imageFile);
+            if (!loopDev) {
+                core.warning(`${this.logPrefix} Could not resolve loop device for ${this.imageFile} — skipping filesystem grow to avoid an inconsistent (EIO-prone) mount`);
+                return;
+            }
+            try {
+                yield sudoExec("losetup", ["-c", loopDev], this.safeCwd);
+                this.info(`Refreshed loop device capacity (${loopDev}) after backing-file grow`);
+            }
+            catch (e) {
+                core.warning(`${this.logPrefix} losetup -c (capacity refresh) failed for ${loopDev}: ${e instanceof Error ? e.message : e} — skipping filesystem grow to avoid an inconsistent (EIO-prone) mount`);
+                return;
+            }
+            // Grow the filesystem to fill the new (now loop-visible) backing space.
             try {
                 yield this.growFilesystem(mountPoint);
             }
             catch (e) {
                 core.warning(`${this.logPrefix} Filesystem grow failed: ${e instanceof Error ? e.message : e}`);
+            }
+        });
+    }
+    /**
+     * Resolve the loop device currently backing the given image file via
+     * `losetup -j`. Returns the /dev/loopN path or null if none is attached.
+     */
+    findLoopDeviceFor(imageFile) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const out = yield exec.getExecOutput("sudo", ["losetup", "-j", imageFile], {
+                    cwd: this.safeCwd,
+                    silent: !core.isDebug(),
+                    ignoreReturnCode: true
+                });
+                // Format: "/dev/loop1: 0 (/tmp/xfs-XXX/cache.xfs)"
+                const match = out.stdout.match(/^(\/dev\/loop\d+):/m);
+                return match ? match[1] : null;
+            }
+            catch (_a) {
+                return null;
             }
         });
     }
@@ -98518,6 +98583,24 @@ class NodeLocalCache {
             }
             catch (_a) {
                 core.debug(`[NodeLocal] Cache miss: ${this.localPath}`);
+                return false;
+            }
+        });
+    }
+    /**
+     * Whether a node-local image was placed by the cache-warmer DaemonSet
+     * (pre-warmed) vs left by a prior runner on this node. The cache-warmer
+     * writes a sidecar stamp file "<image>.prewarmed" next to images it
+     * prestages; its presence distinguishes "prewarmed" from "node-local" for
+     * metrics. Best-effort: returns false if the stamp is absent/unreadable.
+     */
+    isPrewarmed(imagePath = this.localPath) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                yield fs.access(`${imagePath}.prewarmed`);
+                return true;
+            }
+            catch (_a) {
                 return false;
             }
         });

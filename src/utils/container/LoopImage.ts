@@ -196,7 +196,36 @@ export abstract class LoopImage {
             return;
         }
 
-        // Grow the filesystem to fill the new backing space (fs-specific).
+        // CRITICAL: truncating the backing file does NOT tell the already-
+        // attached loop device about the new size — it still exposes the old
+        // capacity. Growing the filesystem onto that stale, smaller block
+        // device leaves the fs believing it has space the loop device won't
+        // back, which surfaces as EIO on later writes/rmdir (see the gh-runner
+        // warm-restore failure: checkout's clean hit
+        // "EIO: i/o error, rmdir .cypress/.../ansi-styles"). Refresh the loop
+        // device capacity with `losetup -c` BEFORE growing the filesystem.
+        const loopDev = await this.findLoopDeviceFor(this.imageFile);
+        if (!loopDev) {
+            core.warning(
+                `${this.logPrefix} Could not resolve loop device for ${this.imageFile} — skipping filesystem grow to avoid an inconsistent (EIO-prone) mount`
+            );
+            return;
+        }
+        try {
+            await sudoExec("losetup", ["-c", loopDev], this.safeCwd);
+            this.info(
+                `Refreshed loop device capacity (${loopDev}) after backing-file grow`
+            );
+        } catch (e) {
+            core.warning(
+                `${this.logPrefix} losetup -c (capacity refresh) failed for ${loopDev}: ${
+                    e instanceof Error ? e.message : e
+                } — skipping filesystem grow to avoid an inconsistent (EIO-prone) mount`
+            );
+            return;
+        }
+
+        // Grow the filesystem to fill the new (now loop-visible) backing space.
         try {
             await this.growFilesystem(mountPoint);
         } catch (e) {
@@ -205,6 +234,31 @@ export abstract class LoopImage {
                     e instanceof Error ? e.message : e
                 }`
             );
+        }
+    }
+
+    /**
+     * Resolve the loop device currently backing the given image file via
+     * `losetup -j`. Returns the /dev/loopN path or null if none is attached.
+     */
+    protected async findLoopDeviceFor(
+        imageFile: string
+    ): Promise<string | null> {
+        try {
+            const out = await exec.getExecOutput(
+                "sudo",
+                ["losetup", "-j", imageFile],
+                {
+                    cwd: this.safeCwd,
+                    silent: !core.isDebug(),
+                    ignoreReturnCode: true
+                }
+            );
+            // Format: "/dev/loop1: 0 (/tmp/xfs-XXX/cache.xfs)"
+            const match = out.stdout.match(/^(\/dev\/loop\d+):/m);
+            return match ? match[1] : null;
+        } catch {
+            return null;
         }
     }
 

@@ -201,6 +201,11 @@ export abstract class LoopContainer extends Container {
                     await this.mountImageReadOnly(localPath);
                 }
                 this.restoredFromNodeLocal = true;
+                this.restoreSource = (await this.nodeLocal.isPrewarmed(
+                    localPath
+                ))
+                    ? "prewarmed"
+                    : "node-local";
                 return true;
             } catch (error) {
                 core.warning(
@@ -226,6 +231,11 @@ export abstract class LoopContainer extends Container {
                     );
                     await this.copyAndMountReadWrite(closestMatch);
                     this.restoredFromNodeLocal = true;
+                    this.restoreSource = (await this.nodeLocal.isPrewarmed(
+                        closestMatch
+                    ))
+                        ? "prewarmed"
+                        : "node-local";
                     return true;
                 } catch (error) {
                     core.warning(

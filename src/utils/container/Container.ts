@@ -18,6 +18,18 @@ export abstract class Container {
      */
     protected readonly nodeLocal: NodeLocalCache;
     protected restoredFromNodeLocal = false;
+    /**
+     * Precise provenance of the restore, for metrics:
+     *   "prewarmed" | "node-local" | "s3" | "cold-boot" | undefined (not set).
+     * Node-local restore paths set "prewarmed" vs "node-local" based on the
+     * cache-warmer prewarm stamp; the S3 / cold-boot paths are set by cache.ts.
+     */
+    protected restoreSource: string | undefined;
+
+    /** Precise restore provenance for metrics (see restoreSource). */
+    getRestoreSource(): string | undefined {
+        return this.restoreSource;
+    }
 
     constructor(
         protected containerFile: string,

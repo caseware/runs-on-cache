@@ -25,7 +25,15 @@ export enum Outputs {
     CacheHit = "cache-hit", // Output from cache, restore action
     CachePrimaryKey = "cache-primary-key", // Output from restore action
     CacheMatchedKey = "cache-matched-key", // Output from restore action
-    NodeLocalCacheHit = "node-local-cache-hit" // Output from restore action: "true" | "false" | "disabled"
+    NodeLocalCacheHit = "node-local-cache-hit", // Output from restore action: "true" | "false" | "disabled"
+    // Output from restore action: precise provenance of the restored image.
+    //   prewarmed  : node-local hostPath hit on a DaemonSet-prestaged image
+    //                (carries the prewarm stamp file)
+    //   node-local : node-local hostPath hit on an image left by a prior runner
+    //                on this node (no prewarm stamp)
+    //   s3         : downloaded from the S3 bucket (node-local missed)
+    //   cold-boot  : no cache found (empty image created)
+    CacheSource = "cache-source"
 }
 
 export enum State {
