@@ -25,8 +25,34 @@ inputs:
   custom-compression-level:
     description: 'Level of compression for the custom method. Syntax varies per method.'
     required: false
+  fs-size:
+    description: 'Virtual size of the filesystem image (btrfs/xfs backends), e.g. 25G.'
+    required: false
+  fs-buffer-mb:
+    description: 'Headroom buffer in MB added when sizing the image.'
+    required: false
+  save-compression-level:
+    description: 'Compression level applied when saving the image (e.g. zstd:9).'
+    required: false
+  mount-mode:
+    description: 'Mount mode for the cache image: ro or rw.'
+    required: false
+  node-local-cache-dir:
+    description: 'Node-local hostPath dir for the WORM image copy (k8s runners).'
+    required: false
+  cleanup-node-local:
+    description: 'Node-local cleanup policy: none | stale | always.'
+    required: false
+  fail-on-save-error:
+    description: 'Fail the action (non-zero exit) if the save fails. Use for the producer/warm job so a failed save fails the job natively.'
+    required: false
+    default: 'false'
+  force-save:
+    description: 'Force a save even when the restored key matches the primary key.'
+    required: false
+    default: 'false'
 runs:
-  using: 'node20'
+  using: 'node24'
   main: '../dist/save-only/index.js'
 branding:
   icon: 'archive'
