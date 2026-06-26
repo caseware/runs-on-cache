@@ -4,16 +4,18 @@ import * as fs from "fs";
 import * as path from "path";
 
 import { Events, Inputs, State } from "./constants";
+import * as custom from "./custom/cache";
 import {
     IStateProvider,
     NullStateProvider,
     StateProvider
 } from "./stateProvider";
 import * as utils from "./utils/actionUtils";
-
-import * as custom from "./custom/cache";
 import { cleanupForCacheKey } from "./utils/container/BtrfsCleanup";
-import { cleanupNodeLocalImage, CleanupPolicy } from "./utils/container/NodeLocalCleanup";
+import {
+    cleanupNodeLocalImage,
+    CleanupPolicy
+} from "./utils/container/NodeLocalCleanup";
 
 /**
  * Marker file that workflows must create before the post step runs to
@@ -51,7 +53,8 @@ export async function saveImpl(
 
         if (!utils.isValidEvent()) {
             utils.logWarning(
-                `Event Validation Error: The event type ${process.env[Events.Key]
+                `Event Validation Error: The event type ${
+                    process.env[Events.Key]
                 } is not supported because it's not tied to a branch or tag ref.`
             );
             return;
@@ -72,7 +75,10 @@ export async function saveImpl(
         // NO-OP in case of SaveOnly action
         const restoredKey = stateProvider.getCacheState();
 
-        if (utils.isExactKeyMatch(primaryKey, restoredKey) && !core.getBooleanInput(Inputs.ForceSave)) {
+        if (
+            utils.isExactKeyMatch(primaryKey, restoredKey) &&
+            !core.getBooleanInput(Inputs.ForceSave)
+        ) {
             core.info(
                 `Cache hit occurred on the primary key ${primaryKey}, not saving cache.`
             );
@@ -91,8 +97,14 @@ export async function saveImpl(
 
         const sync = utils.getInputAsBool(Inputs.Sync);
 
-        const customCompression = core.getState("CUSTOM_COMPRESSION") || core.getInput(Inputs.CustomCompression) || undefined;
-        const customCompressionLevel = core.getState("CUSTOM_COMPRESSION_LEVEL") || core.getInput(Inputs.CustomCompressionLevel) || undefined;
+        const customCompression =
+            core.getState("CUSTOM_COMPRESSION") ||
+            core.getInput(Inputs.CustomCompression) ||
+            undefined;
+        const customCompressionLevel =
+            core.getState("CUSTOM_COMPRESSION_LEVEL") ||
+            core.getInput(Inputs.CustomCompressionLevel) ||
+            undefined;
 
         if (canSaveToS3) {
             core.info(
@@ -100,16 +112,15 @@ export async function saveImpl(
             );
 
             if (sync) {
-                cacheId = await custom.saveCacheSync(
-                    cachePaths,
-                    primaryKey
-                );
+                cacheId = await custom.saveCacheSync(cachePaths, primaryKey);
             } else {
                 cacheId = await custom.saveCache(
                     cachePaths,
                     primaryKey,
                     {
-                        uploadChunkSize: utils.getInputAsInt(Inputs.UploadChunkSize)
+                        uploadChunkSize: utils.getInputAsInt(
+                            Inputs.UploadChunkSize
+                        )
                     },
                     enableCrossOsArchive,
                     customCompression,
@@ -173,23 +184,31 @@ export async function saveRun(earlyExit?: boolean | undefined): Promise<void> {
         // BTRFS cleanup always runs in the finally block regardless.
         const saveEnabled = core.getState("CACHE_SAVE_ENABLED") === "true";
         if (!saveEnabled) {
-            core.info("Skipping cache save — restore step did not complete successfully");
+            core.info(
+                "Skipping cache save — restore step did not complete successfully"
+            );
         } else {
-            const isBtrfs = (
+            // Image-based backends (btrfs, xfs) build a filesystem image that
+            // is uploaded to S3. Uploading a half-populated image after a
+            // cancelled job poisons the cache, so both are gated by the
+            // .cache-save-ok marker.
+            const compressionBackend = (
                 core.getState("CUSTOM_COMPRESSION") ||
                 core.getInput(Inputs.CustomCompression) ||
                 ""
-            ) === "btrfs";
+            ).split("-")[0];
+            const isImageBased =
+                compressionBackend === "btrfs" || compressionBackend === "xfs";
 
-            if (isBtrfs) {
+            if (isImageBased) {
                 const runnerTemp = process.env["RUNNER_TEMP"] || "/tmp";
                 const markerPath = path.join(runnerTemp, CACHE_SAVE_MARKER);
                 if (!fs.existsSync(markerPath)) {
                     core.warning(
-                        "Skipping BTRFS cache save — marker file " +
-                        `${markerPath} not found. The job was likely ` +
-                        "cancelled before completing. Add a workflow step " +
-                        'to create this marker: touch "${RUNNER_TEMP}/.cache-save-ok"'
+                        "Skipping image-based cache save — marker file " +
+                            `${markerPath} not found. The job was likely ` +
+                            "cancelled before completing. Add a workflow step " +
+                            'to create this marker: touch "${RUNNER_TEMP}/.cache-save-ok"'
                     );
                 } else {
                     await saveImpl(new StateProvider());
@@ -206,8 +225,7 @@ export async function saveRun(earlyExit?: boolean | undefined): Promise<void> {
         // Always clean up BTRFS mounts, even if save was skipped or failed.
         // Uses shared BtrfsCleanup (C) — scoped to this cache entry's key.
         const cacheKey =
-            core.getState(State.CachePrimaryKey) ||
-            core.getInput(Inputs.Key);
+            core.getState(State.CachePrimaryKey) || core.getInput(Inputs.Key);
         await cleanupForCacheKey(cacheKey);
 
         // Clean up node-local images based on the cleanup-node-local policy.
@@ -215,7 +233,9 @@ export async function saveRun(earlyExit?: boolean | undefined): Promise<void> {
             core.getInput(Inputs.CleanupNodeLocal) || "stale"
         ).toLowerCase();
         const cleanupPolicy: CleanupPolicy =
-            rawPolicy === "none" || rawPolicy === "always" ? rawPolicy : "stale";
+            rawPolicy === "none" || rawPolicy === "always"
+                ? rawPolicy
+                : "stale";
         await cleanupNodeLocalImage(cacheKey, saveSafe, cleanupPolicy);
     }
 

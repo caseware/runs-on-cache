@@ -3,6 +3,7 @@ import { Container } from "./Container";
 import { TarContainer } from "./TarContainer";
 import { TarLz4Container } from "./TarLz4Container";
 import { VhdxContainer } from "./VhdxContainer";
+import { XfsContainer } from "./XfsContainer";
 
 export interface ContainerFactoryOptions {
     fsSize?: string;
@@ -20,6 +21,7 @@ type Instances = {
 
 const SUPPORTED_CLASSES = {
     btrfs: BtrfsContainer,
+    xfs: XfsContainer,
     vhdx: VhdxContainer,
     tarLz4: TarLz4Container,
     tar: TarContainer

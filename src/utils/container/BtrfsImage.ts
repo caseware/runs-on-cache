@@ -1,211 +1,95 @@
 /**
- * BtrfsImage — pure BTRFS image lifecycle operations.
+ * BtrfsImage — BTRFS-specific image lifecycle operations.
  *
- * Responsibilities: create sparse image, format, mount/unmount (RO/RW),
- * defrag, resize, truncate, verify, loop device management.
+ * All fs-agnostic logic (sparse image creation, loop-device attach/detach,
+ * generic mount/unmount, RW headroom expansion, diagnostics scaffolding,
+ * prerequisite scaffolding) lives in LoopImage. This class supplies ONLY the
+ * BTRFS-specific pieces: compress= mount options, defrag+resize+truncate save
+ * pipeline, dump-super verification, btrfstune UUID randomization, and
+ * `btrfs device stats` health.
  *
- * Does NOT know about bind mounts, workspace paths, node-local caching,
- * or cache keys. Those concerns belong to BtrfsContainer (the orchestrator).
+ * Does NOT know about bind mounts, workspace paths, node-local caching, or
+ * cache keys. Those concerns belong to BtrfsContainer (the orchestrator).
  */
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-const MOUNT_TIMEOUT_MS = 30_000;
-const MIN_DISK_HEADROOM_MB = 1024;
+import {
+    execWithOutput,
+    LoopImage,
+    LoopImageOptions,
+    parseSizeToBytes,
+    RequiredTool,
+    sudoExec,
+    validateFsSize
+} from "./LoopImage";
+
 const LOG_PREFIX = "[BTRFS]";
 
-export interface BtrfsImageOptions {
+export interface BtrfsImageOptions extends LoopImageOptions {
     compressionLevel: string;
     saveCompressionLevel: string;
     /** Buffer added on SAVE — small metadata overhead only (default 128 MB). */
     saveBufferBytes: number;
-    /** Target utilization on RESTORE RW — dynamic headroom (default 0.80). */
-    rwUtilizationTarget: number;
-    safeCwd: string;
 }
 
-export class BtrfsImage {
-    private activeLoopDevice: string | undefined;
-
-    constructor(
-        private imageFile: string,
-        private opts: BtrfsImageOptions
-    ) {}
-
-    /** Update the backing file path (e.g. after copying for RW). */
-    setImageFile(filePath: string): void {
-        this.imageFile = filePath;
+export class BtrfsImage extends LoopImage {
+    constructor(imageFile: string, private opts: BtrfsImageOptions) {
+        super(imageFile, opts);
     }
 
-    getImageFile(): string {
-        return this.imageFile;
+    // ── fs-specific hooks ─────────────────────────────────────────────
+
+    protected get logPrefix(): string {
+        return LOG_PREFIX;
     }
 
-    /** Set the safe CWD for exec calls (needed after async mkdtemp in initialize). */
-    setSafeCwd(cwd: string): void {
-        this.opts.safeCwd = cwd;
+    protected get fsDisplayName(): string {
+        return "BTRFS";
     }
 
-    // ── Create ──────────────────────────────────────────────────────
+    protected mkfsCommand(): string[] {
+        return ["mkfs.btrfs", "-f"];
+    }
 
-    async createSparseImage(fsSize: string): Promise<void> {
-        const effectiveSize = await this.calculateSparseSize(
-            path.dirname(this.imageFile),
-            fsSize
+    protected mountFsType(): string {
+        return "btrfs";
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    protected mountOptions(mode: "ro" | "rw"): string[] {
+        return [`compress=${this.opts.compressionLevel}`];
+    }
+
+    protected async growFilesystem(mountPoint: string): Promise<void> {
+        await sudoExec(
+            "btrfs",
+            ["filesystem", "resize", "max", mountPoint],
+            this.opts.safeCwd
         );
-        info(`Creating sparse image: ${this.imageFile} (virtual size: ${effectiveSize})`);
-        await exec.exec("truncate", ["-s", effectiveSize, this.imageFile], {
-            cwd: this.opts.safeCwd
-        });
-        info("Formatting image with BTRFS");
-        await exec.exec("mkfs.btrfs", ["-f", this.imageFile], {
-            cwd: this.opts.safeCwd,
-            silent: !core.isDebug()
-        });
     }
 
-    // ── Mount / Unmount ─────────────────────────────────────────────
-
-    async mountRO(mountPoint: string): Promise<void> {
-        info(`Mounting read-only: ${this.imageFile} → ${mountPoint}`);
-        await fs.mkdir(mountPoint, { recursive: true });
-        await this.mountWithErrorHandling(this.imageFile, mountPoint, [
-            "loop",
-            "ro",
-            `compress=${this.opts.compressionLevel}`
-        ]);
-    }
-
-    async mountRW(mountPoint: string): Promise<void> {
-        core.debug(`${LOG_PREFIX} Mounting image to ${mountPoint}`);
-        await fs.mkdir(mountPoint, { recursive: true });
-        await this.mountWithErrorHandling(this.imageFile, mountPoint, [
-            "loop",
-            "rw",
-            `compress=${this.opts.compressionLevel}`
-        ]);
-    }
-
-    /**
-     * Expand a mounted RW image to fill up to rwUtilizationTarget of the
-     * runner's available disk space.  Called after mountRW on restore — the
-     * saved image is tight (small save-buffer) and the consumer needs room
-     * for checkout deltas, build artifacts, etc.
-     *
-     * Strategy: the image file currently consumes `currentSize` bytes on the
-     * host.  The host also has `availOnHost` bytes free (not counting the
-     * image).  The total space budget is `currentSize + availOnHost`.
-     * We expand to `budget * target` (default 80%), leaving the remaining
-     * 20% for non-cache host needs (logs, temp files, other jobs).
-     */
-    async expandForHeadroom(mountPoint: string): Promise<void> {
-        const target = this.opts.rwUtilizationTarget;
-        if (target <= 0 || target >= 1) return; // disabled or invalid
-
-        const stat = await fs.stat(this.imageFile);
-        const currentSize = stat.size;
-
-        // Available disk on the host partition where the image file lives
-        const imageDir = path.dirname(this.imageFile);
-        const availOnHost = await checkDiskSpace(imageDir, this.opts.safeCwd);
-
-        // Total budget = current image footprint + remaining free space
-        const totalBudget = currentSize + availOnHost;
-        const desiredSize = Math.floor(totalBudget * target);
-
-        if (desiredSize <= currentSize) {
-            info(
-                `RW headroom: image already at ${Math.ceil(currentSize / (1024 * 1024))} MB, ` +
-                `budget ${Math.ceil(totalBudget / (1024 * 1024))} MB — no expansion needed`
-            );
-            return;
-        }
-
-        const currentMb = Math.ceil(currentSize / (1024 * 1024));
-        const desiredMb = Math.ceil(desiredSize / (1024 * 1024));
-        const availMb = Math.ceil(availOnHost / (1024 * 1024));
-        info(
-            `Expanding for RW headroom: ${currentMb} MB → ${desiredMb} MB ` +
-            `(${availMb} MB free on host, target ${Math.round(target * 100)}% of ${Math.ceil(totalBudget / (1024 * 1024))} MB budget)`
-        );
-
-        // Expand the backing file first (so the filesystem has backing space)
-        try {
-            await exec.exec("truncate", ["-s", `${desiredMb}M`, this.imageFile], {
-                cwd: this.opts.safeCwd
-            });
-        } catch (e) {
-            core.warning(`${LOG_PREFIX} Backing file expansion failed: ${e instanceof Error ? e.message : e}`);
-            return;
-        }
-
-        // Expand the filesystem to fill the new backing space
-        try {
-            await sudoExec("btrfs", ["filesystem", "resize", "max", mountPoint], this.opts.safeCwd);
-        } catch (e) {
-            core.warning(`${LOG_PREFIX} Filesystem expand failed: ${e instanceof Error ? e.message : e}`);
-        }
-    }
-
-    async unmount(mountPoint: string): Promise<void> {
-        try {
-            await exec.exec("sync", [], {
-                cwd: this.opts.safeCwd,
-                silent: !core.isDebug()
-            });
-
-            const rc = await exec.exec("mountpoint", [mountPoint], {
-                cwd: this.opts.safeCwd,
-                ignoreReturnCode: true,
-                silent: !core.isDebug()
-            });
-            if (rc === 0) {
-                core.debug(`${LOG_PREFIX} Unmounting: ${mountPoint}`);
-                await this.umountSafe(mountPoint);
+    protected fsRequiredTools(): RequiredTool[] {
+        return [
+            {
+                command: "mkfs.btrfs",
+                description: "creating BTRFS filesystems (install btrfs-progs)"
+            },
+            {
+                command: "btrfs",
+                description: "BTRFS filesystem operations (install btrfs-progs)"
+            },
+            {
+                command: "findmnt",
+                description: "finding mounted filesystems (install util-linux)"
             }
-
-            if (this.activeLoopDevice) {
-                core.debug(
-                    `${LOG_PREFIX} Detaching loop device: ${this.activeLoopDevice}`
-                );
-                await this.detachLoopWithRetry(this.activeLoopDevice);
-                this.activeLoopDevice = undefined;
-            }
-        } catch (error) {
-            core.debug(`Cleanup mount failed (non-critical): ${error}`);
-        }
-
-        try {
-            await fs.rm(mountPoint, { recursive: true, force: true });
-        } catch (error) {
-            core.debug(`Cleanup mount point failed (non-critical): ${error}`);
-        }
+        ];
     }
 
-    async umountSafe(target: string): Promise<void> {
-        try {
-            await sudoExec("umount", [target], this.opts.safeCwd);
-        } catch (error) {
-            core.warning(
-                `${LOG_PREFIX} Failed to umount ${target}: ${
-                    error instanceof Error ? error.message : error
-                }`
-            );
-            // Lazy unmount as fallback — detaches mount point even if busy.
-            // Required when the workspace dir is still a CWD of running procs.
-            try {
-                await sudoExec("umount", ["-l", target], this.opts.safeCwd);
-                core.info(`${LOG_PREFIX} Lazy-unmounted ${target}`);
-            } catch (lazyErr) {
-                core.warning(
-                    `${LOG_PREFIX} Lazy umount also failed for ${target}: ${
-                        lazyErr instanceof Error ? lazyErr.message : lazyErr
-                    }`
-                );
-            }
-        }
+    protected fsKernelModules(): string[] {
+        return ["btrfs"];
     }
 
     // ── Save pipeline: defrag → resize → unmount → truncate → verify ──
@@ -214,7 +98,7 @@ export class BtrfsImage {
         const defragAlgo = this.opts.saveCompressionLevel.split(":")[0];
 
         // Remount with save-level compression before defrag
-        info(
+        this.info(
             `Remounting with compress-force=${this.opts.saveCompressionLevel} before defrag`
         );
         try {
@@ -237,7 +121,7 @@ export class BtrfsImage {
         }
 
         // Defrag + recompress
-        info(
+        this.info(
             `Defragmenting + recompressing with ${defragAlgo} (save-compression-level: ${this.opts.saveCompressionLevel})`
         );
         try {
@@ -285,26 +169,22 @@ export class BtrfsImage {
         // btrfstune (UUID randomization on restore) fails with
         // "No valid Btrfs found" on the truncated image.
         const MIN_STRUCTURAL_HEADROOM = 64 * 1024 * 1024; // 64 MB
-        const buffer = Math.max(this.opts.saveBufferBytes, MIN_STRUCTURAL_HEADROOM);
-        const targetSize = usedBytes + buffer;
-        const targetMb = Math.max(
-            1,
-            Math.ceil(targetSize / (1024 * 1024))
+        const buffer = Math.max(
+            this.opts.saveBufferBytes,
+            MIN_STRUCTURAL_HEADROOM
         );
+        const targetSize = usedBytes + buffer;
+        const targetMb = Math.max(1, Math.ceil(targetSize / (1024 * 1024)));
 
-        info(
-            `Resize target: ${targetMb} MB (effective usage: ${Math.ceil(usedBytes / (1024 * 1024))} MB + ${Math.ceil(buffer / (1024 * 1024))} MB headroom)`
+        this.info(
+            `Resize target: ${targetMb} MB (effective usage: ${Math.ceil(
+                usedBytes / (1024 * 1024)
+            )} MB + ${Math.ceil(buffer / (1024 * 1024))} MB headroom)`
         );
         try {
             await exec.exec(
                 "sudo",
-                [
-                    "btrfs",
-                    "filesystem",
-                    "resize",
-                    `${targetMb}M`,
-                    mountPoint
-                ],
+                ["btrfs", "filesystem", "resize", `${targetMb}M`, mountPoint],
                 { cwd: this.opts.safeCwd, silent: !core.isDebug() }
             );
             fsResizeSucceeded = true;
@@ -327,7 +207,7 @@ export class BtrfsImage {
             try {
                 await exec.exec(
                     "truncate",
-                    ["-s", `${targetMb}M`, this.imageFile],
+                    ["-s", `${targetMb}M`, this.getImageFile()],
                     { cwd: this.opts.safeCwd }
                 );
             } catch (e) {
@@ -338,7 +218,7 @@ export class BtrfsImage {
                 );
             }
         } else {
-            info(
+            this.info(
                 "Skipping backing file truncation — filesystem resize did not succeed"
             );
         }
@@ -360,15 +240,18 @@ export class BtrfsImage {
      *     magic number, checksums, generation counters)
      */
     async verifyMountable(): Promise<boolean> {
-        info("Verifying image integrity before upload...");
+        this.info("Verifying image integrity before upload...");
         try {
+            const imageFile = this.getImageFile();
             // 1. File existence + size sanity check
-            const stat = await fs.stat(this.imageFile);
+            const stat = await fs.stat(imageFile);
             if (stat.size === 0) {
                 core.error(`${LOG_PREFIX} Image file is empty (0 bytes)`);
                 return false;
             }
-            info(`Image file size: ${Math.round(stat.size / 1024 / 1024)} MB`);
+            this.info(
+                `Image file size: ${Math.round(stat.size / 1024 / 1024)} MB`
+            );
 
             // 2. BTRFS superblock validation (offline, no loop device needed)
             //    dump-super returns non-zero if the superblock is unreadable.
@@ -377,7 +260,7 @@ export class BtrfsImage {
             //    invalid after lazy unmount).
             const result = await exec.getExecOutput(
                 "sudo",
-                ["btrfs", "inspect-internal", "dump-super", this.imageFile],
+                ["btrfs", "inspect-internal", "dump-super", imageFile],
                 {
                     cwd: "/tmp",
                     silent: !core.isDebug(),
@@ -387,20 +270,30 @@ export class BtrfsImage {
 
             if (result.exitCode !== 0) {
                 core.error(
-                    `${LOG_PREFIX} dump-super exited ${result.exitCode} — image may be corrupted. stderr: ${result.stderr.slice(0, 500)}`
+                    `${LOG_PREFIX} dump-super exited ${
+                        result.exitCode
+                    } — image may be corrupted. stderr: ${result.stderr.slice(
+                        0,
+                        500
+                    )}`
                 );
                 return false;
             }
 
             // Extra sanity: if we got stdout, check for key fields
             const output = result.stdout;
-            if (output.length > 0 && (!output.includes("magic") || !output.includes("generation"))) {
+            if (
+                output.length > 0 &&
+                (!output.includes("magic") || !output.includes("generation"))
+            ) {
                 core.warning(
                     `${LOG_PREFIX} dump-super exited 0 but output (${output.length} bytes) missing expected fields — proceeding anyway`
                 );
             }
 
-            info("Superblock validation succeeded — image is safe to upload");
+            this.info(
+                "Superblock validation succeeded — image is safe to upload"
+            );
             return true;
         } catch (verifyError) {
             core.error(
@@ -417,7 +310,8 @@ export class BtrfsImage {
     // ── UUID randomization (K8s HostPath dedup) ─────────────────────
 
     async randomizeUuid(): Promise<void> {
-        info("Randomizing BTRFS UUID on copy");
+        this.info("Randomizing BTRFS UUID on copy");
+        const imageFile = this.getImageFile();
 
         // Attach to a loop device first — btrfstune is more reliable on block
         // devices than on raw files (especially after truncate to exact size).
@@ -425,30 +319,45 @@ export class BtrfsImage {
         try {
             const loResult = await exec.getExecOutput(
                 "sudo",
-                ["losetup", "--find", "--show", this.imageFile],
-                { cwd: this.opts.safeCwd, silent: !core.isDebug(), ignoreReturnCode: true }
+                ["losetup", "--find", "--show", imageFile],
+                {
+                    cwd: this.opts.safeCwd,
+                    silent: !core.isDebug(),
+                    ignoreReturnCode: true
+                }
             );
             if (loResult.exitCode === 0 && loResult.stdout.trim()) {
                 loopDev = loResult.stdout.trim();
-                info(`Attached ${this.imageFile} → ${loopDev} for UUID randomization`);
+                this.info(
+                    `Attached ${imageFile} → ${loopDev} for UUID randomization`
+                );
             }
-        } catch { /* fall through to file-based approach */ }
+        } catch {
+            /* fall through to file-based approach */
+        }
 
-        const target = loopDev || this.imageFile;
+        const target = loopDev || imageFile;
         const result = await exec.getExecOutput(
             "sudo",
             ["btrfstune", "-f", "-u", target],
-            { cwd: this.opts.safeCwd, silent: !core.isDebug(), ignoreReturnCode: true }
+            {
+                cwd: this.opts.safeCwd,
+                silent: !core.isDebug(),
+                ignoreReturnCode: true
+            }
         );
 
         // Always detach loop device, even on failure
         if (loopDev) {
             try {
-                await exec.exec(
-                    "sudo", ["losetup", "-d", loopDev],
-                    { cwd: this.opts.safeCwd, silent: true, ignoreReturnCode: true }
-                );
-            } catch { /* best-effort */ }
+                await exec.exec("sudo", ["losetup", "-d", loopDev], {
+                    cwd: this.opts.safeCwd,
+                    silent: true,
+                    ignoreReturnCode: true
+                });
+            } catch {
+                /* best-effort */
+            }
         }
 
         if (result.exitCode !== 0) {
@@ -456,27 +365,40 @@ export class BtrfsImage {
             const stdout = result.stdout.trim();
             let fileSizeMb = "unknown";
             try {
-                const stat = await fs.stat(this.imageFile);
+                const stat = await fs.stat(imageFile);
                 fileSizeMb = `${Math.round(stat.size / (1024 * 1024))}`;
-            } catch { /* ignore */ }
+            } catch {
+                /* ignore */
+            }
 
             let dfOutput = "";
             try {
                 const dfResult = await exec.getExecOutput(
-                    "df", ["-h", path.dirname(this.imageFile)],
-                    { cwd: this.opts.safeCwd, silent: true, ignoreReturnCode: true }
+                    "df",
+                    ["-h", path.dirname(imageFile)],
+                    {
+                        cwd: this.opts.safeCwd,
+                        silent: true,
+                        ignoreReturnCode: true
+                    }
                 );
                 dfOutput = dfResult.stdout.trim();
-            } catch { /* ignore */ }
+            } catch {
+                /* ignore */
+            }
 
             core.warning(
                 `${LOG_PREFIX} btrfstune failed (exit ${result.exitCode}). ` +
-                `Target: ${target}. File: ${this.imageFile} (${fileSizeMb} MB). ` +
-                `stderr: ${stderr || "(empty)"}. stdout: ${stdout || "(empty)"}. ` +
-                `df: ${dfOutput || "(unavailable)"}`
+                    `Target: ${target}. File: ${imageFile} (${fileSizeMb} MB). ` +
+                    `stderr: ${stderr || "(empty)"}. stdout: ${
+                        stdout || "(empty)"
+                    }. ` +
+                    `df: ${dfOutput || "(unavailable)"}`
             );
             throw new Error(
-                `btrfstune -f -u failed with exit code ${result.exitCode}: ${stderr || stdout || "no output"}`
+                `btrfstune -f -u failed with exit code ${result.exitCode}: ${
+                    stderr || stdout || "no output"
+                }`
             );
         }
     }
@@ -485,27 +407,27 @@ export class BtrfsImage {
 
     async checkHealth(mountPoint: string): Promise<void> {
         try {
-            const output = await execWithOutput("sudo", [
-                "btrfs",
-                "device",
-                "stats",
-                mountPoint
-            ], this.opts.safeCwd);
+            const output = await execWithOutput(
+                "sudo",
+                ["btrfs", "device", "stats", mountPoint],
+                this.opts.safeCwd
+            );
 
-            const errorLines = output
-                .split("\n")
-                .filter(line => {
-                    const match = line.match(/\.(\w+_errs)\s+(\d+)/);
-                    return match && parseInt(match[2], 10) > 0;
-                });
+            const errorLines = output.split("\n").filter(line => {
+                const match = line.match(/\.(\w+_errs)\s+(\d+)/);
+                return match && parseInt(match[2], 10) > 0;
+            });
 
             if (errorLines.length > 0) {
                 core.warning(
-                    `${LOG_PREFIX} Filesystem has I/O errors:\n${errorLines.join("\n")}` +
-                        `\nConsider recreating the cache image.`
+                    `${LOG_PREFIX} Filesystem has I/O errors:\n${errorLines.join(
+                        "\n"
+                    )}` + `\nConsider recreating the cache image.`
                 );
             } else {
-                core.debug(`${LOG_PREFIX} Filesystem health check: no errors detected`);
+                core.debug(
+                    `${LOG_PREFIX} Filesystem health check: no errors detected`
+                );
             }
         } catch {
             core.debug(
@@ -514,338 +436,48 @@ export class BtrfsImage {
         }
     }
 
-    // ── Loop device management ──────────────────────────────────────
+    // ── fs-specific mount diagnostics (debug-only) ───────────────────
 
-    async cleanupLoopDevices(imageFile: string): Promise<void> {
-        try {
-            const output = await execWithOutput("losetup", ["-j", imageFile], this.opts.safeCwd);
-            if (!output) return;
-
-            const devices = output
-                .split("\n")
-                .map(line => line.split(":")[0])
-                .filter(d => d.startsWith("/dev/loop"));
-
-            for (const device of devices) {
-                core.debug(`${LOG_PREFIX} Cleaning up leaked loop device: ${device}`);
-                await this.detachLoopWithRetry(device);
-            }
-        } catch {
-            // losetup -j may fail if no loop devices exist
-        }
-    }
-
-    /**
-     * Detach a loop device with retry logic.
-     * After lazy unmount, the kernel may keep the device busy briefly while
-     * BTRFS finishes releasing its references. Retries with delay handle this.
-     */
-    private async detachLoopWithRetry(device: string, maxRetries = 5): Promise<void> {
-        for (let i = 0; i < maxRetries; i++) {
-            try {
-                await sudoExec("losetup", ["-d", device], this.opts.safeCwd);
-                core.debug(`${LOG_PREFIX} Detached ${device} (attempt ${i + 1})`);
-                return;
-            } catch {
-                if (i < maxRetries - 1) {
-                    core.debug(`${LOG_PREFIX} ${device} still busy, retrying in ${(i + 1)}s...`);
-                    await new Promise(resolve => setTimeout(resolve, (i + 1) * 1000));
-                }
-            }
-        }
-        core.warning(`${LOG_PREFIX} Could not detach loop device ${device} after ${maxRetries} retries`);
-    }
-
-    // ── Prerequisites ───────────────────────────────────────────────
-
-    async checkPrerequisites(): Promise<void> {
-        if (process.platform !== "linux") {
-            throw new Error(
-                `BTRFS compression is only supported on Linux. Current platform: ${process.platform}.`
-            );
-        }
-
-        const requiredTools = [
-            { command: "truncate", description: "creating sparse files" },
-            {
-                command: "mkfs.btrfs",
-                description: "creating BTRFS filesystems (install btrfs-progs)"
-            },
-            {
-                command: "btrfs",
-                description: "BTRFS filesystem operations (install btrfs-progs)"
-            },
-            {
-                command: "losetup",
-                description: "loop device management (install util-linux)"
-            },
-            {
-                command: "findmnt",
-                description: "finding mounted filesystems (install util-linux)"
-            },
-            {
-                command: "sudo",
-                description: "elevated privileges for mounting operations"
-            }
-        ];
-
-        const missingTools: string[] = [];
-        await Promise.all(
-            requiredTools.map(async tool => {
-                try {
-                    await exec.exec("which", [tool.command], {
-                        cwd: this.opts.safeCwd,
-                        silent: !core.isDebug()
-                    });
-                } catch {
-                    missingTools.push(`${tool.command} (${tool.description})`);
-                }
-            })
-        );
-
-        if (missingTools.length > 0) {
-            throw new Error(
-                `Missing required tools for BTRFS compression: ${missingTools.join(", ")}.`
-            );
-        }
-
-        // Passwordless sudo check
-        try {
-            await exec.exec("sudo", ["-n", "true"], {
-                cwd: this.opts.safeCwd,
-                silent: !core.isDebug()
+    protected async collectFsMountDiagnostics(
+        actualDevice: string,
+        collect: (
+            label: string,
+            cmd: string,
+            cmdArgs: string[]
+        ) => Promise<void>
+    ): Promise<void> {
+        await exec
+            .exec(
+                "bash",
+                [
+                    "-c",
+                    "command -v btrfs >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs 2>/dev/null) || true"
+                ],
+                { cwd: this.opts.safeCwd, silent: true }
+            )
+            .catch(() => {
+                /* best-effort tool install */
             });
-        } catch {
-            throw new Error(
-                "sudo access is required for BTRFS mounting but sudo is not available or requires a password."
-            );
-        }
-
-        // Ensure kernel modules are loaded (K8s nodes may not auto-load)
-        for (const mod of ["loop", "btrfs"]) {
-            try {
-                await exec.exec("sudo", ["modprobe", mod], {
-                    cwd: this.opts.safeCwd,
-                    silent: !core.isDebug()
-                });
-            } catch (error) {
-                core.debug(
-                    `${LOG_PREFIX} modprobe ${mod} failed (module likely built-in): ${
-                        error instanceof Error ? error.message : error
-                    }`
-                );
-            }
-        }
-
-        // Verify loop devices actually work on this runner.
-        // K8s pods may lack /dev/loop-control even after modprobe.
-        try {
-            await exec.exec(
-                "sudo",
-                ["losetup", "--find"],
-                {
-                    cwd: this.opts.safeCwd,
-                    silent: !core.isDebug()
-                }
-            );
-        } catch (error) {
-            core.warning(
-                `${LOG_PREFIX} Loop devices are not available on this runner ` +
-                    `(losetup --find failed). BTRFS caching will not work — ` +
-                    `all caches will fall back to S3 download. ` +
-                    `Ensure the 'loop' kernel module is loaded and ` +
-                    `/dev/loop-control is accessible. ` +
-                    `${error instanceof Error ? error.message : error}`
-            );
-        }
+        await collect("btrfs check --readonly", "sudo", [
+            "btrfs",
+            "check",
+            "--readonly",
+            actualDevice
+        ]);
+        await collect("btrfs superblock (compat flags)", "bash", [
+            "-c",
+            `sudo btrfs inspect-internal dump-super ${actualDevice} 2>&1 | grep -iE 'compat|magic|generation|sectorsize|nodesize|root_level'`
+        ]);
     }
 
-    // ── Private helpers ─────────────────────────────────────────────
-
-    private async setupLoopDevice(imageFile: string): Promise<string> {
-        let loopDev = "";
-        let stderrOutput = "";
-        try {
-            await exec.exec(
-                "sudo",
-                ["losetup", "--find", "--show", imageFile],
-                {
-                    cwd: this.opts.safeCwd,
-                    listeners: {
-                        stdout: (data: Buffer) => {
-                            loopDev += data.toString();
-                        },
-                        stderr: (data: Buffer) => {
-                            stderrOutput += data.toString();
-                        }
-                    },
-                    silent: !core.isDebug()
-                }
-            );
-        } catch (error) {
-            const details = stderrOutput.trim()
-                ? `stderr: ${stderrOutput.trim()}`
-                : `${error instanceof Error ? error.message : error}`;
-            throw new Error(
-                `Failed to attach ${imageFile} to a loop device. ` +
-                    `Ensure the 'loop' kernel module is loaded. ` +
-                    `${details}`
-            );
-        }
-        loopDev = loopDev.trim();
-        if (!loopDev.startsWith("/dev/loop")) {
-            throw new Error(
-                `losetup returned unexpected output: "${loopDev}".`
-            );
-        }
-        info(`Attached ${imageFile} → ${loopDev}`);
-        return loopDev;
-    }
-
-    private async mountWithErrorHandling(
-        device: string,
-        mountPath: string,
-        options?: string[]
-    ): Promise<void> {
-        const isLoopMount = options?.includes("loop");
-        const filteredOptions = options?.filter(o => o !== "loop") || [];
-        let actualDevice = device;
-
-        try {
-            if (isLoopMount) {
-                const loopDev = await this.setupLoopDevice(device);
-                actualDevice = loopDev;
-                this.activeLoopDevice = loopDev;
-            }
-
-            const mountArgs = [actualDevice, mountPath];
-            if (filteredOptions.length > 0) {
-                mountArgs.unshift("-o", filteredOptions.join(","));
-            }
-            if (isLoopMount) {
-                mountArgs.unshift("-t", "btrfs");
-            }
-
-            await execWithTimeout(
-                () =>
-                    exec.exec("sudo", ["mount", ...mountArgs], {
-                        cwd: this.opts.safeCwd,
-                        silent: !core.isDebug()
-                    }),
-                MOUNT_TIMEOUT_MS,
-                `mount ${actualDevice} at ${mountPath}`
-            );
-        } catch (error) {
-            // Diagnostics: only collect in debug mode to keep normal failures fast
-            if (core.isDebug()) {
-                await this.collectMountDiagnostics(device, actualDevice);
-            }
-
-            // Detach the loop device directly if we know it, then fall back to
-            // file-based lookup. This avoids orphaned loop devices when the image
-            // path used for losetup -j doesn't match (symlinks, node-local paths).
-            if (this.activeLoopDevice) {
-                try {
-                    await sudoExec("losetup", ["-d", this.activeLoopDevice], this.opts.safeCwd);
-                    core.debug(`${LOG_PREFIX} Detached ${this.activeLoopDevice} after mount failure`);
-                } catch {
-                    core.debug(`${LOG_PREFIX} Direct detach of ${this.activeLoopDevice} failed, trying file-based cleanup`);
-                    await this.cleanupLoopDevices(device);
-                }
-            } else {
-                await this.cleanupLoopDevices(device);
-            }
-            this.activeLoopDevice = undefined;
-            throw new Error(
-                `Failed to mount ${actualDevice} at ${mountPath}: ${
-                    error instanceof Error ? error.message : error
-                }`
-            );
-        }
-    }
-
-    /**
-     * Collect diagnostic info on mount failure (debug-only).
-     * Runs stat, losetup, dmesg, btrfs check, dump-super.
-     */
-    private async collectMountDiagnostics(
-        imageFile: string,
-        actualDevice: string
-    ): Promise<void> {
-        try {
-            const diag: string[] = [];
-            const collect = async (
-                label: string,
-                cmd: string,
-                cmdArgs: string[]
-            ) => {
-                try {
-                    let out = "";
-                    await exec.exec(cmd, cmdArgs, {
-                        cwd: this.opts.safeCwd,
-                        silent: true,
-                        listeners: {
-                            stdout: (d: Buffer) => {
-                                out += d.toString();
-                            }
-                        }
-                    });
-                    diag.push(`${label}: ${out.trim()}`);
-                } catch {
-                    diag.push(`${label}: <unavailable>`);
-                }
-            };
-            await collect("file size", "stat", [
-                "--format=%s",
-                imageFile
-            ]);
-            await collect("loop devices", "sudo", ["losetup", "-a"]);
-            await collect("dmesg (last 40 lines)", "bash", [
-                "-c",
-                "sudo dmesg -T 2>/dev/null | tail -40 || sudo dmesg 2>/dev/null | tail -40 || echo unavailable"
-            ]);
-            if (actualDevice.startsWith("/dev/loop")) {
-                await exec
-                    .exec(
-                        "bash",
-                        [
-                            "-c",
-                            "command -v btrfs >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs 2>/dev/null) || true"
-                        ],
-                        { cwd: this.opts.safeCwd, silent: true }
-                    )
-                    .catch(() => {});
-                await collect("btrfs check --readonly", "sudo", [
-                    "btrfs",
-                    "check",
-                    "--readonly",
-                    actualDevice
-                ]);
-                await collect(
-                    "btrfs superblock (compat flags)",
-                    "bash",
-                    [
-                        "-c",
-                        `sudo btrfs inspect-internal dump-super ${actualDevice} 2>&1 | grep -iE 'compat|magic|generation|sectorsize|nodesize|root_level'`
-                    ]
-                );
-            }
-            for (const d of diag) {
-                core.warning(`${LOG_PREFIX} ${d}`);
-            }
-        } catch {
-            /* diagnostic collection is best-effort */
-        }
-    }
+    // ── Private BTRFS-usage parsing ──────────────────────────────────
 
     private async getBtrfsUsage(mountPoint: string): Promise<string> {
-        return execWithOutput("sudo", [
-            "btrfs",
-            "filesystem",
-            "usage",
-            "-b",
-            mountPoint
-        ], this.opts.safeCwd);
+        return execWithOutput(
+            "sudo",
+            ["btrfs", "filesystem", "usage", "-b", mountPoint],
+            this.opts.safeCwd
+        );
     }
 
     private parseUsedBytes(usageOutput: string): number {
@@ -871,160 +503,15 @@ export class BtrfsImage {
         );
         return effective;
     }
-
-    private async calculateSparseSize(
-        targetDir: string,
-        fsSize: string
-    ): Promise<string> {
-        const availBytes = await checkDiskSpace(targetDir, this.opts.safeCwd);
-
-        if (availBytes === 0) return fsSize;
-
-        const configuredBytes = parseSizeToBytes(fsSize);
-        const safeMaxBytes = Math.floor(availBytes * 0.8);
-
-        if (configuredBytes > safeMaxBytes && safeMaxBytes > 0) {
-            const safeSizeGb = Math.max(
-                1,
-                Math.floor(safeMaxBytes / (1024 * 1024 * 1024))
-            );
-            info(
-                `Reducing sparse file size from ${fsSize} to ${safeSizeGb}G ` +
-                    `(80% of ${Math.floor(availBytes / (1024 * 1024 * 1024))}G available)`
-            );
-            return `${safeSizeGb}G`;
-        }
-
-        return fsSize;
-    }
 }
 
-// ── Module-level helpers (shared, no class dependency) ──────────────
+// ── Re-exports for backwards compatibility ──────────────────────────
 
-function info(message: string): void {
-    core.info(`${LOG_PREFIX} ${message}`);
-}
-
-async function sudoExec(
-    command: string,
-    args: string[],
-    cwd: string
-): Promise<void> {
-    await exec.exec("sudo", [command, ...args], {
-        cwd,
-        silent: !core.isDebug()
-    });
-}
-
-async function execWithOutput(
-    command: string,
-    args: string[],
-    cwd: string
-): Promise<string> {
-    let output = "";
-    await exec.exec(command, args, {
-        cwd,
-        listeners: {
-            stdout: (data: Buffer) => {
-                output += data.toString();
-            }
-        },
-        silent: !core.isDebug()
-    });
-    return output.trim();
-}
-
-async function execWithTimeout<T>(
-    fn: () => Promise<T>,
-    timeoutMs: number,
-    description: string
-): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-        const timer = setTimeout(() => {
-            reject(
-                new Error(
-                    `${LOG_PREFIX} Operation timed out after ${timeoutMs}ms: ${description}`
-                )
-            );
-        }, timeoutMs);
-
-        fn().then(
-            result => {
-                clearTimeout(timer);
-                resolve(result);
-            },
-            err => {
-                clearTimeout(timer);
-                reject(err);
-            }
-        );
-    });
-}
-
-async function checkDiskSpace(targetPath: string, cwd: string): Promise<number> {
-    try {
-        const output = await execWithOutput("df", [
-            "--output=avail",
-            "-B1",
-            targetPath
-        ], cwd);
-        const lines = output.split("\n");
-        const availStr = lines[lines.length - 1]?.trim();
-        if (availStr) {
-            const availBytes = parseInt(availStr, 10);
-            const availMb = Math.floor(availBytes / (1024 * 1024));
-            core.debug(`${LOG_PREFIX} Available disk space: ${availMb} MB`);
-
-            if (availMb < MIN_DISK_HEADROOM_MB) {
-                core.warning(
-                    `${LOG_PREFIX} Low disk space: ${availMb} MB available ` +
-                        `(minimum recommended: ${MIN_DISK_HEADROOM_MB} MB).`
-                );
-            }
-            return availBytes;
-        }
-    } catch {
-        core.debug(`${LOG_PREFIX} Could not check disk space (non-critical)`);
-    }
-    return 0;
-}
-
-export function parseSizeToBytes(size: string): number {
-    const match = size.match(/^(\d+)([KMGT])?$/);
-    if (!match) return 0;
-
-    let bytes = parseInt(match[1], 10);
-    switch (match[2]) {
-        case "K":
-            bytes *= 1024;
-            break;
-        case "M":
-            bytes *= 1024 * 1024;
-            break;
-        case "G":
-            bytes *= 1024 * 1024 * 1024;
-            break;
-        case "T":
-            bytes *= 1024 * 1024 * 1024 * 1024;
-            break;
-    }
-    return bytes;
-}
-
-export function validateFsSize(fsSize: string): void {
-    if (!/^[0-9]+[KMGT]?$/.test(fsSize)) {
-        throw new Error(
-            `Invalid filesystem size format: ${fsSize}. Must be a number followed by optional K, M, G, or T.`
-        );
-    }
-}
+export { parseSizeToBytes, validateFsSize };
 
 export function validateCompressionLevel(level: string): void {
-    const regex =
-        /^(zlib(?:[:][1-9])?|lzo|zstd(?::-?(?:[0-9]|1[0-5]))?)$/;
+    const regex = /^(zlib(?:[:][1-9])?|lzo|zstd(?::-?(?:[0-9]|1[0-5]))?)$/;
     if (!regex.test(level)) {
-        throw new Error(
-            `Invalid compression level format: ${level}.`
-        );
+        throw new Error(`Invalid compression level format: ${level}.`);
     }
 }

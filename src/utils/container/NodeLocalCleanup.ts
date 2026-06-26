@@ -30,16 +30,25 @@ export async function cleanupNodeLocalImage(
 
     if (!nodeLocalCacheDir || !cacheKey) return;
 
-    const isBtrfs = (
+    // Image-based backends (btrfs, xfs) persist a node-local WORM image that
+    // needs the same stale-cleanup treatment. The on-disk extension matches
+    // the backend (.btrfs / .xfs — XFS node-local images are RAW, uncompressed).
+    const backend = (
         core.getState("CUSTOM_COMPRESSION") ||
         core.getInput(Inputs.CustomCompression) ||
         ""
-    ) === "btrfs";
+    ).split("-")[0];
 
-    if (!isBtrfs) return;
+    const extension =
+        backend === "btrfs" ? ".btrfs" : backend === "xfs" ? ".xfs" : null;
+
+    if (!extension) return;
 
     const sanitizedKey = cacheKey.replace(/[/\\:*?"<>|]/g, "-");
-    const localPath = path.join(nodeLocalCacheDir, `${sanitizedKey}.btrfs`);
+    const localPath = path.join(
+        nodeLocalCacheDir,
+        `${sanitizedKey}${extension}`
+    );
 
     try {
         await fs.access(localPath);
@@ -50,7 +59,9 @@ export async function cleanupNodeLocalImage(
 
     if (saveSafe && policy !== "always") {
         core.info(
-            `${LOG_PREFIX} Save succeeded — keeping node-local image: ${path.basename(localPath)}`
+            `${LOG_PREFIX} Save succeeded — keeping node-local image: ${path.basename(
+                localPath
+            )}`
         );
         return;
     }
@@ -59,7 +70,9 @@ export async function cleanupNodeLocalImage(
     try {
         await fs.unlink(localPath);
         core.info(
-            `${LOG_PREFIX} Deleted node-local image (${reason}): ${path.basename(localPath)}`
+            `${LOG_PREFIX} Deleted node-local image (${reason}): ${path.basename(
+                localPath
+            )}`
         );
     } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
@@ -67,9 +80,9 @@ export async function cleanupNodeLocalImage(
             return;
         }
         core.warning(
-            `${LOG_PREFIX} Failed to delete image ${path.basename(localPath)}: ${
-                error instanceof Error ? error.message : error
-            }`
+            `${LOG_PREFIX} Failed to delete image ${path.basename(
+                localPath
+            )}: ${error instanceof Error ? error.message : error}`
         );
     }
 }

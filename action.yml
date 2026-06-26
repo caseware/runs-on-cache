@@ -35,7 +35,14 @@ inputs:
     default: 'false'
     required: false
   custom-compression:
-    description: 'Custom compression method (e.g., lz4, btrfs)'
+    description: |
+      Custom compression method. Allowed values:
+        "lz4"   — tar archive compressed with lz4.
+        "btrfs" — filesystem image (transparent in-fs compression, can shrink before upload).
+        "xfs"   — filesystem image for kernels without btrfs support (e.g. Bottlerocket:
+                  CONFIG_BTRFS_FS unset, CONFIG_XFS_FS=y). The XFS image cannot be shrunk and
+                  has no transparent compression, so the S3 artifact is explicitly zstd-compressed
+                  (and decompressed on restore); node-local copies stay raw for direct mounting.
     required: false
   custom-compression-level:
     description: 'Level of compression for the custom method. Syntax varies per method.'
