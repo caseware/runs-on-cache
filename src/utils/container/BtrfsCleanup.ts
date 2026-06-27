@@ -43,9 +43,13 @@ export async function cleanupForCacheKey(cacheKey: string): Promise<void> {
  */
 async function scopedCleanup(entryTempDir: string): Promise<void> {
     try {
-        const output = execSyncSafe(
-            "findmnt -t btrfs -n -o TARGET,SOURCE"
-        );
+        // NOT type-filtered: the cache image may be btrfs OR xfs (and the
+        // workspace-root bind mount inherits the image fs type). A
+        // `findmnt -t btrfs` filter silently skipped xfs mounts, leaving the
+        // workspace-root bind mount + loop device attached on REUSED runners
+        // (EC2/persistent), which made the next job's "Set up job" fail with
+        // "<workspace> already exists". Scope by path/loop ownership instead.
+        const output = execSyncSafe("findmnt -n -o TARGET,SOURCE");
         if (!output) return;
 
         const allMounts = output
@@ -117,13 +121,21 @@ async function scopedCleanup(entryTempDir: string): Promise<void> {
  */
 async function globalCleanup(): Promise<void> {
     try {
-        const output = execSyncSafe("findmnt -t btrfs -n -o TARGET");
+        // Match any loop-backed cache mount (btrfs or xfs), not just btrfs.
+        const output = execSyncSafe(
+            "findmnt -n -o TARGET,SOURCE"
+        );
         if (!output) return;
 
+        // Only unmount loop-backed cache mounts (source is /dev/loopN), so we
+        // don't touch unrelated system mounts now that we no longer filter by
+        // fs type.
         const mounts = output
             .split("\n")
-            .map(m => m.trim())
-            .filter(m => m.length > 0)
+            .map(l => l.trim())
+            .filter(l => l.length > 0)
+            .filter(l => /\/dev\/loop\d+/.test(l))
+            .map(l => l.split(/\s+/)[0])
             .reverse();
 
         for (const mount of mounts) {
@@ -135,7 +147,9 @@ async function globalCleanup(): Promise<void> {
             if (losetupOutput) {
                 const loopLines = losetupOutput
                     .split("\n")
-                    .filter(l => l.includes(".btrfs"));
+                    .filter(
+                        l => l.includes(".btrfs") || l.includes(".xfs")
+                    );
                 for (const line of loopLines) {
                     const device = line.split(":")[0];
                     if (device) {
