@@ -144,7 +144,13 @@ export abstract class LoopImage {
         if (target <= 0 || target >= 1) return; // disabled or invalid
 
         const stat = await fs.stat(this.imageFile);
+        // NOTE: stat.size is the SPARSE/apparent size (e.g. 25 GiB virtual), not
+        // the physical bytes the image occupies on disk. We must size growth
+        // against real free space, never the apparent size, or we overcommit.
         const currentSize = stat.size;
+        // Physical bytes actually consumed by the (sparse) image file — this is
+        // what counts against host free space. blocks are 512-byte units.
+        const currentPhysical = (stat.blocks ?? 0) * 512;
 
         // Available disk on the host partition where the image file lives
         const imageDir = path.dirname(this.imageFile);
@@ -154,33 +160,47 @@ export abstract class LoopImage {
             this.logPrefix
         );
 
-        // Total budget = current image footprint + remaining free space
-        const totalBudget = currentSize + availOnHost;
-        const desiredSize = Math.floor(totalBudget * target);
+        // Real space budget = what the image already physically uses + free
+        // space on the host (NOT the sparse apparent size, which would
+        // double-count and overcommit). Reserve a safety margin so growth
+        // never consumes the last sliver of the disk — truncating the backing
+        // file and then writing into the grown filesystem past actual free
+        // space surfaces as EIO (seen on EC2 VM runners where the image and
+        // workspace share one disk: expand to 92 GB on 89.5 GB free → EIO on
+        // checkout's unlink/rmdir).
+        const SAFETY = 0.85; // leave 15% of free space unclaimed
+        const usableFree = Math.floor(availOnHost * SAFETY);
+        const physicalBudget = currentPhysical + usableFree;
+        // Target a share of the budget, but HARD-CAP so the backing file never
+        // grows by more than the usable free space allows.
+        const desiredSize = Math.min(
+            Math.floor((currentPhysical + availOnHost) * target),
+            physicalBudget
+        );
 
+        const toMb = (b: number) => Math.ceil(b / (1024 * 1024));
         if (desiredSize <= currentSize) {
             this.info(
-                `RW headroom: image already at ${Math.ceil(
-                    currentSize / (1024 * 1024)
-                )} MB, ` +
-                    `budget ${Math.ceil(
-                        totalBudget / (1024 * 1024)
-                    )} MB — no expansion needed`
+                `RW headroom: image apparent ${toMb(currentSize)} MB ` +
+                    `(physical ${toMb(currentPhysical)} MB), usable free ` +
+                    `${toMb(usableFree)} MB — no safe expansion possible`
             );
             return;
         }
 
-        const currentMb = Math.ceil(currentSize / (1024 * 1024));
-        const desiredMb = Math.ceil(desiredSize / (1024 * 1024));
-        const availMb = Math.ceil(availOnHost / (1024 * 1024));
         this.info(
-            `Expanding for RW headroom: ${currentMb} MB → ${desiredMb} MB ` +
-                `(${availMb} MB free on host, target ${Math.round(
-                    target * 100
-                )}% of ${Math.ceil(totalBudget / (1024 * 1024))} MB budget)`
+            `Expanding for RW headroom: ${toMb(currentSize)} MB → ${toMb(
+                desiredSize
+            )} MB ` +
+                `(physical ${toMb(currentPhysical)} MB, ${toMb(
+                    availOnHost
+                )} MB free on host, capped at physical+${Math.round(
+                    SAFETY * 100
+                )}% free = ${toMb(physicalBudget)} MB)`
         );
 
         // Expand the backing file first (so the filesystem has backing space)
+        const desiredMb = toMb(desiredSize);
         try {
             await exec.exec(
                 "truncate",
