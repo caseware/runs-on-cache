@@ -93315,14 +93315,28 @@ class LoopContainer extends Container_1.Container {
                 //    mount point. Writes land in `upper` on the host fs (which has
                 //    the free space), the WORM image stays pristine.
                 this.logInfo(`Overlay RW mount (no copy): lower=${imageFile} (ro) upper=${upper}`);
-                yield this.execSudo("mount", [
+                // Capture stdout/stderr/exit so a mount failure surfaces the REAL
+                // kernel reason (e.g. "wrong fs type", "failed to verify upper root
+                // origin", d_type/index issues) instead of an opaque exit 32.
+                const ov = yield exec.getExecOutput("sudo", [
+                    "mount",
                     "-t",
                     "overlay",
                     "overlay",
                     "-o",
                     `lowerdir=${lower},upperdir=${upper},workdir=${work}`,
                     merged
-                ]);
+                ], { cwd: this.safeCwd, ignoreReturnCode: true });
+                if (ov.exitCode !== 0) {
+                    // Pull the matching kernel message for the real cause.
+                    const dmesg = yield exec
+                        .getExecOutput("bash", [
+                        "-c",
+                        "sudo dmesg 2>/dev/null | grep -i overlay | tail -5 || true"
+                    ], { cwd: this.safeCwd, ignoreReturnCode: true, silent: true })
+                        .catch(() => ({ stdout: "" }));
+                    throw new Error(`mount -t overlay exit ${ov.exitCode}: ${ov.stderr.trim() || ov.stdout.trim() || "(no output)"}${dmesg.stdout ? ` | dmesg: ${dmesg.stdout.trim()}` : ""}`);
+                }
                 this.mountPoint = merged;
                 this.usingOverlay = true;
                 this.overlayLowerMount = lower;

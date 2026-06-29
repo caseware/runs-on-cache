@@ -604,14 +604,40 @@ export abstract class LoopContainer extends Container {
             this.logInfo(
                 `Overlay RW mount (no copy): lower=${imageFile} (ro) upper=${upper}`
             );
-            await this.execSudo("mount", [
-                "-t",
-                "overlay",
-                "overlay",
-                "-o",
-                `lowerdir=${lower},upperdir=${upper},workdir=${work}`,
-                merged
-            ]);
+            // Capture stdout/stderr/exit so a mount failure surfaces the REAL
+            // kernel reason (e.g. "wrong fs type", "failed to verify upper root
+            // origin", d_type/index issues) instead of an opaque exit 32.
+            const ov = await exec.getExecOutput(
+                "sudo",
+                [
+                    "mount",
+                    "-t",
+                    "overlay",
+                    "overlay",
+                    "-o",
+                    `lowerdir=${lower},upperdir=${upper},workdir=${work}`,
+                    merged
+                ],
+                { cwd: this.safeCwd, ignoreReturnCode: true }
+            );
+            if (ov.exitCode !== 0) {
+                // Pull the matching kernel message for the real cause.
+                const dmesg = await exec
+                    .getExecOutput(
+                        "bash",
+                        [
+                            "-c",
+                            "sudo dmesg 2>/dev/null | grep -i overlay | tail -5 || true"
+                        ],
+                        { cwd: this.safeCwd, ignoreReturnCode: true, silent: true }
+                    )
+                    .catch(() => ({ stdout: "" }));
+                throw new Error(
+                    `mount -t overlay exit ${ov.exitCode}: ${
+                        ov.stderr.trim() || ov.stdout.trim() || "(no output)"
+                    }${dmesg.stdout ? ` | dmesg: ${dmesg.stdout.trim()}` : ""}`
+                );
+            }
 
             this.mountPoint = merged;
             this.usingOverlay = true;
