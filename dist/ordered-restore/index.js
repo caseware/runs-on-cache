@@ -92895,9 +92895,22 @@ class LoopContainer extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
             const lower = path.join(tempDir, "lower"); // RO WORM image mount
-            const upper = path.join(tempDir, "upper"); // RW deltas (host fs)
-            const work = path.join(tempDir, "work"); // overlay workdir (host fs)
             const merged = path.join(tempDir, "mount"); // merged view = workspace
+            // CRITICAL: overlayfs refuses an upperdir/workdir that is itself on an
+            // overlay filesystem (kernel: "filesystem on '...' not supported as
+            // upperdir" → mount exit 32). On k8s the per-run temp dir
+            // ($RUNNER_TEMP = /home/runner/_work/_temp) IS the pod's overlay rootfs,
+            // so upper/work MUST live on a NON-overlay fs. The node-local dir
+            // (parent of the WORM image — a hostPath on k8s, the persistent disk on
+            // EC2 — real xfs/ext4) is exactly that. Put upper+work there in a
+            // per-job subdir so concurrent runners on the same node don't collide.
+            // upperdir + workdir must be on the SAME fs (they are — both here).
+            const nodeLocalDir = path.dirname(imageFile);
+            const jobTag = path.basename(tempDir);
+            const overlayBase = path.join(nodeLocalDir, `.overlay-${jobTag}`);
+            const upper = path.join(overlayBase, "upper"); // RW deltas (node-local fs)
+            const work = path.join(overlayBase, "work"); // overlay workdir (same fs)
+            this.overlayBaseDir = overlayBase;
             try {
                 yield fs.mkdir(lower, { recursive: true });
                 yield fs.mkdir(upper, { recursive: true });
@@ -92940,8 +92953,15 @@ class LoopContainer extends Container_1.Container {
                 catch (_a) {
                     /* ignore */
                 }
+                try {
+                    yield fs.rm(overlayBase, { recursive: true, force: true });
+                }
+                catch (_b) {
+                    /* ignore */
+                }
                 this.usingOverlay = false;
                 this.overlayLowerMount = undefined;
+                this.overlayBaseDir = undefined;
                 throw new Error(`Overlay RW mount failed for node-local image ${imageFile}: ${error instanceof Error ? error.message : error}`);
             }
         });
@@ -94096,14 +94116,19 @@ class NodeLocalCache {
                 const entries = yield fs.readdir(this.cacheDir);
                 const now = Date.now();
                 for (const entry of entries) {
-                    if (!entry.startsWith(".temp"))
+                    // .temp*  → in-progress S3 downloads
+                    // .overlay-* → per-job overlay upper/work dirs (k8s places these
+                    //   on the node-local fs because $RUNNER_TEMP is overlayfs and
+                    //   can't be an overlay upperdir). Normally removed at job end,
+                    //   but a killed/cancelled job can orphan one — prune by age.
+                    if (!entry.startsWith(".temp") && !entry.startsWith(".overlay-"))
                         continue;
                     const fullPath = path.join(this.cacheDir, entry);
                     try {
                         const stat = yield fs.stat(fullPath);
                         const ageMs = now - stat.mtimeMs;
                         if (ageMs > STALE_TEMP_FILE_AGE_MS) {
-                            core.info(`[NodeLocal] Removing stale temp file (${Math.floor(ageMs / 3600000)}h old): ${entry}`);
+                            core.info(`[NodeLocal] Removing stale ${entry.startsWith(".overlay-") ? "overlay" : "temp"} entry (${Math.floor(ageMs / 3600000)}h old): ${entry}`);
                             yield this.removeSafe(fullPath);
                             cleaned++;
                         }
@@ -94186,7 +94211,9 @@ class NodeLocalCache {
     removeSafe(filePath) {
         return __awaiter(this, void 0, void 0, function* () {
             try {
-                yield fs.unlink(filePath);
+                // rm handles both files (.temp*) and directories (.overlay-*
+                // upper/work trees) — fs.unlink would throw EISDIR on a dir.
+                yield fs.rm(filePath, { recursive: true, force: true });
             }
             catch (error) {
                 const code = error.code;

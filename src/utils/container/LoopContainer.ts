@@ -51,6 +51,12 @@ export abstract class LoopContainer extends Container {
     protected usingOverlay = false;
     /** The RO lower-layer mount point of an active overlay (for teardown). */
     protected overlayLowerMount: string | undefined;
+    /**
+     * The overlay upper+work base dir, placed on the NON-overlay node-local fs
+     * (not $RUNNER_TEMP, which is overlayfs on k8s). Removed on teardown so the
+     * node-local dir doesn't accumulate per-job RW deltas.
+     */
+    protected overlayBaseDir: string | undefined;
     /** Per-run temp dir used as CWD for all exec calls. */
     protected safeCwd = "";
 
@@ -561,9 +567,23 @@ export abstract class LoopContainer extends Container {
             this.cacheKey
         );
         const lower = path.join(tempDir, "lower"); // RO WORM image mount
-        const upper = path.join(tempDir, "upper"); // RW deltas (host fs)
-        const work = path.join(tempDir, "work"); // overlay workdir (host fs)
         const merged = path.join(tempDir, "mount"); // merged view = workspace
+
+        // CRITICAL: overlayfs refuses an upperdir/workdir that is itself on an
+        // overlay filesystem (kernel: "filesystem on '...' not supported as
+        // upperdir" → mount exit 32). On k8s the per-run temp dir
+        // ($RUNNER_TEMP = /home/runner/_work/_temp) IS the pod's overlay rootfs,
+        // so upper/work MUST live on a NON-overlay fs. The node-local dir
+        // (parent of the WORM image — a hostPath on k8s, the persistent disk on
+        // EC2 — real xfs/ext4) is exactly that. Put upper+work there in a
+        // per-job subdir so concurrent runners on the same node don't collide.
+        // upperdir + workdir must be on the SAME fs (they are — both here).
+        const nodeLocalDir = path.dirname(imageFile);
+        const jobTag = path.basename(tempDir);
+        const overlayBase = path.join(nodeLocalDir, `.overlay-${jobTag}`);
+        const upper = path.join(overlayBase, "upper"); // RW deltas (node-local fs)
+        const work = path.join(overlayBase, "work"); // overlay workdir (same fs)
+        this.overlayBaseDir = overlayBase;
 
         try {
             await fs.mkdir(lower, { recursive: true });
@@ -610,8 +630,14 @@ export abstract class LoopContainer extends Container {
             } catch {
                 /* ignore */
             }
+            try {
+                await fs.rm(overlayBase, { recursive: true, force: true });
+            } catch {
+                /* ignore */
+            }
             this.usingOverlay = false;
             this.overlayLowerMount = undefined;
+            this.overlayBaseDir = undefined;
             throw new Error(
                 `Overlay RW mount failed for node-local image ${imageFile}: ${
                     error instanceof Error ? error.message : error

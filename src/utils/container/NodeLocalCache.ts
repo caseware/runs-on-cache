@@ -201,7 +201,13 @@ export class NodeLocalCache {
             const now = Date.now();
 
             for (const entry of entries) {
-                if (!entry.startsWith(".temp")) continue;
+                // .temp*  → in-progress S3 downloads
+                // .overlay-* → per-job overlay upper/work dirs (k8s places these
+                //   on the node-local fs because $RUNNER_TEMP is overlayfs and
+                //   can't be an overlay upperdir). Normally removed at job end,
+                //   but a killed/cancelled job can orphan one — prune by age.
+                if (!entry.startsWith(".temp") && !entry.startsWith(".overlay-"))
+                    continue;
 
                 const fullPath = path.join(this.cacheDir, entry);
                 try {
@@ -210,7 +216,7 @@ export class NodeLocalCache {
 
                     if (ageMs > STALE_TEMP_FILE_AGE_MS) {
                         core.info(
-                            `[NodeLocal] Removing stale temp file (${Math.floor(ageMs / 3600000)}h old): ${entry}`
+                            `[NodeLocal] Removing stale ${entry.startsWith(".overlay-") ? "overlay" : "temp"} entry (${Math.floor(ageMs / 3600000)}h old): ${entry}`
                         );
                         await this.removeSafe(fullPath);
                         cleaned++;
@@ -300,7 +306,9 @@ export class NodeLocalCache {
      */
     private async removeSafe(filePath: string): Promise<void> {
         try {
-            await fs.unlink(filePath);
+            // rm handles both files (.temp*) and directories (.overlay-*
+            // upper/work trees) — fs.unlink would throw EISDIR on a dir.
+            await fs.rm(filePath, { recursive: true, force: true });
         } catch (error) {
             const code = (error as NodeJS.ErrnoException).code;
             if (code !== "ENOENT") {
