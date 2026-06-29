@@ -99741,11 +99741,8 @@ exports.XfsContainer = void 0;
  */
 const core = __importStar(__nccwpck_require__(2186));
 const exec = __importStar(__nccwpck_require__(1514));
-const node_fs_1 = __nccwpck_require__(7561);
 const fs = __importStar(__nccwpck_require__(3977));
 const path = __importStar(__nccwpck_require__(9411));
-const promises_1 = __nccwpck_require__(6402);
-const zlib = __importStar(__nccwpck_require__(5628));
 const LoopContainer_1 = __nccwpck_require__(1659);
 const XfsImage_1 = __nccwpck_require__(5672);
 class XfsContainer extends LoopContainer_1.LoopContainer {
@@ -99802,9 +99799,34 @@ class XfsContainer extends LoopContainer_1.LoopContainer {
      */
     prepareRawForRestore() {
         return __awaiter(this, void 0, void 0, function* () {
+            // When node-local is enabled, the S3-download path (cache.ts) already
+            // decompressed the freshly downloaded artifact to a RAW image and
+            // committed it to the node-local WORM dir, then re-pointed
+            // containerFile at that raw image. Decompressing AGAIN here would feed
+            // raw XFS bytes to zstd → "Unknown frame descriptor" (the restore
+            // failure seen on EC2: a wasted ~4m decompress that then fell back to a
+            // cold install). Detect that case and mount the raw image directly.
+            // shouldCopyOnRwRestore() then handles the copy + UUID randomize so we
+            // never RW-mount the shared WORM source in place.
+            if (this.isInNodeLocalDir()) {
+                this.logInfo("Container file is the raw node-local WORM image — skipping decompress (already raw)");
+                this.rawImageFile = this.containerFile;
+                this.xfsImage.setImageFile(this.rawImageFile);
+                return;
+            }
             yield this.decompressToRaw(this.containerFile, this.rawImageFile);
             this.xfsImage.setImageFile(this.rawImageFile);
         });
+    }
+    /**
+     * When containerFile points at the raw image in the node-local WORM dir
+     * (S3-download → commit → re-point), the RW restore must copy +
+     * UUID-randomize before mounting so we never mutate the shared WORM source
+     * and never collide UUIDs with another runner on the same node. Mirrors
+     * btrfs's node-local RW behaviour.
+     */
+    shouldCopyOnRwRestore() {
+        return this.isInNodeLocalDir();
     }
     /**
      * Explicitly zstd-compress the RAW image into this.containerFile (= the
@@ -99947,15 +99969,22 @@ class XfsContainer extends LoopContainer_1.LoopContainer {
     // ── Compression helpers (explicit zstd for S3) ───────────────────
     compressRawToArchive(rawFile, archive) {
         return __awaiter(this, void 0, void 0, function* () {
-            this.logInfo(`Compressing raw XFS image with zstd -${this.zstdLevel}: ${rawFile} → ${archive}`);
-            // Stream via Node's built-in zlib zstd (node24) — no `zstd` CLI / exec.
-            // The source is kept (we read it, never remove it) so the node-local
-            // commit can still copy the RAW image afterwards.
-            yield (0, promises_1.pipeline)((0, node_fs_1.createReadStream)(rawFile), zlib.createZstdCompress({
-                params: {
-                    [zlib.constants.ZSTD_c_compressionLevel]: this.zstdLevel
-                }
-            }), (0, node_fs_1.createWriteStream)(archive));
+            this.logInfo(`Compressing raw XFS image with zstd -${this.zstdLevel} -T0: ${rawFile} → ${archive}`);
+            // Use the zstd CLI (baked into the runner image; async exec, never
+            // execFileSync) rather than Node's single-threaded zlib zstd. `-T0`
+            // multithreads across all cores, which is the dominant lever on the
+            // producer's 25G→~3G zstd:9 save (single-threaded zstd:9 on a 25G
+            // sparse image is minutes of CPU). The source is KEPT (`-k`) so the
+            // node-local commit can still copy the RAW image afterwards.
+            yield exec.exec("zstd", [
+                `-${this.zstdLevel}`,
+                "-T0",
+                "-f",
+                "-k",
+                "-o",
+                archive,
+                rawFile
+            ], { cwd: this.safeCwd, silent: !core.isDebug() });
             const [srcStat, dstStat] = yield Promise.all([
                 fs.stat(rawFile),
                 fs.stat(archive)
@@ -99966,14 +99995,16 @@ class XfsContainer extends LoopContainer_1.LoopContainer {
     }
     decompressToRaw(archive, rawFile) {
         return __awaiter(this, void 0, void 0, function* () {
-            this.logInfo(`Decompressing artifact with zstd: ${archive} → ${rawFile}`);
-            // Stream via Node's built-in zlib zstd (node24) — no `zstd` CLI / exec.
-            // NOTE: streaming decompress writes a NORMAL (non-sparse) file. That is
-            // acceptable here because the decompressed output is a transient working
-            // image that is immediately loop-mounted and (on restore) expanded; the
-            // SAVED / kept node-local copy is produced by sparse-preserving copies
-            // (see commitNodeLocalDownload / copyAndMountReadWrite), per Problem 2.
-            yield (0, promises_1.pipeline)((0, node_fs_1.createReadStream)(archive), zlib.createZstdDecompress(), (0, node_fs_1.createWriteStream)(rawFile));
+            this.logInfo(`Decompressing artifact with zstd --sparse: ${archive} → ${rawFile}`);
+            // Use the zstd CLI with `--sparse` (async exec, never execFileSync).
+            // This is the fix for the ~4-min restore: the raw XFS image is a sparse
+            // 25G file whose holes zstd:9 squashes to near-nothing, but Node's
+            // streaming zlib decompress re-materialized all 25G as REAL bytes (incl.
+            // gigabytes of zeros) → a 25G disk write every restore. `zstd --sparse`
+            // detects zero-runs and seeks over them, so only the ~8-12G of actual
+            // data blocks touch disk. Ratio is unchanged (same artifact) — this only
+            // changes how the output is written. `-f` overwrites any stale temp.
+            yield exec.exec("zstd", ["-d", "--sparse", "-f", "-o", rawFile, archive], { cwd: this.safeCwd, silent: !core.isDebug() });
         });
     }
 }
@@ -100462,22 +100493,6 @@ module.exports = require("node:os");
 
 "use strict";
 module.exports = require("node:path");
-
-/***/ }),
-
-/***/ 6402:
-/***/ ((module) => {
-
-"use strict";
-module.exports = require("node:stream/promises");
-
-/***/ }),
-
-/***/ 5628:
-/***/ ((module) => {
-
-"use strict";
-module.exports = require("node:zlib");
 
 /***/ }),
 

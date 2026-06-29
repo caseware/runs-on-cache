@@ -27,11 +27,8 @@
  */
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
-import { createReadStream, createWriteStream } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { pipeline } from "node:stream/promises";
-import * as zlib from "node:zlib";
 
 import { ContainerOptions } from "./Container";
 import { LoopContainer } from "./LoopContainer";
@@ -123,8 +120,36 @@ export class XfsContainer extends LoopContainer {
      * raw working image so the base restore() can loop-mount the raw image.
      */
     protected async prepareRawForRestore(): Promise<void> {
+        // When node-local is enabled, the S3-download path (cache.ts) already
+        // decompressed the freshly downloaded artifact to a RAW image and
+        // committed it to the node-local WORM dir, then re-pointed
+        // containerFile at that raw image. Decompressing AGAIN here would feed
+        // raw XFS bytes to zstd → "Unknown frame descriptor" (the restore
+        // failure seen on EC2: a wasted ~4m decompress that then fell back to a
+        // cold install). Detect that case and mount the raw image directly.
+        // shouldCopyOnRwRestore() then handles the copy + UUID randomize so we
+        // never RW-mount the shared WORM source in place.
+        if (this.isInNodeLocalDir()) {
+            this.logInfo(
+                "Container file is the raw node-local WORM image — skipping decompress (already raw)"
+            );
+            this.rawImageFile = this.containerFile;
+            this.xfsImage.setImageFile(this.rawImageFile);
+            return;
+        }
         await this.decompressToRaw(this.containerFile, this.rawImageFile);
         this.xfsImage.setImageFile(this.rawImageFile);
+    }
+
+    /**
+     * When containerFile points at the raw image in the node-local WORM dir
+     * (S3-download → commit → re-point), the RW restore must copy +
+     * UUID-randomize before mounting so we never mutate the shared WORM source
+     * and never collide UUIDs with another runner on the same node. Mirrors
+     * btrfs's node-local RW behaviour.
+     */
+    protected shouldCopyOnRwRestore(): boolean {
+        return this.isInNodeLocalDir();
     }
 
     /**
@@ -283,19 +308,26 @@ export class XfsContainer extends LoopContainer {
         archive: string
     ): Promise<void> {
         this.logInfo(
-            `Compressing raw XFS image with zstd -${this.zstdLevel}: ${rawFile} → ${archive}`
+            `Compressing raw XFS image with zstd -${this.zstdLevel} -T0: ${rawFile} → ${archive}`
         );
-        // Stream via Node's built-in zlib zstd (node24) — no `zstd` CLI / exec.
-        // The source is kept (we read it, never remove it) so the node-local
-        // commit can still copy the RAW image afterwards.
-        await pipeline(
-            createReadStream(rawFile),
-            zlib.createZstdCompress({
-                params: {
-                    [zlib.constants.ZSTD_c_compressionLevel]: this.zstdLevel
-                }
-            }),
-            createWriteStream(archive)
+        // Use the zstd CLI (baked into the runner image; async exec, never
+        // execFileSync) rather than Node's single-threaded zlib zstd. `-T0`
+        // multithreads across all cores, which is the dominant lever on the
+        // producer's 25G→~3G zstd:9 save (single-threaded zstd:9 on a 25G
+        // sparse image is minutes of CPU). The source is KEPT (`-k`) so the
+        // node-local commit can still copy the RAW image afterwards.
+        await exec.exec(
+            "zstd",
+            [
+                `-${this.zstdLevel}`,
+                "-T0",
+                "-f",
+                "-k",
+                "-o",
+                archive,
+                rawFile
+            ],
+            { cwd: this.safeCwd, silent: !core.isDebug() }
         );
 
         const [srcStat, dstStat] = await Promise.all([
@@ -313,18 +345,20 @@ export class XfsContainer extends LoopContainer {
         rawFile: string
     ): Promise<void> {
         this.logInfo(
-            `Decompressing artifact with zstd: ${archive} → ${rawFile}`
+            `Decompressing artifact with zstd --sparse: ${archive} → ${rawFile}`
         );
-        // Stream via Node's built-in zlib zstd (node24) — no `zstd` CLI / exec.
-        // NOTE: streaming decompress writes a NORMAL (non-sparse) file. That is
-        // acceptable here because the decompressed output is a transient working
-        // image that is immediately loop-mounted and (on restore) expanded; the
-        // SAVED / kept node-local copy is produced by sparse-preserving copies
-        // (see commitNodeLocalDownload / copyAndMountReadWrite), per Problem 2.
-        await pipeline(
-            createReadStream(archive),
-            zlib.createZstdDecompress(),
-            createWriteStream(rawFile)
+        // Use the zstd CLI with `--sparse` (async exec, never execFileSync).
+        // This is the fix for the ~4-min restore: the raw XFS image is a sparse
+        // 25G file whose holes zstd:9 squashes to near-nothing, but Node's
+        // streaming zlib decompress re-materialized all 25G as REAL bytes (incl.
+        // gigabytes of zeros) → a 25G disk write every restore. `zstd --sparse`
+        // detects zero-runs and seeks over them, so only the ~8-12G of actual
+        // data blocks touch disk. Ratio is unchanged (same artifact) — this only
+        // changes how the output is written. `-f` overwrites any stale temp.
+        await exec.exec(
+            "zstd",
+            ["-d", "--sparse", "-f", "-o", rawFile, archive],
+            { cwd: this.safeCwd, silent: !core.isDebug() }
         );
     }
 }
