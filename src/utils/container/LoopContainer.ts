@@ -269,11 +269,14 @@ export abstract class LoopContainer extends Container {
             if (this.mountMode === "ro") {
                 await this.mountImageReadOnly(this.rawImageFile);
             } else if (this.shouldCopyOnRwRestore()) {
+                // The just-downloaded image was committed to the node-local WORM
+                // dir (S3-miss path). Overlay-mount it RW instead of copying the
+                // whole ~13.5 GB — same no-copy fast path as a node-local hit.
+                // (A node-local restore never saves back, so an overlay is safe.)
                 this.logInfo(
-                    `Container file is in node-local WORM dir — copying for RW mount`
+                    `Container file is in node-local WORM dir — overlay RW mount (no copy)`
                 );
-                await this.copyAndMountReadWrite(this.rawImageFile);
-                await this.image.checkHealth(this.mountPoint!);
+                await this.overlayMountReadWrite(this.rawImageFile);
             } else {
                 this.image.setImageFile(this.rawImageFile);
                 await this.mountImageReadWrite({ expandForHeadroom: true });
