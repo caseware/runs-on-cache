@@ -223,6 +223,109 @@ describe("XfsContainer.copyImage (Problem 2: sparse-preserving copy)", () => {
     });
 });
 
+describe("XfsImage RW headroom (warm-restore corruption fix)", () => {
+    function createXfsImage(): XfsImage {
+        return new XfsImage("/tmp/xfs-proc/cache.xfs", {
+            rwUtilizationTarget: 0.8,
+            safeCwd: "/tmp/xfs-proc"
+        });
+    }
+
+    test("computeHeadroomTargetMb returns a grow target sized against physical+free, capped", async () => {
+        const image = createXfsImage();
+        // apparent 1000 MB, physical 100 MB used
+        mockedFs.stat.mockResolvedValueOnce({
+            size: 1000 * 1024 * 1024,
+            blocks: (100 * 1024 * 1024) / 512
+        } as unknown as Awaited<ReturnType<typeof fsPromises.stat>>);
+        // df --output=avail -B1 → 10000 MB free on host
+        mockedExec.exec.mockImplementationOnce(
+            async (_cmd, _args, opts) => {
+                opts?.listeners?.stdout?.(
+                    Buffer.from(`Avail\n${10000 * 1024 * 1024}\n`)
+                );
+                return 0;
+            }
+        );
+
+        const targetMb = await image.computeHeadroomTargetMb();
+        // budget*target = (100+10000)*0.8 = 8080; cap = 100 + 0.85*10000 = 8600
+        // → min = 8080 MB
+        expect(targetMb).toBe(8080);
+    });
+
+    test("computeHeadroomTargetMb returns null when headroom disabled", async () => {
+        const image = new XfsImage("/tmp/x/cache.xfs", {
+            rwUtilizationTarget: 0,
+            safeCwd: "/tmp/x"
+        });
+        expect(await image.computeHeadroomTargetMb()).toBeNull();
+    });
+
+    test("growBackingFile truncates the backing file up (no losetup -c)", async () => {
+        const image = createXfsImage();
+        mockedExec.exec.mockResolvedValue(0);
+
+        await image.growBackingFile(8080);
+
+        expect(mockedExec.exec).toHaveBeenCalledWith(
+            "truncate",
+            ["-s", "8080M", "/tmp/xfs-proc/cache.xfs"],
+            expect.any(Object)
+        );
+        // The corruption trigger must be gone: never a live capacity refresh.
+        const calls = mockedExec.exec.mock.calls;
+        const losetupC = calls.some(
+            ([cmd, args]) =>
+                cmd === "sudo" &&
+                Array.isArray(args) &&
+                args[0] === "losetup" &&
+                args[1] === "-c"
+        );
+        expect(losetupC).toBe(false);
+    });
+
+    test("RW restore grows the BACKING FILE before mounting, then the FS after — no losetup -c", async () => {
+        const container = createXfsContainer();
+        const callOrder: string[] = [];
+
+        const image = (
+            container as unknown as { xfsImage: XfsImage }
+        ).xfsImage;
+        const c = container as unknown as Record<
+            string,
+            (...args: unknown[]) => Promise<unknown>
+        >;
+
+        jest.spyOn(c, "prepareRawForRestore").mockResolvedValue(undefined);
+        jest.spyOn(c, "cleanStaleMounts").mockResolvedValue(undefined);
+        jest.spyOn(c, "bindMountPaths").mockResolvedValue(undefined);
+        jest.spyOn(image, "growBackingFileForHeadroom").mockImplementation(
+            async () => {
+                callOrder.push("growBackingFile");
+                return true;
+            }
+        );
+        jest.spyOn(image, "mountRW").mockImplementation(async () => {
+            callOrder.push("mountRW");
+        });
+        jest.spyOn(image, "growFilesystemForHeadroom").mockImplementation(
+            async () => {
+                callOrder.push("growFilesystem");
+            }
+        );
+        jest.spyOn(image, "checkHealth").mockResolvedValue(undefined);
+
+        await container.restore();
+
+        expect(callOrder).toEqual([
+            "growBackingFile",
+            "mountRW",
+            "growFilesystem"
+        ]);
+    });
+});
+
 describe("ContainerFactory XFS selection", () => {
     test('selects XfsContainer when customCompression is "xfs"', () => {
         const container = ContainerFactory.getCacheContainer(

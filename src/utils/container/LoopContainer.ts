@@ -275,8 +275,7 @@ export abstract class LoopContainer extends Container {
                 await this.image.checkHealth(this.mountPoint!);
             } else {
                 this.image.setImageFile(this.rawImageFile);
-                await this.mountImageReadWrite();
-                await this.image.expandForHeadroom(this.mountPoint!);
+                await this.mountImageReadWrite({ expandForHeadroom: true });
                 await this.image.checkHealth(this.mountPoint!);
             }
         } catch (error) {
@@ -456,7 +455,31 @@ export abstract class LoopContainer extends Container {
         await this.image.checkHealth(this.mountPoint);
     }
 
-    protected async mountImageReadWrite(): Promise<void> {
+    /**
+     * Mount the working image read-write.
+     *
+     * When `expandForHeadroom` is set (restore paths — the saved image is tight
+     * and the consumer needs room for checkout deltas, build artifacts, etc.),
+     * the RW headroom grow is performed AROUND the single real mount:
+     *
+     *   1. Compute the headroom target and grow the BACKING FILE *before*
+     *      mountRW. The fresh `losetup --find --show` inside mountRW then
+     *      exposes the full device capacity from the start, so the (single)
+     *      log recovery happens at full size.
+     *   2. After mountRW, grow the FILESYSTEM onto the already-present backing
+     *      space (xfs_growfs / btrfs resize).
+     *
+     * This deliberately avoids a live `losetup -c` capacity change on a
+     * mounted, just-log-recovered device — that was the kernel-5.15 XFS finobt
+     * corruption trigger (EFSCORRUPTED → fs shutdown → EIO on checkout's
+     * unlink/rmdir) behind the warm-restore failures.
+     *
+     * createEmptyCache mounts a fresh sparse image and passes no options, so it
+     * never expands here.
+     */
+    protected async mountImageReadWrite(
+        opts: { expandForHeadroom?: boolean } = {}
+    ): Promise<void> {
         try {
             const tempDir = await createCacheKeySpecificTempDirectory(
                 this.cacheKey
@@ -464,7 +487,21 @@ export abstract class LoopContainer extends Container {
             this.mountPoint = path.join(tempDir, "mount");
 
             await this.cleanStaleMounts();
+
+            // Grow the BACKING FILE before mounting (never `losetup -c` on a
+            // live, recovered device). The fresh loop attach in mountRW exposes
+            // the full size, so the post-mount filesystem grow is safe.
+            let grew = false;
+            if (opts.expandForHeadroom) {
+                grew = await this.image.growBackingFileForHeadroom();
+            }
+
             await this.image.mountRW(this.mountPoint);
+
+            if (grew) {
+                await this.image.growFilesystemForHeadroom(this.mountPoint);
+            }
+
             await this.bindMountPaths(false);
         } catch (error) {
             await this.image.cleanupLoopDevices(this.image.getImageFile());
@@ -506,8 +543,7 @@ export abstract class LoopContainer extends Container {
         // This copy is now the image we mount and (on save) persist.
         this.rawImageFile = localCopy;
         this.onRawImageCopied(localCopy);
-        await this.mountImageReadWrite();
-        await this.image.expandForHeadroom(this.mountPoint!);
+        await this.mountImageReadWrite({ expandForHeadroom: true });
     }
 
     // ── Bind mounts ──────────────────────────────────────────────────

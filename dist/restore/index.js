@@ -97464,8 +97464,7 @@ class LoopContainer extends Container_1.Container {
                 }
                 else {
                     this.image.setImageFile(this.rawImageFile);
-                    yield this.mountImageReadWrite();
-                    yield this.image.expandForHeadroom(this.mountPoint);
+                    yield this.mountImageReadWrite({ expandForHeadroom: true });
                     yield this.image.checkHealth(this.mountPoint);
                 }
             }
@@ -97619,13 +97618,45 @@ class LoopContainer extends Container_1.Container {
             yield this.image.checkHealth(this.mountPoint);
         });
     }
-    mountImageReadWrite() {
+    /**
+     * Mount the working image read-write.
+     *
+     * When `expandForHeadroom` is set (restore paths — the saved image is tight
+     * and the consumer needs room for checkout deltas, build artifacts, etc.),
+     * the RW headroom grow is performed AROUND the single real mount:
+     *
+     *   1. Compute the headroom target and grow the BACKING FILE *before*
+     *      mountRW. The fresh `losetup --find --show` inside mountRW then
+     *      exposes the full device capacity from the start, so the (single)
+     *      log recovery happens at full size.
+     *   2. After mountRW, grow the FILESYSTEM onto the already-present backing
+     *      space (xfs_growfs / btrfs resize).
+     *
+     * This deliberately avoids a live `losetup -c` capacity change on a
+     * mounted, just-log-recovered device — that was the kernel-5.15 XFS finobt
+     * corruption trigger (EFSCORRUPTED → fs shutdown → EIO on checkout's
+     * unlink/rmdir) behind the warm-restore failures.
+     *
+     * createEmptyCache mounts a fresh sparse image and passes no options, so it
+     * never expands here.
+     */
+    mountImageReadWrite(opts = {}) {
         return __awaiter(this, void 0, void 0, function* () {
             try {
                 const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
                 this.mountPoint = path.join(tempDir, "mount");
                 yield this.cleanStaleMounts();
+                // Grow the BACKING FILE before mounting (never `losetup -c` on a
+                // live, recovered device). The fresh loop attach in mountRW exposes
+                // the full size, so the post-mount filesystem grow is safe.
+                let grew = false;
+                if (opts.expandForHeadroom) {
+                    grew = yield this.image.growBackingFileForHeadroom();
+                }
                 yield this.image.mountRW(this.mountPoint);
+                if (grew) {
+                    yield this.image.growFilesystemForHeadroom(this.mountPoint);
+                }
                 yield this.bindMountPaths(false);
             }
             catch (error) {
@@ -97655,8 +97686,7 @@ class LoopContainer extends Container_1.Container {
             // This copy is now the image we mount and (on save) persist.
             this.rawImageFile = localCopy;
             this.onRawImageCopied(localCopy);
-            yield this.mountImageReadWrite();
-            yield this.image.expandForHeadroom(this.mountPoint);
+            yield this.mountImageReadWrite({ expandForHeadroom: true });
         });
     }
     // ── Bind mounts ──────────────────────────────────────────────────
@@ -98015,23 +98045,28 @@ class LoopImage {
         });
     }
     /**
-     * Expand a mounted RW image to fill up to rwUtilizationTarget of the
-     * runner's available disk space.  Called after mountRW on restore — the
-     * saved image is tight and the consumer needs room for checkout deltas,
-     * build artifacts, etc.
+     * Compute the RW-headroom target size (in MB) for the backing file, or
+     * null if no safe expansion is possible / headroom is disabled.
      *
-     * Strategy: the image file currently consumes `currentSize` bytes on the
-     * host.  The host also has `availOnHost` bytes free (not counting the
-     * image).  The total space budget is `currentSize + availOnHost`.
-     * We expand to `budget * target` (default 80%), leaving the remaining
-     * 20% for non-cache host needs (logs, temp files, other jobs).
+     * This is the disk-budget math ONLY — it performs NO resizing. It must run
+     * BEFORE the (single, fresh) RW mount so the backing file can be grown
+     * pre-mount; see growBackingFile() and the warm-restore corruption note on
+     * mountImageReadWrite.
+     *
+     * Strategy: the image file currently consumes `currentPhysical` bytes on
+     * the host. The host also has `availOnHost` bytes free (not counting the
+     * image). The total space budget is `currentPhysical + availOnHost`. We
+     * expand to `budget * target` (default 80%), leaving the remaining ~20%
+     * for non-cache host needs (logs, temp files, other jobs), and HARD-CAP
+     * against `currentPhysical + 85% of free` so growth never consumes the
+     * last sliver of the disk (which surfaces as EIO on later writes/rmdir).
      */
-    expandForHeadroom(mountPoint) {
+    computeHeadroomTargetMb() {
         var _a;
         return __awaiter(this, void 0, void 0, function* () {
             const target = this.baseOpts.rwUtilizationTarget;
             if (target <= 0 || target >= 1)
-                return; // disabled or invalid
+                return null; // disabled or invalid
             const stat = yield fs.stat(this.imageFile);
             // NOTE: stat.size is the SPARSE/apparent size (e.g. 25 GiB virtual), not
             // the physical bytes the image occupies on disk. We must size growth
@@ -98046,7 +98081,7 @@ class LoopImage {
             // Real space budget = what the image already physically uses + free
             // space on the host (NOT the sparse apparent size, which would
             // double-count and overcommit). Reserve a safety margin so growth
-            // never consumes the last sliver of the disk — truncating the backing
+            // never consumes the last sliver of the disk — growing the backing
             // file and then writing into the grown filesystem past actual free
             // space surfaces as EIO (seen on EC2 VM runners where the image and
             // workspace share one disk: expand to 92 GB on 89.5 GB free → EIO on
@@ -98062,67 +98097,66 @@ class LoopImage {
                 this.info(`RW headroom: image apparent ${toMb(currentSize)} MB ` +
                     `(physical ${toMb(currentPhysical)} MB), usable free ` +
                     `${toMb(usableFree)} MB — no safe expansion possible`);
-                return;
+                return null;
             }
-            this.info(`Expanding for RW headroom: ${toMb(currentSize)} MB → ${toMb(desiredSize)} MB ` +
+            this.info(`RW headroom target: ${toMb(currentSize)} MB → ${toMb(desiredSize)} MB ` +
                 `(physical ${toMb(currentPhysical)} MB, ${toMb(availOnHost)} MB free on host, capped at physical+${Math.round(SAFETY * 100)}% free = ${toMb(physicalBudget)} MB)`);
-            // Expand the backing file first (so the filesystem has backing space)
-            const desiredMb = toMb(desiredSize);
+            return toMb(desiredSize);
+        });
+    }
+    /**
+     * Grow the backing FILE to `targetMb` megabytes. This MUST run BEFORE the
+     * (single, fresh) RW mount.
+     *
+     * CRITICAL — why pre-mount: the warm-restore corruption was caused by
+     * growing a just-log-recovered XFS in place via a LIVE `losetup -c`
+     * capacity change on the already-attached loop device (kernel 5.15
+     * finobt corruption → EFSCORRUPTED → fs shutdown → EIO on checkout's
+     * unlink/rmdir). By truncating the backing file up BEFORE mountRW, the
+     * fresh `losetup --find --show` performed by setupLoopDevice() exposes the
+     * full device capacity from the start. The single mount then log-recovers
+     * once at full size, and growFilesystem() afterwards extends the fs onto
+     * the already-present space — with NO live capacity change on a mounted,
+     * recovered device.
+     */
+    growBackingFile(targetMb) {
+        return __awaiter(this, void 0, void 0, function* () {
             try {
-                yield exec.exec("truncate", ["-s", `${desiredMb}M`, this.imageFile], { cwd: this.safeCwd });
+                yield exec.exec("truncate", ["-s", `${targetMb}M`, this.imageFile], { cwd: this.safeCwd });
+                this.info(`Grew backing file to ${targetMb} MB before mount (no live loop capacity change)`);
             }
             catch (e) {
                 core.warning(`${this.logPrefix} Backing file expansion failed: ${e instanceof Error ? e.message : e}`);
-                return;
             }
-            // CRITICAL: truncating the backing file does NOT tell the already-
-            // attached loop device about the new size — it still exposes the old
-            // capacity. Growing the filesystem onto that stale, smaller block
-            // device leaves the fs believing it has space the loop device won't
-            // back, which surfaces as EIO on later writes/rmdir (see the gh-runner
-            // warm-restore failure: checkout's clean hit
-            // "EIO: i/o error, rmdir .cypress/.../ansi-styles"). Refresh the loop
-            // device capacity with `losetup -c` BEFORE growing the filesystem.
-            const loopDev = yield this.findLoopDeviceFor(this.imageFile);
-            if (!loopDev) {
-                core.warning(`${this.logPrefix} Could not resolve loop device for ${this.imageFile} — skipping filesystem grow to avoid an inconsistent (EIO-prone) mount`);
-                return;
-            }
-            try {
-                yield sudoExec("losetup", ["-c", loopDev], this.safeCwd);
-                this.info(`Refreshed loop device capacity (${loopDev}) after backing-file grow`);
-            }
-            catch (e) {
-                core.warning(`${this.logPrefix} losetup -c (capacity refresh) failed for ${loopDev}: ${e instanceof Error ? e.message : e} — skipping filesystem grow to avoid an inconsistent (EIO-prone) mount`);
-                return;
-            }
-            // Grow the filesystem to fill the new (now loop-visible) backing space.
+        });
+    }
+    /**
+     * Compute the headroom target and grow the backing FILE to it, BEFORE the
+     * RW mount. Returns true if the backing file was grown (so the caller
+     * knows a post-mount growFilesystem is warranted), false otherwise.
+     */
+    growBackingFileForHeadroom() {
+        return __awaiter(this, void 0, void 0, function* () {
+            const targetMb = yield this.computeHeadroomTargetMb();
+            if (targetMb === null)
+                return false;
+            yield this.growBackingFile(targetMb);
+            return true;
+        });
+    }
+    /**
+     * Grow the mounted filesystem to fill its (already-grown, full-capacity)
+     * backing device. MUST run AFTER mountRW. Safe because the fresh loop
+     * attach already exposes the full size (the backing file was grown
+     * pre-mount) — there is NO live `losetup -c` capacity change involved.
+     */
+    growFilesystemForHeadroom(mountPoint) {
+        return __awaiter(this, void 0, void 0, function* () {
             try {
                 yield this.growFilesystem(mountPoint);
             }
             catch (e) {
                 core.warning(`${this.logPrefix} Filesystem grow failed: ${e instanceof Error ? e.message : e}`);
-            }
-        });
-    }
-    /**
-     * Resolve the loop device currently backing the given image file via
-     * `losetup -j`. Returns the /dev/loopN path or null if none is attached.
-     */
-    findLoopDeviceFor(imageFile) {
-        return __awaiter(this, void 0, void 0, function* () {
-            try {
-                const out = yield exec.getExecOutput("sudo", ["losetup", "-j", imageFile], {
-                    cwd: this.safeCwd,
-                    silent: !core.isDebug(),
-                    ignoreReturnCode: true
-                });
-                // Format: "/dev/loop1: 0 (/tmp/xfs-XXX/cache.xfs)"
-                const match = out.stdout.match(/^(\/dev\/loop\d+):/m);
-                return match ? match[1] : null;
-            }
-            catch (_a) {
-                return null;
             }
         });
     }

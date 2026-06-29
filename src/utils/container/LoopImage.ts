@@ -128,20 +128,25 @@ export abstract class LoopImage {
     }
 
     /**
-     * Expand a mounted RW image to fill up to rwUtilizationTarget of the
-     * runner's available disk space.  Called after mountRW on restore — the
-     * saved image is tight and the consumer needs room for checkout deltas,
-     * build artifacts, etc.
+     * Compute the RW-headroom target size (in MB) for the backing file, or
+     * null if no safe expansion is possible / headroom is disabled.
      *
-     * Strategy: the image file currently consumes `currentSize` bytes on the
-     * host.  The host also has `availOnHost` bytes free (not counting the
-     * image).  The total space budget is `currentSize + availOnHost`.
-     * We expand to `budget * target` (default 80%), leaving the remaining
-     * 20% for non-cache host needs (logs, temp files, other jobs).
+     * This is the disk-budget math ONLY — it performs NO resizing. It must run
+     * BEFORE the (single, fresh) RW mount so the backing file can be grown
+     * pre-mount; see growBackingFile() and the warm-restore corruption note on
+     * mountImageReadWrite.
+     *
+     * Strategy: the image file currently consumes `currentPhysical` bytes on
+     * the host. The host also has `availOnHost` bytes free (not counting the
+     * image). The total space budget is `currentPhysical + availOnHost`. We
+     * expand to `budget * target` (default 80%), leaving the remaining ~20%
+     * for non-cache host needs (logs, temp files, other jobs), and HARD-CAP
+     * against `currentPhysical + 85% of free` so growth never consumes the
+     * last sliver of the disk (which surfaces as EIO on later writes/rmdir).
      */
-    async expandForHeadroom(mountPoint: string): Promise<void> {
+    async computeHeadroomTargetMb(): Promise<number | null> {
         const target = this.baseOpts.rwUtilizationTarget;
-        if (target <= 0 || target >= 1) return; // disabled or invalid
+        if (target <= 0 || target >= 1) return null; // disabled or invalid
 
         const stat = await fs.stat(this.imageFile);
         // NOTE: stat.size is the SPARSE/apparent size (e.g. 25 GiB virtual), not
@@ -163,7 +168,7 @@ export abstract class LoopImage {
         // Real space budget = what the image already physically uses + free
         // space on the host (NOT the sparse apparent size, which would
         // double-count and overcommit). Reserve a safety margin so growth
-        // never consumes the last sliver of the disk — truncating the backing
+        // never consumes the last sliver of the disk — growing the backing
         // file and then writing into the grown filesystem past actual free
         // space surfaces as EIO (seen on EC2 VM runners where the image and
         // workspace share one disk: expand to 92 GB on 89.5 GB free → EIO on
@@ -185,11 +190,11 @@ export abstract class LoopImage {
                     `(physical ${toMb(currentPhysical)} MB), usable free ` +
                     `${toMb(usableFree)} MB — no safe expansion possible`
             );
-            return;
+            return null;
         }
 
         this.info(
-            `Expanding for RW headroom: ${toMb(currentSize)} MB → ${toMb(
+            `RW headroom target: ${toMb(currentSize)} MB → ${toMb(
                 desiredSize
             )} MB ` +
                 `(physical ${toMb(currentPhysical)} MB, ${toMb(
@@ -199,13 +204,33 @@ export abstract class LoopImage {
                 )}% free = ${toMb(physicalBudget)} MB)`
         );
 
-        // Expand the backing file first (so the filesystem has backing space)
-        const desiredMb = toMb(desiredSize);
+        return toMb(desiredSize);
+    }
+
+    /**
+     * Grow the backing FILE to `targetMb` megabytes. This MUST run BEFORE the
+     * (single, fresh) RW mount.
+     *
+     * CRITICAL — why pre-mount: the warm-restore corruption was caused by
+     * growing a just-log-recovered XFS in place via a LIVE `losetup -c`
+     * capacity change on the already-attached loop device (kernel 5.15
+     * finobt corruption → EFSCORRUPTED → fs shutdown → EIO on checkout's
+     * unlink/rmdir). By truncating the backing file up BEFORE mountRW, the
+     * fresh `losetup --find --show` performed by setupLoopDevice() exposes the
+     * full device capacity from the start. The single mount then log-recovers
+     * once at full size, and growFilesystem() afterwards extends the fs onto
+     * the already-present space — with NO live capacity change on a mounted,
+     * recovered device.
+     */
+    async growBackingFile(targetMb: number): Promise<void> {
         try {
             await exec.exec(
                 "truncate",
-                ["-s", `${desiredMb}M`, this.imageFile],
+                ["-s", `${targetMb}M`, this.imageFile],
                 { cwd: this.safeCwd }
+            );
+            this.info(
+                `Grew backing file to ${targetMb} MB before mount (no live loop capacity change)`
             );
         } catch (e) {
             core.warning(
@@ -213,39 +238,28 @@ export abstract class LoopImage {
                     e instanceof Error ? e.message : e
                 }`
             );
-            return;
         }
+    }
 
-        // CRITICAL: truncating the backing file does NOT tell the already-
-        // attached loop device about the new size — it still exposes the old
-        // capacity. Growing the filesystem onto that stale, smaller block
-        // device leaves the fs believing it has space the loop device won't
-        // back, which surfaces as EIO on later writes/rmdir (see the gh-runner
-        // warm-restore failure: checkout's clean hit
-        // "EIO: i/o error, rmdir .cypress/.../ansi-styles"). Refresh the loop
-        // device capacity with `losetup -c` BEFORE growing the filesystem.
-        const loopDev = await this.findLoopDeviceFor(this.imageFile);
-        if (!loopDev) {
-            core.warning(
-                `${this.logPrefix} Could not resolve loop device for ${this.imageFile} — skipping filesystem grow to avoid an inconsistent (EIO-prone) mount`
-            );
-            return;
-        }
-        try {
-            await sudoExec("losetup", ["-c", loopDev], this.safeCwd);
-            this.info(
-                `Refreshed loop device capacity (${loopDev}) after backing-file grow`
-            );
-        } catch (e) {
-            core.warning(
-                `${this.logPrefix} losetup -c (capacity refresh) failed for ${loopDev}: ${
-                    e instanceof Error ? e.message : e
-                } — skipping filesystem grow to avoid an inconsistent (EIO-prone) mount`
-            );
-            return;
-        }
+    /**
+     * Compute the headroom target and grow the backing FILE to it, BEFORE the
+     * RW mount. Returns true if the backing file was grown (so the caller
+     * knows a post-mount growFilesystem is warranted), false otherwise.
+     */
+    async growBackingFileForHeadroom(): Promise<boolean> {
+        const targetMb = await this.computeHeadroomTargetMb();
+        if (targetMb === null) return false;
+        await this.growBackingFile(targetMb);
+        return true;
+    }
 
-        // Grow the filesystem to fill the new (now loop-visible) backing space.
+    /**
+     * Grow the mounted filesystem to fill its (already-grown, full-capacity)
+     * backing device. MUST run AFTER mountRW. Safe because the fresh loop
+     * attach already exposes the full size (the backing file was grown
+     * pre-mount) — there is NO live `losetup -c` capacity change involved.
+     */
+    async growFilesystemForHeadroom(mountPoint: string): Promise<void> {
         try {
             await this.growFilesystem(mountPoint);
         } catch (e) {
@@ -254,31 +268,6 @@ export abstract class LoopImage {
                     e instanceof Error ? e.message : e
                 }`
             );
-        }
-    }
-
-    /**
-     * Resolve the loop device currently backing the given image file via
-     * `losetup -j`. Returns the /dev/loopN path or null if none is attached.
-     */
-    protected async findLoopDeviceFor(
-        imageFile: string
-    ): Promise<string | null> {
-        try {
-            const out = await exec.getExecOutput(
-                "sudo",
-                ["losetup", "-j", imageFile],
-                {
-                    cwd: this.safeCwd,
-                    silent: !core.isDebug(),
-                    ignoreReturnCode: true
-                }
-            );
-            // Format: "/dev/loop1: 0 (/tmp/xfs-XXX/cache.xfs)"
-            const match = out.stdout.match(/^(\/dev\/loop\d+):/m);
-            return match ? match[1] : null;
-        } catch {
-            return null;
         }
     }
 
