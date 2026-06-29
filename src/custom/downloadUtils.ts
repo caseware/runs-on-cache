@@ -1,8 +1,17 @@
 // Just a copy of the original file from the toolkit/actions/cache repository, with a change for byte range used in the downloadCacheHttpClientConcurrent function.
 import * as core from "@actions/core";
 import { HttpClient } from "@actions/http-client";
-import { TransferProgressEvent } from "@azure/ms-rest-js";
 import * as fs from "fs";
+
+/**
+ * Minimal progress-event shape. Previously imported from `@azure/ms-rest-js`,
+ * which was removed when `@actions/cache` was upgraded to v5 (it dropped the
+ * legacy Azure SDK / node-fetch@2 / tr46 chain that emitted the deprecated
+ * `punycode` DEP0040 warning). The only field used is `loadedBytes`.
+ */
+interface TransferProgressEvent {
+    loadedBytes: number;
+}
 import { DownloadOptions } from "@actions/cache/lib/options";
 import { retryHttpClientResponse } from "@actions/cache/lib/internal/requestUtils";
 
