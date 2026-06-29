@@ -135,6 +135,27 @@ export async function restoreCache(
         // Initialize container (prerequisite checks, stale temp cleanup)
         await cacheContainer.initialize();
 
+        // Producer / force-rebuild: never restore a (possibly stale or corrupt)
+        // cached image. Skip node-local + S3 restore and build a fresh empty
+        // image to populate and force-save over the key. This also self-heals a
+        // poisoned cache: a corrupt image can't block its own overwrite.
+        const skipRestore =
+            (core.getInput(Inputs.SkipRestore) || "false") === "true";
+        if (skipRestore) {
+            core.info(
+                "skip-restore: bypassing node-local + S3 restore — creating a fresh empty image (force-rebuild)"
+            );
+            core.setOutput(
+                Outputs.NodeLocalCacheHit,
+                cacheContainer.isNodeLocalEnabled() ? "false" : "disabled"
+            );
+            core.setOutput(Outputs.CacheSource, "cold-boot");
+            if (cacheContainer.requiresCreateEmptyCache) {
+                await cacheContainer.createEmptyCache();
+            }
+            return undefined;
+        }
+
         // Try node-local restore first (fast path: ~1-2s on warm node)
         const nodeLocalEnabled = cacheContainer.isNodeLocalEnabled();
         const restoredFromLocal = await cacheContainer.tryRestoreFromNodeLocal(restoreKeys);

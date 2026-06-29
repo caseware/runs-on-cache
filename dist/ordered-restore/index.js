@@ -95112,7 +95112,8 @@ var Inputs;
     Inputs["NodeLocalCacheDir"] = "node-local-cache-dir";
     Inputs["MountMode"] = "mount-mode";
     Inputs["FailOnSaveError"] = "fail-on-save-error";
-    Inputs["CleanupNodeLocal"] = "cleanup-node-local"; // Input for node-local image cleanup policy: "none" | "stale" (default) | "always"
+    Inputs["CleanupNodeLocal"] = "cleanup-node-local";
+    Inputs["SkipRestore"] = "skip-restore"; // Input: skip node-local + S3 restore and create a fresh empty image (producer/force-rebuild — never mount a stale/corrupt cached image)
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {
@@ -95546,6 +95547,20 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode });
             // Initialize container (prerequisite checks, stale temp cleanup)
             yield cacheContainer.initialize();
+            // Producer / force-rebuild: never restore a (possibly stale or corrupt)
+            // cached image. Skip node-local + S3 restore and build a fresh empty
+            // image to populate and force-save over the key. This also self-heals a
+            // poisoned cache: a corrupt image can't block its own overwrite.
+            const skipRestore = (core.getInput(constants_1.Inputs.SkipRestore) || "false") === "true";
+            if (skipRestore) {
+                core.info("skip-restore: bypassing node-local + S3 restore — creating a fresh empty image (force-rebuild)");
+                core.setOutput(constants_1.Outputs.NodeLocalCacheHit, cacheContainer.isNodeLocalEnabled() ? "false" : "disabled");
+                core.setOutput(constants_1.Outputs.CacheSource, "cold-boot");
+                if (cacheContainer.requiresCreateEmptyCache) {
+                    yield cacheContainer.createEmptyCache();
+                }
+                return undefined;
+            }
             // Try node-local restore first (fast path: ~1-2s on warm node)
             const nodeLocalEnabled = cacheContainer.isNodeLocalEnabled();
             const restoredFromLocal = yield cacheContainer.tryRestoreFromNodeLocal(restoreKeys);

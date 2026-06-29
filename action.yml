@@ -71,6 +71,10 @@ inputs:
     description: 'Fail the action if cache save encounters an error (useful for cache validation tests)'
     default: 'false'
     required: false
+  skip-restore:
+    description: 'Skip node-local + S3 restore and create a fresh empty image (for a producer/force-rebuild job). Guarantees the build never mounts a stale or corrupt cached image, and self-heals a poisoned cache on the next force-save.'
+    default: 'false'
+    required: false
   cleanup-node-local:
     description: |
       Controls cleanup of node-local BTRFS images after the job:
