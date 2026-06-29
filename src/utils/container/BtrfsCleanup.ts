@@ -100,9 +100,17 @@ async function scopedCleanup(entryTempDir: string): Promise<void> {
             }
         }
 
-        // Unmount in reverse order (bind mounts before main mount)
-        ownedMounts.reverse();
-        for (const mount of ownedMounts) {
+        // Unmount deepest path first. This is more robust than reverse-discovery
+        // order for the overlay node-local path, where the workspace bind mounts
+        // and the merged overlay (<tempDir>/mount) must come down before the RO
+        // lower image mount (<tempDir>/lower) that the overlay stacks on — a
+        // pure findmnt-order reverse doesn't guarantee overlay-before-lower.
+        // Longest target path first naturally orders bind-mounts → overlay →
+        // lower → loop image.
+        const ordered = [...new Set(ownedMounts)].sort(
+            (a, b) => b.length - a.length
+        );
+        for (const mount of ordered) {
             umountSafe(mount);
         }
 

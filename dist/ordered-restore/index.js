@@ -92484,6 +92484,13 @@ class LoopContainer extends Container_1.Container {
         this.saveAborted = false;
         /** True if the current mount is read-only. */
         this.mountIsReadOnly = false;
+        /**
+         * True when the workspace is an overlayfs (RO WORM image lower + RW upper)
+         * rather than a directly-mounted RW image — the no-copy node-local fast
+         * path. The overlay is teardown-only (consumer never saves back), and the
+         * lower RO image mount must be unmounted alongside the overlay.
+         */
+        this.usingOverlay = false;
         /** Per-run temp dir used as CWD for all exec calls. */
         this.safeCwd = "";
         if (!options.fsSize) {
@@ -92590,7 +92597,7 @@ class LoopContainer extends Container_1.Container {
                 this.logInfo(`Node-local exact hit — mounting from ${localPath}`);
                 try {
                     if (this.mountMode === "rw") {
-                        yield this.copyAndMountReadWrite(localPath);
+                        yield this.overlayMountReadWrite(localPath);
                     }
                     else {
                         yield this.mountImageReadOnly(localPath);
@@ -92611,8 +92618,8 @@ class LoopContainer extends Container_1.Container {
                 const closestMatch = yield this.nodeLocal.findClosestMatch(restoreKeys);
                 if (closestMatch) {
                     try {
-                        this.logInfo(`Node-local partial hit — copying ${path.basename(closestMatch)} for RW augmentation`);
-                        yield this.copyAndMountReadWrite(closestMatch);
+                        this.logInfo(`Node-local partial hit — overlay RW on ${path.basename(closestMatch)} (no copy)`);
+                        yield this.overlayMountReadWrite(closestMatch);
                         this.restoredFromNodeLocal = true;
                         this.restoreSource = (yield this.nodeLocal.isPrewarmed(closestMatch))
                             ? "prewarmed"
@@ -92696,6 +92703,11 @@ class LoopContainer extends Container_1.Container {
             }
             if (!this.mountPoint) {
                 this.logInfo("Mount point not discovered — skipping save");
+                return;
+            }
+            if (this.usingOverlay) {
+                this.logInfo("Skipping save — workspace is an overlay on a node-local WORM " +
+                    "image (consumer restore; nothing to persist back to S3)");
                 return;
             }
             if (this.mountIsReadOnly) {
@@ -92846,6 +92858,88 @@ class LoopContainer extends Container_1.Container {
             catch (error) {
                 yield this.image.cleanupLoopDevices(this.image.getImageFile());
                 throw new Error(`Failed to mount ${this.fsDisplayName} filesystem: ${error instanceof Error ? error.message : error}`);
+            }
+        });
+    }
+    /**
+     * Mount a node-local WORM image for RW use WITHOUT copying the whole image.
+     *
+     * The previous approach (copyAndMountReadWrite) copied the entire ~13.5 GB
+     * of real data from the node-local WORM image to a per-job RW image before
+     * mounting (3+ minutes on ext4-backed runners — the dominant cost of the
+     * "Workspace cache setup" step). That copy existed only to give the job (a)
+     * an isolated writable view and (b) a unique loop-mount so a sibling runner
+     * on the same node doesn't conflict — NOT to save back (node-local restores
+     * set restoredFromNodeLocal → shouldSkipS3Upload() is true, so nothing is
+     * ever uploaded from a consumer).
+     *
+     * overlayfs gives both for free, instantly:
+     *   - lowerdir  = the WORM image mounted READ-ONLY (shared, immutable; a RO
+     *     mount needs no UUID randomization — multiple runners can RO-mount the
+     *     same image, and xfs `nouuid` covers the duplicate-UUID case);
+     *   - upperdir + workdir = on the host temp fs (ext4), which has the real
+     *     free space for checkout deltas / build artifacts — replacing the old
+     *     filesystem-headroom grow entirely;
+     *   - the merged overlay is mounted at the workspace mount point and the
+     *     paths are bind-mounted exactly as before.
+     *
+     * This is the authoritative node-local RW path — there is intentionally NO
+     * copy fallback. overlayfs is a kernel builtin on every runner (the cache
+     * itself depends on loop + the fs module), so a failure here is a real fault
+     * that must surface RED, not be silently papered over by a 3-minute copy.
+     */
+    overlayMountReadWrite(imageFile) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
+            const lower = path.join(tempDir, "lower"); // RO WORM image mount
+            const upper = path.join(tempDir, "upper"); // RW deltas (host fs)
+            const work = path.join(tempDir, "work"); // overlay workdir (host fs)
+            const merged = path.join(tempDir, "mount"); // merged view = workspace
+            try {
+                yield fs.mkdir(lower, { recursive: true });
+                yield fs.mkdir(upper, { recursive: true });
+                yield fs.mkdir(work, { recursive: true });
+                yield fs.mkdir(merged, { recursive: true });
+                // 1. Mount the WORM image READ-ONLY as the overlay lower layer. No
+                //    copy, no UUID randomize — RO + fs-specific ro options (xfs:
+                //    norecovery,nouuid) make concurrent RO mounts of the shared
+                //    image safe.
+                this.image.setImageFile(imageFile);
+                yield this.image.mountRO(lower);
+                // 2. Mount the overlay: RO lower + RW upper, merged at the workspace
+                //    mount point. Writes land in `upper` on the host fs (which has
+                //    the free space), the WORM image stays pristine.
+                this.logInfo(`Overlay RW mount (no copy): lower=${imageFile} (ro) upper=${upper}`);
+                yield this.execSudo("mount", [
+                    "-t",
+                    "overlay",
+                    "overlay",
+                    "-o",
+                    `lowerdir=${lower},upperdir=${upper},workdir=${work}`,
+                    merged
+                ]);
+                this.mountPoint = merged;
+                this.usingOverlay = true;
+                this.overlayLowerMount = lower;
+                // No rawImageFile to persist (consumer never saves), and no
+                // expand-for-headroom: the upperdir already has the host's free
+                // space. Bind the cached paths onto the workspace from the merged
+                // overlay.
+                yield this.bindMountPaths(false);
+            }
+            catch (error) {
+                // No copy fallback — a failed overlay is a real fault that must go
+                // RED. Best-effort teardown of any partial overlay/lower mount so we
+                // don't leak a mount, then rethrow.
+                try {
+                    yield this.image.unmount(lower);
+                }
+                catch (_a) {
+                    /* ignore */
+                }
+                this.usingOverlay = false;
+                this.overlayLowerMount = undefined;
+                throw new Error(`Overlay RW mount failed for node-local image ${imageFile}: ${error instanceof Error ? error.message : error}`);
             }
         });
     }
