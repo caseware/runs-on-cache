@@ -30,6 +30,13 @@ export abstract class LoopContainer extends Container {
     protected mountPoint: string | undefined;
     protected readonly fsSize: string;
     protected readonly mountMode: "ro" | "rw";
+    /**
+     * When true, save() produces a consistent image WITHOUT unmounting the
+     * workspace (freeze → verify → compress → unfreeze, leaving the fs mounted).
+     * Used by the explicit producer save step so later composite POST-steps that
+     * re-read actions from the (bind-mounted) workspace don't lose their files.
+     */
+    protected readonly skipUnmount: boolean;
 
     /**
      * Path to the (uncompressed) image that is actually loop-mounted.
@@ -72,6 +79,7 @@ export abstract class LoopContainer extends Container {
 
         this.fsSize = options.fsSize;
         this.mountMode = options.mountMode || "rw";
+        this.skipUnmount = options.skipUnmount ?? false;
         this.rawImageFile = containerFile;
 
         this.checkPathTraversal(this.baseDir, this.containerFile);
@@ -333,24 +341,68 @@ export abstract class LoopContainer extends Container {
         // fs-specific prepare (btrfs: defrag/resize/truncate; xfs: sync)
         await this.image.prepareSave(this.mountPoint);
 
-        // Unmount all bind mounts + main mount
-        await this.unmountAll();
+        if (this.skipUnmount) {
+            await this.saveWhileFrozen();
+        } else {
+            // Unmount all bind mounts + main mount
+            await this.unmountAll();
 
-        // Verify image is mountable before upload
-        const ok = await this.image.verifyMountable();
-        if (!ok) {
-            this.saveAborted = true;
-            throw new Error(
-                `${this.fsDisplayName} verification failed — aborting save to prevent cache poisoning`
-            );
+            // Verify image is mountable before upload
+            const ok = await this.image.verifyMountable();
+            if (!ok) {
+                this.saveAborted = true;
+                throw new Error(
+                    `${this.fsDisplayName} verification failed — aborting save to prevent cache poisoning`
+                );
+            }
+
+            // fs-specific finalize (btrfs: no-op; xfs: zstd-compress to artifact)
+            await this.finalizeSaveArtifact();
         }
-
-        // fs-specific finalize (btrfs: no-op; xfs: zstd-compress to artifact)
-        await this.finalizeSaveArtifact();
 
         this.logDebug(
             `Save completed. Artifact ready for upload: ${this.containerFile}`
         );
+    }
+
+    /**
+     * Skip-unmount save: produce a crash-consistent image WITHOUT unmounting
+     * the workspace bind mount / loop device.
+     *
+     * The workspace cache is bind-mounted onto the GitHub workspace root; the
+     * explicit producer save must NOT yank that out from under later composite
+     * POST-steps (which re-read local actions from the workspace). So instead of
+     * unmounting we FREEZE the filesystem (quiesce all in-flight writes →
+     * crash-consistent on-disk state), then verify + compress the now-quiesced
+     * backing file, then UNFREEZE — always leaving the fs mounted. The single
+     * real unmount is performed later by the main action's restore post-step.
+     */
+    protected async saveWhileFrozen(): Promise<void> {
+        if (!this.mountPoint) {
+            throw new Error("Mount point is not set");
+        }
+
+        this.logInfo(
+            "skip-unmount: freezing filesystem for a crash-consistent image (workspace stays mounted)"
+        );
+        await this.image.freeze(this.mountPoint);
+        try {
+            // Verify the (frozen, quiesced) backing file is structurally sound.
+            // xfs: offline xfs_db -r read — safe while frozen, no in-flight writes.
+            const ok = await this.image.verifyMountable();
+            if (!ok) {
+                this.saveAborted = true;
+                throw new Error(
+                    `${this.fsDisplayName} verification failed — aborting save to prevent cache poisoning`
+                );
+            }
+
+            // fs-specific finalize (btrfs: no-op; xfs: zstd-compress to artifact)
+            await this.finalizeSaveArtifact();
+        } finally {
+            // Never leave the fs frozen, even on error; ignore unfreeze errors.
+            await this.image.unfreeze(this.mountPoint);
+        }
     }
 
     shouldSkipS3Upload(): boolean {

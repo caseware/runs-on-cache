@@ -91,6 +91,17 @@ inputs:
           The image is shared across all jobs on the same node (WORM pattern).
     default: 'rw'
     required: false
+  skip-unmount:
+    description: |
+      Image backends (btrfs/xfs) only. When 'true', the save path produces a
+      crash-consistent image WITHOUT unmounting the workspace: it freezes the
+      filesystem (fsfreeze), verifies + zstd-compresses the quiesced backing
+      file, then unfreezes, leaving the bind-mounted workspace mounted. Use for an
+      explicit producer save when later composite POST-steps still need the
+      workspace; the single real unmount is performed by the main action's
+      restore post-step. Default 'false' (unmount-on-save, unchanged behaviour).
+    default: 'false'
+    required: false
 outputs:
   cache-hit:
     description: 'A boolean value to indicate an exact match was found for the primary key'

@@ -112,6 +112,7 @@ export async function restoreCache(
     const saveCompressionLevel = core.getInput(Inputs.SaveCompressionLevel) || undefined;
     const nodeLocalCacheDir = core.getInput(Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
     const mountMode = (core.getInput(Inputs.MountMode) || "rw") as "ro" | "rw";
+    const skipUnmount = (core.getInput(Inputs.SkipUnmount) || "false") === "true";
     let cacheContainer: Container | undefined = undefined;
     try {
         const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
@@ -128,8 +129,8 @@ export async function restoreCache(
             archivePath, 
             baseDir, 
             paths, 
-            primaryKey, 
-            { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode }
+            primaryKey,
+            { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode, skipUnmount }
         );
 
         // Initialize container (prerequisite checks, stale temp cleanup)
@@ -381,6 +382,7 @@ export async function saveCache(
         const saveCompressionLevel = core.getInput(Inputs.SaveCompressionLevel) || undefined;
         const nodeLocalCacheDir = core.getInput(Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
         const mountMode = (core.getInput(Inputs.MountMode) || "rw") as "ro" | "rw";
+        const skipUnmount = (core.getInput(Inputs.SkipUnmount) || "false") === "true";
         const cacheContainer = ContainerFactory.getCacheContainer(
             customCompression, 
             customCompressionLevel,
@@ -388,7 +390,7 @@ export async function saveCache(
             baseDir, 
             paths, 
             key,
-            { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode }
+            { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode, skipUnmount }
         );
 
         await cacheContainer.initialize();
