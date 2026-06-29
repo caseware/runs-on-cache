@@ -15,6 +15,7 @@
  */
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -569,18 +570,29 @@ export abstract class LoopContainer extends Container {
         const lower = path.join(tempDir, "lower"); // RO WORM image mount
         const merged = path.join(tempDir, "mount"); // merged view = workspace
 
-        // CRITICAL: overlayfs refuses an upperdir/workdir that is itself on an
+        // CRITICAL #1: overlayfs refuses an upperdir/workdir that is itself on an
         // overlay filesystem (kernel: "filesystem on '...' not supported as
         // upperdir" → mount exit 32). On k8s the per-run temp dir
         // ($RUNNER_TEMP = /home/runner/_work/_temp) IS the pod's overlay rootfs,
         // so upper/work MUST live on a NON-overlay fs. The node-local dir
         // (parent of the WORM image — a hostPath on k8s, the persistent disk on
-        // EC2 — real xfs/ext4) is exactly that. Put upper+work there in a
-        // per-job subdir so concurrent runners on the same node don't collide.
-        // upperdir + workdir must be on the SAME fs (they are — both here).
+        // EC2 — real xfs/ext4) is exactly that.
+        //
+        // CRITICAL #2: the overlay base dir must be UNIQUE PER JOB, not per cache
+        // key. The node-local dir persists across jobs on a node (hostPath /
+        // reused-runner disk), and overlayfs refuses a workdir that another
+        // overlay already used or that is non-empty ("workdir is in-use ..." →
+        // exit 32 with "wrong fs type, bad option, bad superblock"). Using a
+        // cache-key-derived name (the $RUNNER_TEMP basename is per-key,
+        // deterministic) collided run-over-run on the same node. A random
+        // per-invocation suffix gives each job its own clean upper/work; both are
+        // on the same fs (required) and removed on teardown / stale-swept.
         const nodeLocalDir = path.dirname(imageFile);
-        const jobTag = path.basename(tempDir);
-        const overlayBase = path.join(nodeLocalDir, `.overlay-${jobTag}`);
+        const safeKey = this.cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, "_");
+        const overlayBase = path.join(
+            nodeLocalDir,
+            `.overlay-${safeKey}-${crypto.randomBytes(6).toString("hex")}`
+        );
         const upper = path.join(overlayBase, "upper"); // RW deltas (node-local fs)
         const work = path.join(overlayBase, "work"); // overlay workdir (same fs)
         this.overlayBaseDir = overlayBase;
