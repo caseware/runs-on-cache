@@ -8,7 +8,6 @@ export interface ContainerOptions {
     saveCompressionLevel?: string;
     nodeLocalCacheDir?: string;
     mountMode?: "ro" | "rw";
-    skipUnmount?: boolean;
 }
 
 export abstract class Container {

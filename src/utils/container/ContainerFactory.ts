@@ -11,7 +11,6 @@ export interface ContainerFactoryOptions {
     saveCompressionLevel?: string;
     nodeLocalCacheDir?: string;
     mountMode?: "ro" | "rw";
-    skipUnmount?: boolean;
 }
 
 type Instances = {

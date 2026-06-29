@@ -306,54 +306,6 @@ export abstract class LoopImage {
         }
     }
 
-    /**
-     * Freeze the mounted filesystem at `mountPoint` so its backing file is
-     * crash-consistent while it stays mounted (used by the skip-unmount save).
-     *
-     * Default: the generic `fsfreeze -f` binary, which works on xfs, btrfs and
-     * any other fs implementing freeze. If freeze is unsupported / fails we do
-     * NOT abort — we WARN and fall back to a plain `sync` (still better than
-     * nothing) and leave the fs mounted. Subclasses may override.
-     */
-    async freeze(mountPoint: string): Promise<void> {
-        try {
-            await sudoExec("fsfreeze", ["-f", mountPoint], this.safeCwd);
-            this.info(`Froze filesystem at ${mountPoint}`);
-        } catch (error) {
-            core.warning(
-                `${this.logPrefix} fsfreeze -f failed for ${mountPoint} (${
-                    error instanceof Error ? error.message : error
-                }) — falling back to sync (image may be only sync-consistent, not frozen)`
-            );
-            try {
-                await exec.exec("sync", [], {
-                    cwd: this.safeCwd,
-                    silent: !core.isDebug()
-                });
-            } catch {
-                /* best-effort */
-            }
-        }
-    }
-
-    /**
-     * Unfreeze a previously frozen filesystem. Best-effort: ignore errors (a
-     * fall-back-to-sync freeze never actually froze, so unfreeze will error —
-     * that's fine). MUST be called in a finally so the fs is never left frozen.
-     */
-    async unfreeze(mountPoint: string): Promise<void> {
-        try {
-            await sudoExec("fsfreeze", ["-u", mountPoint], this.safeCwd);
-            this.info(`Unfroze filesystem at ${mountPoint}`);
-        } catch (error) {
-            core.debug(
-                `${this.logPrefix} fsfreeze -u for ${mountPoint} failed (ignored): ${
-                    error instanceof Error ? error.message : error
-                }`
-            );
-        }
-    }
-
     async umountSafe(target: string): Promise<void> {
         try {
             await sudoExec("umount", [target], this.safeCwd);

@@ -95112,8 +95112,7 @@ var Inputs;
     Inputs["NodeLocalCacheDir"] = "node-local-cache-dir";
     Inputs["MountMode"] = "mount-mode";
     Inputs["FailOnSaveError"] = "fail-on-save-error";
-    Inputs["CleanupNodeLocal"] = "cleanup-node-local";
-    Inputs["SkipUnmount"] = "skip-unmount"; // Input for the save path: compress+upload a frozen image WITHOUT unmounting the workspace (explicit producer save)
+    Inputs["CleanupNodeLocal"] = "cleanup-node-local"; // Input for node-local image cleanup policy: "none" | "stale" (default) | "always"
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {
@@ -95538,14 +95537,13 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
         const saveCompressionLevel = core.getInput(constants_1.Inputs.SaveCompressionLevel) || undefined;
         const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
         const mountMode = (core.getInput(constants_1.Inputs.MountMode) || "rw");
-        const skipUnmount = (core.getInput(constants_1.Inputs.SkipUnmount) || "false") === "true";
         let cacheContainer = undefined;
         try {
             const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
             core.debug(`Using baseDir: ${baseDir}`);
             archivePath = path.join(yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(primaryKey), (0, actionUtils_1.getCacheFileName)(compressionMethod));
             core.debug(`Archive Path: ${archivePath}`);
-            cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode, skipUnmount });
+            cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode });
             // Initialize container (prerequisite checks, stale temp cleanup)
             yield cacheContainer.initialize();
             // Try node-local restore first (fast path: ~1-2s on warm node)
@@ -95742,8 +95740,7 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
             const saveCompressionLevel = core.getInput(constants_1.Inputs.SaveCompressionLevel) || undefined;
             const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
             const mountMode = (core.getInput(constants_1.Inputs.MountMode) || "rw");
-            const skipUnmount = (core.getInput(constants_1.Inputs.SkipUnmount) || "false") === "true";
-            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, key, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode, skipUnmount });
+            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, key, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode });
             yield cacheContainer.initialize();
             yield cacheContainer.save();
             // After save, persist to node-local if enabled (so subsequent runs on this node get a hit)
@@ -97258,7 +97255,6 @@ const actionUtils_1 = __nccwpck_require__(6850);
 const Container_1 = __nccwpck_require__(9620);
 class LoopContainer extends Container_1.Container {
     constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
-        var _a;
         super(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options);
         this.requiresCreateEmptyCache = true;
         this.requiresKeepArchive = true;
@@ -97273,7 +97269,6 @@ class LoopContainer extends Container_1.Container {
         }
         this.fsSize = options.fsSize;
         this.mountMode = options.mountMode || "rw";
-        this.skipUnmount = (_a = options.skipUnmount) !== null && _a !== void 0 ? _a : false;
         this.rawImageFile = containerFile;
         this.checkPathTraversal(this.baseDir, this.containerFile);
         this.pathsToCache.forEach(p => this.checkPathTraversal(this.baseDir, p));
@@ -97487,57 +97482,61 @@ class LoopContainer extends Container_1.Container {
             }
             // fs-specific prepare (btrfs: defrag/resize/truncate; xfs: sync)
             yield this.image.prepareSave(this.mountPoint);
-            if (this.skipUnmount) {
-                yield this.saveWhileFrozen();
+            // Unmount all bind mounts + main mount. Only a real unmount produces a
+            // self-consistent on-disk image — freezing a still-mounted fs does NOT
+            // (xfs_repair reports agi_freecount/sb_ifree mismatches and the kernel
+            // hits finobt corruption → fs shutdown → EIO on restore), so unmount is
+            // the ONLY save path.
+            yield this.unmountAll();
+            // Verify image is mountable before upload
+            const ok = yield this.image.verifyMountable();
+            if (!ok) {
+                this.saveAborted = true;
+                throw new Error(`${this.fsDisplayName} verification failed — aborting save to prevent cache poisoning`);
             }
-            else {
-                // Unmount all bind mounts + main mount
-                yield this.unmountAll();
-                // Verify image is mountable before upload
-                const ok = yield this.image.verifyMountable();
-                if (!ok) {
-                    this.saveAborted = true;
-                    throw new Error(`${this.fsDisplayName} verification failed — aborting save to prevent cache poisoning`);
-                }
-                // fs-specific finalize (btrfs: no-op; xfs: zstd-compress to artifact)
-                yield this.finalizeSaveArtifact();
-            }
+            // fs-specific finalize (btrfs: no-op; xfs: zstd-compress to artifact).
+            // For xfs this reads (does not consume) rawImageFile, so the raw image
+            // survives for the read-only remount below.
+            yield this.finalizeSaveArtifact();
             this.logDebug(`Save completed. Artifact ready for upload: ${this.containerFile}`);
+            // The image is now consistent on disk and the artifact is ready for
+            // upload. The cache was bind-mounted on the GitHub workspace root, and
+            // unmounting it leaves later composite POST-steps unable to re-read
+            // local actions from the workspace. Remount the (just-unmounted,
+            // consistent) raw image READ-ONLY and re-establish the workspace binds
+            // so those files are present again. This is best-effort — the artifact
+            // is already saved, so a remount failure must NOT fail the save.
+            yield this.remountReadOnlyForPostSteps();
         });
     }
     /**
-     * Skip-unmount save: produce a crash-consistent image WITHOUT unmounting
-     * the workspace bind mount / loop device.
+     * After a successful save (image unmounted + verified + artifact finalized),
+     * remount the RAW image READ-ONLY at the workspace so later composite
+     * POST-steps can still read local actions from `$GITHUB_WORKSPACE`.
      *
-     * The workspace cache is bind-mounted onto the GitHub workspace root; the
-     * explicit producer save must NOT yank that out from under later composite
-     * POST-steps (which re-read local actions from the workspace). So instead of
-     * unmounting we FREEZE the filesystem (quiesce all in-flight writes →
-     * crash-consistent on-disk state), then verify + compress the now-quiesced
-     * backing file, then UNFREEZE — always leaving the fs mounted. The single
-     * real unmount is performed later by the main action's restore post-step.
+     * We mount the RAW image that was just verified (xfs: rawImageFile, which
+     * survives finalizeSaveArtifact because zstd compression reads it without
+     * removing it; btrfs: containerFile IS the raw image). We deliberately do
+     * NOT mount the compressed artifact.
+     *
+     * A read-only mount can never corrupt the image, and the post-step cleanup
+     * (BtrfsCleanup scopedCleanup, fs-agnostic) unmounts it at job end. Any
+     * failure here is logged and swallowed — the artifact is already uploaded.
      */
-    saveWhileFrozen() {
+    remountReadOnlyForPostSteps() {
         return __awaiter(this, void 0, void 0, function* () {
-            if (!this.mountPoint) {
-                throw new Error("Mount point is not set");
-            }
-            this.logInfo("skip-unmount: freezing filesystem for a crash-consistent image (workspace stays mounted)");
-            yield this.image.freeze(this.mountPoint);
             try {
-                // Verify the (frozen, quiesced) backing file is structurally sound.
-                // xfs: offline xfs_db -r read — safe while frozen, no in-flight writes.
-                const ok = yield this.image.verifyMountable();
-                if (!ok) {
-                    this.saveAborted = true;
-                    throw new Error(`${this.fsDisplayName} verification failed — aborting save to prevent cache poisoning`);
-                }
-                // fs-specific finalize (btrfs: no-op; xfs: zstd-compress to artifact)
-                yield this.finalizeSaveArtifact();
+                this.logInfo("Remounting saved image read-only so post-steps can read the workspace");
+                yield this.mountImageReadOnly(this.rawImageFile);
+                // mountImageReadOnly may set mountIsReadOnly=true (bind-to-existing
+                // branch). That flag gates shouldSkipS3Upload(), which cache.ts
+                // consults AFTER save() returns — a true here would wrongly skip the
+                // upload of the artifact we just produced. The save already
+                // succeeded and the image is consistent, so reset it.
+                this.mountIsReadOnly = false;
             }
-            finally {
-                // Never leave the fs frozen, even on error; ignore unfreeze errors.
-                yield this.image.unfreeze(this.mountPoint);
+            catch (error) {
+                core.warning(`${this.getLogPrefix()} Read-only remount for post-steps failed (non-fatal, image already saved): ${error instanceof Error ? error.message : error}`);
             }
         });
     }
@@ -98152,51 +98151,6 @@ class LoopImage {
             }
             catch (error) {
                 core.debug(`Cleanup mount point failed (non-critical): ${error}`);
-            }
-        });
-    }
-    /**
-     * Freeze the mounted filesystem at `mountPoint` so its backing file is
-     * crash-consistent while it stays mounted (used by the skip-unmount save).
-     *
-     * Default: the generic `fsfreeze -f` binary, which works on xfs, btrfs and
-     * any other fs implementing freeze. If freeze is unsupported / fails we do
-     * NOT abort — we WARN and fall back to a plain `sync` (still better than
-     * nothing) and leave the fs mounted. Subclasses may override.
-     */
-    freeze(mountPoint) {
-        return __awaiter(this, void 0, void 0, function* () {
-            try {
-                yield sudoExec("fsfreeze", ["-f", mountPoint], this.safeCwd);
-                this.info(`Froze filesystem at ${mountPoint}`);
-            }
-            catch (error) {
-                core.warning(`${this.logPrefix} fsfreeze -f failed for ${mountPoint} (${error instanceof Error ? error.message : error}) — falling back to sync (image may be only sync-consistent, not frozen)`);
-                try {
-                    yield exec.exec("sync", [], {
-                        cwd: this.safeCwd,
-                        silent: !core.isDebug()
-                    });
-                }
-                catch (_a) {
-                    /* best-effort */
-                }
-            }
-        });
-    }
-    /**
-     * Unfreeze a previously frozen filesystem. Best-effort: ignore errors (a
-     * fall-back-to-sync freeze never actually froze, so unfreeze will error —
-     * that's fine). MUST be called in a finally so the fs is never left frozen.
-     */
-    unfreeze(mountPoint) {
-        return __awaiter(this, void 0, void 0, function* () {
-            try {
-                yield sudoExec("fsfreeze", ["-u", mountPoint], this.safeCwd);
-                this.info(`Unfroze filesystem at ${mountPoint}`);
-            }
-            catch (error) {
-                core.debug(`${this.logPrefix} fsfreeze -u for ${mountPoint} failed (ignored): ${error instanceof Error ? error.message : error}`);
             }
         });
     }

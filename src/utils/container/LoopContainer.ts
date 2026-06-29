@@ -30,13 +30,6 @@ export abstract class LoopContainer extends Container {
     protected mountPoint: string | undefined;
     protected readonly fsSize: string;
     protected readonly mountMode: "ro" | "rw";
-    /**
-     * When true, save() produces a consistent image WITHOUT unmounting the
-     * workspace (freeze → verify → compress → unfreeze, leaving the fs mounted).
-     * Used by the explicit producer save step so later composite POST-steps that
-     * re-read actions from the (bind-mounted) workspace don't lose their files.
-     */
-    protected readonly skipUnmount: boolean;
 
     /**
      * Path to the (uncompressed) image that is actually loop-mounted.
@@ -79,7 +72,6 @@ export abstract class LoopContainer extends Container {
 
         this.fsSize = options.fsSize;
         this.mountMode = options.mountMode || "rw";
-        this.skipUnmount = options.skipUnmount ?? false;
         this.rawImageFile = containerFile;
 
         this.checkPathTraversal(this.baseDir, this.containerFile);
@@ -340,67 +332,73 @@ export abstract class LoopContainer extends Container {
         // fs-specific prepare (btrfs: defrag/resize/truncate; xfs: sync)
         await this.image.prepareSave(this.mountPoint);
 
-        if (this.skipUnmount) {
-            await this.saveWhileFrozen();
-        } else {
-            // Unmount all bind mounts + main mount
-            await this.unmountAll();
+        // Unmount all bind mounts + main mount. Only a real unmount produces a
+        // self-consistent on-disk image — freezing a still-mounted fs does NOT
+        // (xfs_repair reports agi_freecount/sb_ifree mismatches and the kernel
+        // hits finobt corruption → fs shutdown → EIO on restore), so unmount is
+        // the ONLY save path.
+        await this.unmountAll();
 
-            // Verify image is mountable before upload
-            const ok = await this.image.verifyMountable();
-            if (!ok) {
-                this.saveAborted = true;
-                throw new Error(
-                    `${this.fsDisplayName} verification failed — aborting save to prevent cache poisoning`
-                );
-            }
-
-            // fs-specific finalize (btrfs: no-op; xfs: zstd-compress to artifact)
-            await this.finalizeSaveArtifact();
+        // Verify image is mountable before upload
+        const ok = await this.image.verifyMountable();
+        if (!ok) {
+            this.saveAborted = true;
+            throw new Error(
+                `${this.fsDisplayName} verification failed — aborting save to prevent cache poisoning`
+            );
         }
+
+        // fs-specific finalize (btrfs: no-op; xfs: zstd-compress to artifact).
+        // For xfs this reads (does not consume) rawImageFile, so the raw image
+        // survives for the read-only remount below.
+        await this.finalizeSaveArtifact();
 
         this.logDebug(
             `Save completed. Artifact ready for upload: ${this.containerFile}`
         );
+
+        // The image is now consistent on disk and the artifact is ready for
+        // upload. The cache was bind-mounted on the GitHub workspace root, and
+        // unmounting it leaves later composite POST-steps unable to re-read
+        // local actions from the workspace. Remount the (just-unmounted,
+        // consistent) raw image READ-ONLY and re-establish the workspace binds
+        // so those files are present again. This is best-effort — the artifact
+        // is already saved, so a remount failure must NOT fail the save.
+        await this.remountReadOnlyForPostSteps();
     }
 
     /**
-     * Skip-unmount save: produce a crash-consistent image WITHOUT unmounting
-     * the workspace bind mount / loop device.
+     * After a successful save (image unmounted + verified + artifact finalized),
+     * remount the RAW image READ-ONLY at the workspace so later composite
+     * POST-steps can still read local actions from `$GITHUB_WORKSPACE`.
      *
-     * The workspace cache is bind-mounted onto the GitHub workspace root; the
-     * explicit producer save must NOT yank that out from under later composite
-     * POST-steps (which re-read local actions from the workspace). So instead of
-     * unmounting we FREEZE the filesystem (quiesce all in-flight writes →
-     * crash-consistent on-disk state), then verify + compress the now-quiesced
-     * backing file, then UNFREEZE — always leaving the fs mounted. The single
-     * real unmount is performed later by the main action's restore post-step.
+     * We mount the RAW image that was just verified (xfs: rawImageFile, which
+     * survives finalizeSaveArtifact because zstd compression reads it without
+     * removing it; btrfs: containerFile IS the raw image). We deliberately do
+     * NOT mount the compressed artifact.
+     *
+     * A read-only mount can never corrupt the image, and the post-step cleanup
+     * (BtrfsCleanup scopedCleanup, fs-agnostic) unmounts it at job end. Any
+     * failure here is logged and swallowed — the artifact is already uploaded.
      */
-    protected async saveWhileFrozen(): Promise<void> {
-        if (!this.mountPoint) {
-            throw new Error("Mount point is not set");
-        }
-
-        this.logInfo(
-            "skip-unmount: freezing filesystem for a crash-consistent image (workspace stays mounted)"
-        );
-        await this.image.freeze(this.mountPoint);
+    protected async remountReadOnlyForPostSteps(): Promise<void> {
         try {
-            // Verify the (frozen, quiesced) backing file is structurally sound.
-            // xfs: offline xfs_db -r read — safe while frozen, no in-flight writes.
-            const ok = await this.image.verifyMountable();
-            if (!ok) {
-                this.saveAborted = true;
-                throw new Error(
-                    `${this.fsDisplayName} verification failed — aborting save to prevent cache poisoning`
-                );
-            }
-
-            // fs-specific finalize (btrfs: no-op; xfs: zstd-compress to artifact)
-            await this.finalizeSaveArtifact();
-        } finally {
-            // Never leave the fs frozen, even on error; ignore unfreeze errors.
-            await this.image.unfreeze(this.mountPoint);
+            this.logInfo(
+                "Remounting saved image read-only so post-steps can read the workspace"
+            );
+            await this.mountImageReadOnly(this.rawImageFile);
+            // mountImageReadOnly may set mountIsReadOnly=true (bind-to-existing
+            // branch). That flag gates shouldSkipS3Upload(), which cache.ts
+            // consults AFTER save() returns — a true here would wrongly skip the
+            // upload of the artifact we just produced. The save already
+            // succeeded and the image is consistent, so reset it.
+            this.mountIsReadOnly = false;
+        } catch (error) {
+            core.warning(
+                `${this.getLogPrefix()} Read-only remount for post-steps failed (non-fatal, image already saved): ${
+                    error instanceof Error ? error.message : error
+                }`
+            );
         }
     }
 
