@@ -63,8 +63,16 @@ export class XfsImage extends LoopImage {
     }
 
     // NOTE: no compress= option — XFS has no transparent compression.
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     protected mountOptions(mode: "ro" | "rw"): string[] {
+        if (mode === "ro") {
+            // A read-only mount cannot replay an XFS log, so an image with any
+            // unclean log fails to mount (exit 32). `norecovery` mounts it
+            // read-only without log replay (safe — the post-step RO remount
+            // only needs to READ the workspace files). `nouuid` avoids the
+            // "duplicate UUID" rejection when the same image/UUID may already
+            // be (or have just been) attached on this host.
+            return ["norecovery", "nouuid"];
+        }
         return [];
     }
 

@@ -97535,24 +97535,25 @@ class LoopContainer extends Container_1.Container {
      * NOT mount the compressed artifact.
      *
      * A read-only mount can never corrupt the image, and the post-step cleanup
-     * (BtrfsCleanup scopedCleanup, fs-agnostic) unmounts it at job end. Any
-     * failure here is logged and swallowed — the artifact is already uploaded.
+     * (BtrfsCleanup scopedCleanup, fs-agnostic) unmounts it at job end.
+     *
+     * FATAL on failure: leaving the workspace unmounted makes later composite
+     * POST-steps (which re-read local ./.github/actions from $GITHUB_WORKSPACE)
+     * fail with a confusing "Can't find action.yml" far from the cause.
+     * Throwing here surfaces the real reason at the right place. The S3 artifact
+     * is already uploaded, so this doesn't lose the cache — it correctly reports
+     * that the required workspace remount did not happen.
      */
     remountReadOnlyForPostSteps() {
         return __awaiter(this, void 0, void 0, function* () {
-            try {
-                this.logInfo("Remounting saved image read-only so post-steps can read the workspace");
-                yield this.mountImageReadOnly(this.rawImageFile);
-                // mountImageReadOnly may set mountIsReadOnly=true (bind-to-existing
-                // branch). That flag gates shouldSkipS3Upload(), which cache.ts
-                // consults AFTER save() returns — a true here would wrongly skip the
-                // upload of the artifact we just produced. The save already
-                // succeeded and the image is consistent, so reset it.
-                this.mountIsReadOnly = false;
-            }
-            catch (error) {
-                core.warning(`${this.getLogPrefix()} Read-only remount for post-steps failed (non-fatal, image already saved): ${error instanceof Error ? error.message : error}`);
-            }
+            this.logInfo("Remounting saved image read-only so post-steps can read the workspace");
+            yield this.mountImageReadOnly(this.rawImageFile);
+            // mountImageReadOnly may set mountIsReadOnly=true (bind-to-existing
+            // branch). That flag gates shouldSkipS3Upload(), which cache.ts
+            // consults AFTER save() returns — a true here would wrongly skip the
+            // upload of the artifact we just produced. The save already
+            // succeeded and the image is consistent, so reset it.
+            this.mountIsReadOnly = false;
         });
     }
     shouldSkipS3Upload() {
@@ -100031,8 +100032,16 @@ class XfsImage extends LoopImage_1.LoopImage {
         return "xfs";
     }
     // NOTE: no compress= option — XFS has no transparent compression.
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     mountOptions(mode) {
+        if (mode === "ro") {
+            // A read-only mount cannot replay an XFS log, so an image with any
+            // unclean log fails to mount (exit 32). `norecovery` mounts it
+            // read-only without log replay (safe — the post-step RO remount
+            // only needs to READ the workspace files). `nouuid` avoids the
+            // "duplicate UUID" rejection when the same image/UUID may already
+            // be (or have just been) attached on this host.
+            return ["norecovery", "nouuid"];
+        }
         return [];
     }
     growFilesystem(mountPoint) {

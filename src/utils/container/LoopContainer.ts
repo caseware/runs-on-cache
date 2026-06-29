@@ -378,28 +378,26 @@ export abstract class LoopContainer extends Container {
      * NOT mount the compressed artifact.
      *
      * A read-only mount can never corrupt the image, and the post-step cleanup
-     * (BtrfsCleanup scopedCleanup, fs-agnostic) unmounts it at job end. Any
-     * failure here is logged and swallowed — the artifact is already uploaded.
+     * (BtrfsCleanup scopedCleanup, fs-agnostic) unmounts it at job end.
+     *
+     * FATAL on failure: leaving the workspace unmounted makes later composite
+     * POST-steps (which re-read local ./.github/actions from $GITHUB_WORKSPACE)
+     * fail with a confusing "Can't find action.yml" far from the cause.
+     * Throwing here surfaces the real reason at the right place. The S3 artifact
+     * is already uploaded, so this doesn't lose the cache — it correctly reports
+     * that the required workspace remount did not happen.
      */
     protected async remountReadOnlyForPostSteps(): Promise<void> {
-        try {
-            this.logInfo(
-                "Remounting saved image read-only so post-steps can read the workspace"
-            );
-            await this.mountImageReadOnly(this.rawImageFile);
-            // mountImageReadOnly may set mountIsReadOnly=true (bind-to-existing
-            // branch). That flag gates shouldSkipS3Upload(), which cache.ts
-            // consults AFTER save() returns — a true here would wrongly skip the
-            // upload of the artifact we just produced. The save already
-            // succeeded and the image is consistent, so reset it.
-            this.mountIsReadOnly = false;
-        } catch (error) {
-            core.warning(
-                `${this.getLogPrefix()} Read-only remount for post-steps failed (non-fatal, image already saved): ${
-                    error instanceof Error ? error.message : error
-                }`
-            );
-        }
+        this.logInfo(
+            "Remounting saved image read-only so post-steps can read the workspace"
+        );
+        await this.mountImageReadOnly(this.rawImageFile);
+        // mountImageReadOnly may set mountIsReadOnly=true (bind-to-existing
+        // branch). That flag gates shouldSkipS3Upload(), which cache.ts
+        // consults AFTER save() returns — a true here would wrongly skip the
+        // upload of the artifact we just produced. The save already
+        // succeeded and the image is consistent, so reset it.
+        this.mountIsReadOnly = false;
     }
 
     shouldSkipS3Upload(): boolean {
