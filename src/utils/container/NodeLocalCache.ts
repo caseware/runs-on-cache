@@ -146,13 +146,6 @@ export class NodeLocalCache {
 
             // Atomic rename: .tempXXX → <cache-key>.ext
             await fs.rename(tempPath, finalPath);
-            // This image was just DOWNLOADED from S3 by a runner — it is NOT a
-            // DaemonSet-prestaged ("prewarmed") image. Remove any stale
-            // `.prewarmed` stamp left by a prior prestage so cache-source is
-            // reported as "node-local"/"s3", not mislabeled "prewarmed".
-            // (Only the cache-warmer/cache-transfer DaemonSet writes that stamp;
-            // isPrewarmed() keys off its presence.)
-            await this.removeSafe(`${finalPath}.prewarmed`);
             core.info(`[NodeLocal] Committed: ${finalPath}`);
             return true;
         } catch (error) {
