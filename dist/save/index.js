@@ -90852,7 +90852,16 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             }
             else {
                 // Supress all non-validation cache related errors because caching should be optional
-                core.warning(`Failed to restore: ${error.message}`);
+                core.error(`Failed to restore: ${error.message}`);
+                // Distinct provenance: a cache entry WAS found/downloaded but the
+                // restore/mount FAILED — this is NOT a benign miss ("cold-boot").
+                // Emit "restore-failed" so downstream metrics/alerting can page on
+                // this specific catastrophe (e.g. the ~7.5min "downloaded 25GB then
+                // overlay mount exit 32 -> empty fallback" case) separately from an
+                // expected cache miss. Also surface it as a GH Actions ::error:: so
+                // the failure is loud, not a swallowed warning.
+                core.setOutput(constants_1.Outputs.CacheSource, "restore-failed");
+                core.setOutput("restore-failed", "true");
                 // Fallback: create an empty BTRFS filesystem so the workspace
                 // still gets a mount and the save step can produce a new valid
                 // image (e.g. after a corrupted cache download).
@@ -90920,7 +90929,12 @@ function restoreCacheSync(paths, primaryKey, options) {
             }
             else {
                 // Supress all non-validation cache related errors because caching should be optional
-                core.warning(`Failed to restore: ${error.message}`);
+                // Distinct provenance (see the other restore catch above): a found
+                // entry that failed to restore is NOT a benign miss — emit
+                // "restore-failed" + a loud ::error:: for alerting.
+                core.error(`Failed to restore: ${error.message}`);
+                core.setOutput(constants_1.Outputs.CacheSource, "restore-failed");
+                core.setOutput("restore-failed", "true");
             }
         }
         return undefined;

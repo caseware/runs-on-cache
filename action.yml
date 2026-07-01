@@ -101,7 +101,9 @@ outputs:
   node-local-cache-hit:
     description: 'Whether the cache was restored from node-local storage: "true" (node-local hit), "false" (S3 fallback), or "disabled" (node-local not configured)'
   cache-source:
-    description: 'Precise provenance of the restored image: "prewarmed" (DaemonSet-prestaged node-local image), "node-local" (node-local image left by a prior runner), "s3" (downloaded from the S3 bucket), or "cold-boot" (no cache found)'
+    description: 'Precise provenance of the restored image: "prewarmed" (DaemonSet-prestaged node-local image), "node-local" (node-local image left by a prior runner), "s3" (downloaded from the S3 bucket), "cold-boot" (no cache found), or "restore-failed" (a cache entry WAS found but the restore/mount failed — distinct from a benign miss, for alerting on the download-then-fallback catastrophe)'
+  restore-failed:
+    description: 'Set to "true" when a cache entry was found but its restore/mount failed and an empty fallback image was created (a catastrophe distinct from a benign cache miss). Unset otherwise.'
 runs:
   using: 'node24'
   main: 'dist/restore/index.js'
