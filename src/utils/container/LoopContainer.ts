@@ -613,8 +613,17 @@ export abstract class LoopContainer extends Container {
             // 2. Mount the overlay: RO lower + RW upper, merged at the workspace
             //    mount point. Writes land in `upper` on the host fs (which has
             //    the free space), the WORM image stays pristine.
+            //
+            // `volatile`: the upper is ALWAYS throwaway here — every
+            // overlayMountReadWrite caller is a consumer (restoredFromNodeLocal),
+            // never saved/uploaded; producers use skip-restore, not this path.
+            // Without it, umount at job end force-syncs multi-GB of dirty upper
+            // pages to the instance disk (throttled by rq_qos_wait), adding up to
+            // ~2.5 min to teardown. volatile skips the sync barrier (pages
+            // discarded, not flushed) — upper stays on-disk, so no RAM cost.
+            // Verified on kernel 6.12.88: volatile umount = 0s vs ~2.5 min.
             this.logInfo(
-                `Overlay RW mount (no copy): lower=${imageFile} (ro) upper=${upper}`
+                `Overlay RW mount (no copy, volatile): lower=${imageFile} (ro) upper=${upper}`
             );
             // Capture stdout/stderr/exit so a mount failure surfaces the REAL
             // kernel reason (e.g. "wrong fs type", "failed to verify upper root
@@ -627,7 +636,7 @@ export abstract class LoopContainer extends Container {
                     "overlay",
                     "overlay",
                     "-o",
-                    `lowerdir=${lower},upperdir=${upper},workdir=${work}`,
+                    `lowerdir=${lower},upperdir=${upper},workdir=${work},volatile`,
                     merged
                 ],
                 { cwd: this.safeCwd, ignoreReturnCode: true }
