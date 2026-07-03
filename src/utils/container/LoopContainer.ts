@@ -343,9 +343,19 @@ export abstract class LoopContainer extends Container {
 
         if (this.usingOverlay) {
             this.logInfo(
-                "Skipping save — workspace is an overlay on a node-local WORM " +
-                    "image (consumer restore; nothing to persist back to S3)"
+                "Workspace is an overlay on a node-local WORM image (consumer " +
+                    "restore; nothing to persist to S3). Fast-dropping the upper."
             );
+            // PERF: do NOT leave the overlay for the pod/ARC teardown to reap.
+            // The RW upper dir accumulates a copy-up of the whole workspace
+            // (measured: 700k+ files for a full node_modules), and the ephemeral
+            // runner teardown deletes it file-by-file — ~1 min of unlink() on the
+            // critical path (blocks job.completed_at, holds the runner slot).
+            // The upper is pure throwaway, so instead: unmount the overlay +
+            // its RO lower, then ATOMICALLY RENAME the upper base dir out of the
+            // way (O(1), same-fs) into a ".trash-" sibling. The cache-warmer
+            // DaemonSet sweeps ".trash-*" asynchronously, off the critical path.
+            await this.fastDropOverlay();
             return;
         }
 
@@ -800,6 +810,70 @@ export abstract class LoopContainer extends Container {
             }
         });
         await Promise.all(promises);
+    }
+
+    // ── Overlay fast-drop ────────────────────────────────────────────
+
+    /**
+     * Tear down a consumer overlay WITHOUT the O(files) recursive delete of its
+     * RW upper. Unmounts the bind mounts + merged overlay + RO lower, then
+     * ATOMICALLY RENAMES the upper base dir to a ".trash-<rand>" sibling on the
+     * SAME node-local fs (O(1) regardless of file count). The cache-warmer
+     * DaemonSet sweeps ".trash-*" async, off the runner's critical path.
+     *
+     * Runs in the SAVE process, which is separate from restore — so the
+     * overlayBaseDir instance field may be unset. We re-derive the upper dir
+     * from the live overlay mount's `upperdir=` option via findmnt.
+     */
+    protected async fastDropOverlay(): Promise<void> {
+        // 1) Re-derive the overlay upper base dir from the live mount options.
+        let upperBase = this.overlayBaseDir;
+        if (!upperBase) {
+            try {
+                const out = await exec.getExecOutput(
+                    "findmnt",
+                    ["-t", "overlay", "-n", "-o", "OPTIONS", this.mountPoint!],
+                    { cwd: this.safeCwd, ignoreReturnCode: true, silent: !core.isDebug() }
+                );
+                const m = out.stdout.match(/upperdir=([^,\s]+)/);
+                if (m) {
+                    // overlayBase is the PARENT of the "upper" dir (…/.overlay-…/upper).
+                    upperBase = path.dirname(m[1]);
+                }
+            } catch (e) {
+                this.logInfo(`fastDropOverlay: could not resolve upperdir (${e}); leaving teardown to the pod`);
+            }
+        }
+
+        // 2) Unmount bind mounts + merged overlay + RO lower (best-effort).
+        try {
+            await this.unmountAll();
+        } catch (e) {
+            this.logInfo(`fastDropOverlay: unmountAll best-effort failed (${e})`);
+        }
+        if (this.overlayLowerMount) {
+            try {
+                await this.image.umountSafe(this.overlayLowerMount);
+            } catch {
+                /* ignore */
+            }
+        }
+
+        // 3) Atomic rename the upper base dir out of the way (O(1)). The DS
+        //    sweeps ".trash-*". If rename fails, fall back to nothing (the pod
+        //    teardown will still reap it — correctness preserved, just slow).
+        if (upperBase) {
+            const trash = path.join(
+                path.dirname(upperBase),
+                `.trash-${path.basename(upperBase)}-${crypto.randomBytes(4).toString("hex")}`
+            );
+            try {
+                await fs.rename(upperBase, trash);
+                this.logInfo(`fastDropOverlay: moved overlay upper aside for async sweep → ${trash}`);
+            } catch (e) {
+                this.logInfo(`fastDropOverlay: rename failed (${e}); pod teardown will reap the upper`);
+            }
+        }
     }
 
     // ── Unmount ──────────────────────────────────────────────────────
