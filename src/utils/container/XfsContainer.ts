@@ -78,16 +78,6 @@ export class XfsContainer extends LoopContainer {
         return this.xfsImage;
     }
 
-    protected newUpperImage(imageFile: string): LoopImage {
-        // A standalone xfs image for the overlay upper. Same fs family + mkfs
-        // tooling as the cache image, so no new prerequisites; mounted RW and
-        // dropped wholesale on teardown.
-        return new XfsImage(imageFile, {
-            rwUtilizationTarget: 0.8,
-            safeCwd: this.safeCwd
-        });
-    }
-
     protected get fsDisplayName(): string {
         return "XFS";
     }

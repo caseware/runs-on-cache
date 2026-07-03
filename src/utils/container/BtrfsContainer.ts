@@ -71,18 +71,6 @@ export class BtrfsContainer extends LoopContainer {
         return this.btrfsImage;
     }
 
-    protected newUpperImage(imageFile: string): LoopImage {
-        // Standalone btrfs image for the overlay upper (dropped wholesale on
-        // teardown). Same fs family + tooling as the cache image.
-        return new BtrfsImage(imageFile, {
-            compressionLevel: this.compressionLevel!,
-            saveCompressionLevel: this.compressionLevel!,
-            saveBufferBytes: 0,
-            rwUtilizationTarget: 0.8,
-            safeCwd: this.safeCwd
-        });
-    }
-
     protected get fsDisplayName(): string {
         return "BTRFS";
     }
