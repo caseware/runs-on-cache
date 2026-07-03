@@ -55,6 +55,17 @@ inputs:
     description: 'Filesystem size for btrfs format (e.g., 50G)'
     default: '50G'
     required: false
+  overlay-upper-size:
+    description: >-
+      Size (e.g. "4G") of the DEDICATED per-job ext4 loop image that backs a
+      consumer overlay''s RW upper. fallocate-FULL to this size up front so
+      copy-up writes never trigger host-fs allocation on the hot path; teardown
+      is then O(1) (unmount + delete one backing file frees all upper inodes).
+      Empty => plain-dir upper (slower O(files) teardown). Pass a fraction of
+      the runner''s ephemeral-storage (the image lives on the node-local
+      hostPath, which is shared across pods — size conservatively).
+    default: '4G'
+    required: false
   fs-buffer-mb:
     description: 'Additional buffer in MB beyond Device allocated for btrfs resize (e.g., 256). Smaller = tighter images = faster copies.'
     default: '256'

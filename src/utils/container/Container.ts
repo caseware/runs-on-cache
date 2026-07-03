@@ -8,6 +8,15 @@ export interface ContainerOptions {
     saveCompressionLevel?: string;
     nodeLocalCacheDir?: string;
     mountMode?: "ro" | "rw";
+    /**
+     * Human size (e.g. "4G") of the DEDICATED per-job ext4 loop image that
+     * backs a consumer overlay's RW upper. fallocate-FULL to this size up
+     * front so copy-up writes never trigger host-fs allocation on the hot path;
+     * unmount + delete the one backing file frees all upper inodes at teardown
+     * (O(1)). Undefined/empty => plain-dir upper fallback (slower teardown).
+     * Callers should pass a fraction of the runner's ephemeral-storage.
+     */
+    overlayUpperSize?: string;
 }
 
 export abstract class Container {
