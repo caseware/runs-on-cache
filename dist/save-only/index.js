@@ -108109,6 +108109,12 @@ class LoopContainer extends Container_1.Container {
         this.requiresKeepArchive = true;
         /** Set to true if save verification fails. */
         this.saveAborted = false;
+        /**
+         * True once a consumer overlay has been fast-dropped in save(). A consumer
+         * overlay produces no archive artifact, so the caller must skip the S3
+         * upload — otherwise it would stat/upload a non-existent archivePath.
+         */
+        this.overlayDropped = false;
         /** True if the current mount is read-only. */
         this.mountIsReadOnly = false;
         /**
@@ -108339,6 +108345,9 @@ class LoopContainer extends Container_1.Container {
                 this.logInfo("Workspace is a consumer overlay (nothing to persist to S3); " +
                     "dropping it O(1) instead of leaving the pod to reap the upper.");
                 yield this.dropOverlayFast();
+                // No archive is produced for a consumer overlay; signal the caller
+                // to skip the S3 upload (else it stats a non-existent archivePath).
+                this.overlayDropped = true;
                 return;
             }
             if (this.mountIsReadOnly) {
@@ -108407,7 +108416,7 @@ class LoopContainer extends Container_1.Container {
         });
     }
     shouldSkipS3Upload() {
-        return this.mountIsReadOnly || this.saveAborted;
+        return this.mountIsReadOnly || this.saveAborted || this.overlayDropped;
     }
     // ── Private: mount orchestration ─────────────────────────────────
     mountImageReadOnly(imageFile) {

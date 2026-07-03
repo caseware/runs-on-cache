@@ -41,6 +41,12 @@ export abstract class LoopContainer extends Container {
 
     /** Set to true if save verification fails. */
     protected saveAborted = false;
+    /**
+     * True once a consumer overlay has been fast-dropped in save(). A consumer
+     * overlay produces no archive artifact, so the caller must skip the S3
+     * upload — otherwise it would stat/upload a non-existent archivePath.
+     */
+    protected overlayDropped = false;
     /** True if the current mount is read-only. */
     protected mountIsReadOnly = false;
     /**
@@ -364,6 +370,9 @@ export abstract class LoopContainer extends Container {
                     "dropping it O(1) instead of leaving the pod to reap the upper."
             );
             await this.dropOverlayFast();
+            // No archive is produced for a consumer overlay; signal the caller
+            // to skip the S3 upload (else it stats a non-existent archivePath).
+            this.overlayDropped = true;
             return;
         }
 
@@ -446,7 +455,7 @@ export abstract class LoopContainer extends Container {
     }
 
     shouldSkipS3Upload(): boolean {
-        return this.mountIsReadOnly || this.saveAborted;
+        return this.mountIsReadOnly || this.saveAborted || this.overlayDropped;
     }
 
     // ── Private: mount orchestration ─────────────────────────────────
