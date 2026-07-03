@@ -41,6 +41,12 @@ export abstract class LoopContainer extends Container {
 
     /** Set to true if save verification fails. */
     protected saveAborted = false;
+    /**
+     * True once a consumer overlay has been fast-dropped in save(). A consumer
+     * overlay produces no archive artifact, so the caller must skip the S3
+     * upload — otherwise it would stat/upload a non-existent archivePath.
+     */
+    protected overlayDropped = false;
     /** True if the current mount is read-only. */
     protected mountIsReadOnly = false;
     /**
@@ -58,6 +64,15 @@ export abstract class LoopContainer extends Container {
      * node-local dir doesn't accumulate per-job RW deltas.
      */
     protected overlayBaseDir: string | undefined;
+    /**
+     * When set, the overlay upper+work live on a DEDICATED per-job xfs loop
+     * image mounted at overlayBaseDir (not a plain dir on the shared node-local
+     * fs). This makes teardown O(1): unmount the image + delete this one backing
+     * file frees all upper inodes with the filesystem, instead of unlink()ing
+     * the (up to ~700k) copied-up workspace files one by one on the runner's
+     * critical path. Undefined => plain-dir upper fallback (slower teardown).
+     */
+    protected overlayUpperImageFile: string | undefined;
     /** Per-run temp dir used as CWD for all exec calls. */
     protected safeCwd = "";
 
@@ -106,6 +121,14 @@ export abstract class LoopContainer extends Container {
     protected abstract findmntFsType(): string;
     /** Filename for the local RW copy of a WORM image, e.g. "cache.btrfs". */
     protected abstract localCopyName(): string;
+
+    /**
+     * Build a fresh LoopImage for a DEDICATED per-job overlay-upper filesystem
+     * (its own loop-backed image, distinct from the cache WORM image). Used only
+     * by the overlay RW path so the upper can be dropped in O(1) at teardown
+     * (unmount + delete one file) instead of a recursive per-file unlink.
+     */
+    protected abstract newUpperImage(imageFile: string): LoopImage;
 
     /**
      * Finalize the working-image path inside safeCwd during initialize().
@@ -343,9 +366,13 @@ export abstract class LoopContainer extends Container {
 
         if (this.usingOverlay) {
             this.logInfo(
-                "Skipping save — workspace is an overlay on a node-local WORM " +
-                    "image (consumer restore; nothing to persist back to S3)"
+                "Workspace is a consumer overlay (nothing to persist to S3); " +
+                    "dropping it O(1) instead of leaving the pod to reap the upper."
             );
+            await this.dropOverlayFast();
+            // No archive is produced for a consumer overlay; signal the caller
+            // to skip the S3 upload (else it stats a non-existent archivePath).
+            this.overlayDropped = true;
             return;
         }
 
@@ -428,7 +455,7 @@ export abstract class LoopContainer extends Container {
     }
 
     shouldSkipS3Upload(): boolean {
-        return this.mountIsReadOnly || this.saveAborted;
+        return this.mountIsReadOnly || this.saveAborted || this.overlayDropped;
     }
 
     // ── Private: mount orchestration ─────────────────────────────────
@@ -593,12 +620,50 @@ export abstract class LoopContainer extends Container {
             nodeLocalDir,
             `.overlay-${safeKey}-${crypto.randomBytes(6).toString("hex")}`
         );
-        const upper = path.join(overlayBase, "upper"); // RW deltas (node-local fs)
+        const upper = path.join(overlayBase, "upper"); // RW deltas
         const work = path.join(overlayBase, "work"); // overlay workdir (same fs)
         this.overlayBaseDir = overlayBase;
 
+        // PERF (teardown): back overlayBase (upper+work) with a DEDICATED per-job
+        // loop image instead of a plain dir on the shared node-local fs. The
+        // upper accumulates a copy-up of everything the job writes to the
+        // workspace (a full node_modules + checkout is ~700k files); if it lives
+        // on a shared dir, teardown must unlink() every one of them on the
+        // runner's critical path (measured ~1 min, blocking job.completed_at).
+        // On its own filesystem, teardown is O(1): unmount + delete the single
+        // backing file drops all inodes with the fs. Best-effort — any failure
+        // falls back to a plain-dir upper (correctness over the optimization).
+        const upperImageFile = `${overlayBase}.img`;
+        const upperImage = this.newUpperImage(upperImageFile);
+        let upperOnImage = false;
+
         try {
             await fs.mkdir(lower, { recursive: true });
+            await fs.mkdir(overlayBase, { recursive: true });
+            try {
+                await upperImage.createSparseImage(this.fsSize);
+                await upperImage.mountRW(overlayBase);
+                this.overlayUpperImageFile = upperImageFile;
+                upperOnImage = true;
+            } catch (e) {
+                this.logInfo(
+                    `Overlay upper loop-image setup failed (${
+                        e instanceof Error ? e.message : e
+                    }); using plain-dir upper (slower teardown)`
+                );
+                try {
+                    await upperImage.unmount(overlayBase);
+                } catch {
+                    /* not mounted */
+                }
+                try {
+                    await fs.rm(upperImageFile, { force: true });
+                } catch {
+                    /* ignore */
+                }
+                this.overlayUpperImageFile = undefined;
+            }
+            void upperOnImage;
             await fs.mkdir(upper, { recursive: true });
             await fs.mkdir(work, { recursive: true });
             await fs.mkdir(merged, { recursive: true });
@@ -677,6 +742,20 @@ export abstract class LoopContainer extends Container {
             } catch {
                 /* ignore */
             }
+            // If we mounted a dedicated upper image, unmount it (detach loop) +
+            // delete the backing file before removing the base dir.
+            if (this.overlayUpperImageFile) {
+                try {
+                    await upperImage.unmount(overlayBase);
+                } catch {
+                    /* ignore */
+                }
+                try {
+                    await fs.rm(this.overlayUpperImageFile, { force: true });
+                } catch {
+                    /* ignore */
+                }
+            }
             try {
                 await fs.rm(overlayBase, { recursive: true, force: true });
             } catch {
@@ -685,6 +764,7 @@ export abstract class LoopContainer extends Container {
             this.usingOverlay = false;
             this.overlayLowerMount = undefined;
             this.overlayBaseDir = undefined;
+            this.overlayUpperImageFile = undefined;
             throw new Error(
                 `Overlay RW mount failed for node-local image ${imageFile}: ${
                     error instanceof Error ? error.message : error
@@ -811,6 +891,150 @@ export abstract class LoopContainer extends Container {
         await Promise.all(promises);
     }
 
+    // ── Overlay detect + fast drop (cross-process safe) ───────────────
+
+    /**
+     * Detect an active consumer overlay mounted at `expectedMountPoint` and
+     * re-derive the teardown targets from its live mount options. Runs in the
+     * SAVE process (a fresh instance where usingOverlay/overlayBaseDir/etc. are
+     * unset), so everything is recovered from `findmnt -t overlay`:
+     *   upperdir=<overlayBase>/upper  → overlayBaseDir = dirname(upperdir)
+     *   lowerdir=<tempDir>/lower       → overlayLowerMount
+     * The upper filesystem image (if used) is <overlayBase>.img.
+     * Returns true if an overlay was found (caller should stop normal discovery).
+     */
+    protected async detectOverlayMount(
+        expectedMountPoint: string
+    ): Promise<boolean> {
+        try {
+            const out = await exec.getExecOutput(
+                "findmnt",
+                ["-t", "overlay", "-n", "-o", "TARGET,OPTIONS", expectedMountPoint],
+                { cwd: this.safeCwd, silent: !core.isDebug(), ignoreReturnCode: true }
+            );
+            const line = out.stdout.trim();
+            if (out.exitCode !== 0 || !line) return false;
+
+            const options = line.split(/\s+/).slice(1).join(" ");
+            const upperM = options.match(/upperdir=([^,\s]+)/);
+            const lowerM = options.match(/lowerdir=([^,\s]+)/);
+            if (!upperM) return false;
+
+            this.mountPoint = expectedMountPoint;
+            this.usingOverlay = true;
+            this.overlayBaseDir = path.dirname(upperM[1]); // .../upper → base
+            if (lowerM) this.overlayLowerMount = lowerM[1];
+            const candidateImg = `${this.overlayBaseDir}.img`;
+            // Only treat the upper as image-backed if the image file exists.
+            try {
+                await fs.access(candidateImg);
+                this.overlayUpperImageFile = candidateImg;
+            } catch {
+                this.overlayUpperImageFile = undefined;
+            }
+            this.logInfo(
+                `Detected consumer overlay at ${expectedMountPoint} (base=${this.overlayBaseDir}` +
+                    `${this.overlayUpperImageFile ? ", image-backed upper" : ""})`
+            );
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Tear down a consumer overlay in O(1) (not O(files)). Order:
+     *   1. plain `umount` the merged overlay (NO loop-detach — the merged mount
+     *      has no loop device; image.unmount would spuriously hunt for one).
+     *   2. if the upper is on a dedicated loop image: unmount it (detaches its
+     *      loop) then delete the ONE backing .img file — frees all upper inodes
+     *      with the filesystem, no per-file unlink.
+     *      else (plain-dir upper fallback): rename the base aside to .trash-*
+     *      for the DaemonSet to sweep async (still off the critical path).
+     *   3. unmount the RO lower image mount + detach its loop.
+     * All best-effort: on failure the pod teardown still reaps it (slow but
+     * correct).
+     */
+    protected async dropOverlayFast(): Promise<void> {
+        const base = this.overlayBaseDir;
+
+        // 1. Unmount the merged overlay (plain umount, lazy fallback for busy).
+        if (this.mountPoint) {
+            try {
+                await this.execSudo("umount", [this.mountPoint]);
+            } catch {
+                try {
+                    await this.execSudo("umount", ["-l", this.mountPoint]);
+                } catch {
+                    /* ignore */
+                }
+            }
+        }
+
+        // 2. Drop the upper.
+        if (base) {
+            if (this.overlayUpperImageFile) {
+                // Image-backed upper → unmount the image (detaches loop) + rm the
+                // single backing file. O(1) regardless of file count.
+                try {
+                    await this.image.unmount(base);
+                } catch {
+                    try {
+                        await this.execSudo("umount", ["-l", base]);
+                    } catch {
+                        /* ignore */
+                    }
+                }
+                try {
+                    await fs.rm(this.overlayUpperImageFile, { force: true });
+                } catch {
+                    /* ignore */
+                }
+                try {
+                    await fs.rm(base, { recursive: false, force: true });
+                } catch {
+                    /* dir may be non-empty if unmount failed; leave for sweeper */
+                }
+                this.logInfo("Dropped overlay upper image (O(1) teardown)");
+            } else {
+                // Plain-dir upper fallback → atomic rename aside; DS sweeps it.
+                const trash = path.join(
+                    path.dirname(base),
+                    `.trash-${path.basename(base)}-${crypto
+                        .randomBytes(4)
+                        .toString("hex")}`
+                );
+                try {
+                    await fs.rename(base, trash);
+                    this.logInfo(`Renamed overlay upper aside for async sweep → ${trash}`);
+                } catch (e) {
+                    this.logInfo(
+                        `Overlay upper rename-aside failed (${
+                            e instanceof Error ? e.message : e
+                        }); pod teardown will reap it`
+                    );
+                }
+            }
+        }
+
+        // 3. Unmount the RO lower image (detach its loop).
+        if (this.overlayLowerMount) {
+            try {
+                await this.image.unmount(this.overlayLowerMount);
+            } catch {
+                try {
+                    await this.execSudo("umount", ["-l", this.overlayLowerMount]);
+                } catch {
+                    /* ignore */
+                }
+            }
+        }
+        this.usingOverlay = false;
+        this.overlayBaseDir = undefined;
+        this.overlayLowerMount = undefined;
+        this.overlayUpperImageFile = undefined;
+    }
+
     // ── Unmount ──────────────────────────────────────────────────────
 
     protected async unmountAll(): Promise<void> {
@@ -877,6 +1101,16 @@ export abstract class LoopContainer extends Container {
             this.cacheKey
         );
         const expectedMountPoint = path.join(tempDir, "mount");
+
+        // OVERLAY consumer path first: the save process is a fresh instance, so
+        // usingOverlay/overlayBaseDir/etc. are unset and the `-t <xfs|btrfs>`
+        // search below can't see an overlay-type mount (it lives at
+        // expectedMountPoint but is fs-type "overlay", and the RO lower is at
+        // .../lower). Detect the overlay here and re-derive the teardown targets
+        // from its mount options so dropOverlayFast() can run in the save step.
+        if (await this.detectOverlayMount(expectedMountPoint)) {
+            return;
+        }
 
         this.logDebug(
             `Looking for ${this.fsDisplayName} mount at: ${expectedMountPoint}`
