@@ -19,7 +19,8 @@ export enum Inputs {
     MountMode = "mount-mode", // Input for mount mode: "ro" (read-only, default for node_modules) or "rw" (read-write, for mutable caches)
     FailOnSaveError = "fail-on-save-error", // Input for failing the action on save errors (useful for cache validation tests)
     CleanupNodeLocal = "cleanup-node-local", // Input for node-local image cleanup policy: "none" | "stale" (default) | "always"
-    SkipRestore = "skip-restore" // Input: skip node-local + S3 restore and create a fresh empty image (producer/force-rebuild — never mount a stale/corrupt cached image)
+    SkipRestore = "skip-restore", // Input: skip node-local + S3 restore and create a fresh empty image (producer/force-rebuild — never mount a stale/corrupt cached image)
+    OverlayUpperSize = "overlay-upper-size" // Input: size (e.g. "4G") of the per-job ext4 loop image backing a consumer overlay's RW upper (fallocate-full → O(1) teardown). Empty => plain-dir upper. Pass a fraction of the runner's ephemeral-storage.
 }
 
 export enum Outputs {

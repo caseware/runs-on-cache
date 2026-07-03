@@ -105532,7 +105532,8 @@ var Inputs;
     Inputs["MountMode"] = "mount-mode";
     Inputs["FailOnSaveError"] = "fail-on-save-error";
     Inputs["CleanupNodeLocal"] = "cleanup-node-local";
-    Inputs["SkipRestore"] = "skip-restore"; // Input: skip node-local + S3 restore and create a fresh empty image (producer/force-rebuild — never mount a stale/corrupt cached image)
+    Inputs["SkipRestore"] = "skip-restore";
+    Inputs["OverlayUpperSize"] = "overlay-upper-size"; // Input: size (e.g. "4G") of the per-job ext4 loop image backing a consumer overlay's RW upper (fallocate-full → O(1) teardown). Empty => plain-dir upper. Pass a fraction of the runner's ephemeral-storage.
 })(Inputs = exports.Inputs || (exports.Inputs = {}));
 var Outputs;
 (function (Outputs) {
@@ -105957,13 +105958,14 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
         const saveCompressionLevel = core.getInput(constants_1.Inputs.SaveCompressionLevel) || undefined;
         const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
         const mountMode = (core.getInput(constants_1.Inputs.MountMode) || "rw");
+        const overlayUpperSize = core.getInput(constants_1.Inputs.OverlayUpperSize) || undefined;
         let cacheContainer = undefined;
         try {
             const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
             core.debug(`Using baseDir: ${baseDir}`);
             archivePath = path.join(yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(primaryKey), (0, actionUtils_1.getCacheFileName)(compressionMethod));
             core.debug(`Archive Path: ${archivePath}`);
-            cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode });
+            cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode, overlayUpperSize });
             // Initialize container (prerequisite checks, stale temp cleanup)
             yield cacheContainer.initialize();
             // Producer / force-rebuild: never restore a (possibly stale or corrupt)
@@ -106188,7 +106190,8 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
             const saveCompressionLevel = core.getInput(constants_1.Inputs.SaveCompressionLevel) || undefined;
             const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
             const mountMode = (core.getInput(constants_1.Inputs.MountMode) || "rw");
-            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, key, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode });
+            const overlayUpperSize = core.getInput(constants_1.Inputs.OverlayUpperSize) || undefined;
+            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, key, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode, overlayUpperSize });
             yield cacheContainer.initialize();
             yield cacheContainer.save();
             // After save, persist to node-local if enabled (so subsequent runs on this node get a hit)
@@ -108029,6 +108032,211 @@ exports.ContainerFactory = ContainerFactory;
 
 /***/ }),
 
+/***/ 3381:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.Ext4UpperImage = void 0;
+/**
+ * Ext4UpperImage — a DEDICATED, throwaway ext4 loop image used ONLY as the
+ * RW upperdir+workdir of a consumer overlay.
+ *
+ * Why this exists (the O(1)-teardown problem):
+ *   The consumer overlay's upper holds the job's copy-up deltas — up to ~700k
+ *   real files (node_modules rewrite, `cp -rf` devkits, build output). The
+ *   `volatile` overlay makes the *umount* free, but reclaiming those files then
+ *   costs a recursive `rm -rf` of the upper dir on the shared node-local disk —
+ *   ~56s on the runner's critical path. Backing the upper with its own loop
+ *   image turns that into: unmount the image + delete ONE backing file →
+ *   the whole filesystem (and every inode in it) is freed at once. O(1).
+ *
+ * Why NOT the cache WORM image machinery (XfsImage/LoopImage):
+ *   The upper is throwaway — never saved, never uploaded, no UUID dedup, no
+ *   verify, no headroom growth. It needs only: create → mount RW → unmount +
+ *   delete. So this is a small self-contained class, not a LoopImage subclass.
+ *
+ * Performance design (learned the hard way — the sparse-XFS-on-loop attempt
+ * stalled for 17 min on a live job):
+ *   1. `fallocate -l <size>` FULL (non-sparse). A sparse backing file forces
+ *      the HOST fs to allocate an extent (a host-journal metadata txn) on the
+ *      FIRST write to every block — i.e. per-block host-fs journaling amortized
+ *      across ~700k copy-ups. fallocate pre-allocates all host extents up front
+ *      in a handful of big-extent transactions, so copy-up writes hit
+ *      already-allocated blocks → NO host-fs allocation on the hot path.
+ *   2. `mkfs.ext4 -O ^has_journal` — the upper is throwaway, so its own journal
+ *      buys nothing and only adds write traffic (xlog commits were half the
+ *      stall). No guest journal → no guest-journal txns on copy-up.
+ *   3. `losetup --direct-io=on` — bypass the host page cache for the loop
+ *      device, so dirty pages don't pile up and trip block-layer writeback
+ *      throttling (rq_qos_wait/wbt_wait — the other half of the stall).
+ *   4. mount `noatime,nobarrier` — no atime writes; barriers are moot without a
+ *      journal and the upper needs zero durability.
+ *
+ * NO live growth: growing a mounted loop fs needs `losetup -c` on the attached
+ * device, which is the exact operation that corrupted a just-recovered fs
+ * before (see LoopImage.growBackingFile's warm-restore corruption note). The
+ * backing file is fallocated to its full size ONCE, up front, and never grown.
+ */
+const core = __importStar(__nccwpck_require__(37484));
+const exec = __importStar(__nccwpck_require__(95236));
+const LoopImage_1 = __nccwpck_require__(8866);
+const LOG_PREFIX = "[Ext4Upper]";
+class Ext4UpperImage {
+    constructor(imageFile, safeCwd) {
+        this.imageFile = imageFile;
+        this.safeCwd = safeCwd;
+    }
+    info(msg) {
+        core.info(`${LOG_PREFIX} ${msg}`);
+    }
+    getImageFile() {
+        return this.imageFile;
+    }
+    /**
+     * Create the backing file (fallocate FULL — non-sparse) and format it as a
+     * no-journal ext4. `size` is a human string like "4G" / "3200M".
+     *
+     * fallocate reserves the whole size on the host disk immediately; if the
+     * host doesn't have the room, fallocate fails HERE (before any mount), and
+     * the caller falls back to a plain-dir upper.
+     */
+    create(size) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const bytes = (0, LoopImage_1.parseSizeToBytes)(size);
+            this.info(`Allocating full (non-sparse) upper image: ${this.imageFile} (${size} = ${bytes} bytes)`);
+            // fallocate FULL — reserves all host extents up front so copy-up writes
+            // never trigger host-fs allocation/journaling on the hot path.
+            yield exec.exec("fallocate", ["-l", `${bytes}`, this.imageFile], {
+                cwd: this.safeCwd
+            });
+            this.info("Formatting upper image as ext4 (no journal)");
+            // -F: force (operate on a file). -O ^has_journal: NO journal (throwaway
+            // upper). lazy_*_init=0: do inode/journal table init at mkfs time so the
+            // first writes aren't slowed by lazy background init on the hot path.
+            yield exec.exec("mkfs.ext4", [
+                "-F",
+                "-O",
+                "^has_journal",
+                "-E",
+                "lazy_itable_init=0,lazy_journal_init=0",
+                this.imageFile
+            ], { cwd: this.safeCwd, silent: !core.isDebug() });
+        });
+    }
+    /**
+     * Attach the image to a fresh loop device with direct-io ON, then mount it
+     * RW at `mountPoint`. Records the loop device for unmount().
+     */
+    mountRW(mountPoint) {
+        return __awaiter(this, void 0, void 0, function* () {
+            // Attach with direct-io=on so loop writes bypass the host page cache
+            // (avoids dirty-page pileup → block-layer writeback throttling).
+            const attach = yield exec.getExecOutput("sudo", [
+                "losetup",
+                "--find",
+                "--show",
+                "--direct-io=on",
+                this.imageFile
+            ], { cwd: this.safeCwd });
+            const dev = attach.stdout.trim();
+            if (!dev) {
+                throw new Error(`losetup did not return a loop device for ${this.imageFile}`);
+            }
+            this.loopDevice = dev;
+            this.info(`Attached ${this.imageFile} → ${dev} (direct-io=on)`);
+            // Mount noatime,nobarrier. nobarrier is moot without a journal and the
+            // upper needs zero durability. If the kernel rejects nobarrier, retry
+            // with noatime alone so a picky kernel can't fail the whole mount.
+            const mount = yield exec.getExecOutput("sudo", ["mount", "-t", "ext4", "-o", "noatime,nobarrier", dev, mountPoint], { cwd: this.safeCwd, ignoreReturnCode: true });
+            if (mount.exitCode !== 0) {
+                core.warning(`${LOG_PREFIX} mount with noatime,nobarrier failed (exit ${mount.exitCode}: ` +
+                    `${mount.stderr.trim() || mount.stdout.trim()}); retrying with noatime only`);
+                yield exec.exec("sudo", ["mount", "-t", "ext4", "-o", "noatime", dev, mountPoint], { cwd: this.safeCwd });
+            }
+            this.info(`Mounted ${dev} → ${mountPoint} (ext4, noatime)`);
+        });
+    }
+    /**
+     * Unmount the image and detach its loop device. Best-effort + lazy-unmount
+     * fallback so a busy mount can't wedge teardown. Safe to call when the loop
+     * device is only known from a fresh cross-process re-detection (pass it via
+     * setLoopDevice() first).
+     */
+    unmount(mountPoint) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const um = yield exec.getExecOutput("sudo", ["umount", mountPoint], {
+                cwd: this.safeCwd,
+                ignoreReturnCode: true
+            });
+            if (um.exitCode !== 0) {
+                core.warning(`${LOG_PREFIX} umount ${mountPoint} failed (exit ${um.exitCode}); trying lazy umount`);
+                yield exec
+                    .getExecOutput("sudo", ["umount", "-l", mountPoint], {
+                    cwd: this.safeCwd,
+                    ignoreReturnCode: true
+                })
+                    .catch(() => undefined);
+            }
+            if (this.loopDevice) {
+                yield exec
+                    .getExecOutput("sudo", ["losetup", "-d", this.loopDevice], {
+                    cwd: this.safeCwd,
+                    ignoreReturnCode: true
+                })
+                    .catch(() => undefined);
+                this.info(`Detached loop device ${this.loopDevice}`);
+                this.loopDevice = undefined;
+            }
+        });
+    }
+    /**
+     * Set the loop device explicitly — used by the SAVE process, which is a
+     * fresh instance that didn't attach the device and must re-derive it from
+     * the live mount (findmnt SOURCE) before unmounting.
+     */
+    setLoopDevice(dev) {
+        this.loopDevice = dev;
+    }
+}
+exports.Ext4UpperImage = Ext4UpperImage;
+
+
+/***/ }),
+
 /***/ 8764:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -108091,6 +108299,7 @@ const os = __importStar(__nccwpck_require__(48161));
 const path = __importStar(__nccwpck_require__(76760));
 const actionUtils_1 = __nccwpck_require__(8270);
 const Container_1 = __nccwpck_require__(38198);
+const Ext4UpperImage_1 = __nccwpck_require__(3381);
 class LoopContainer extends Container_1.Container {
     constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options) {
         super(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options);
@@ -108098,6 +108307,12 @@ class LoopContainer extends Container_1.Container {
         this.requiresKeepArchive = true;
         /** Set to true if save verification fails. */
         this.saveAborted = false;
+        /**
+         * True once a consumer overlay has been fast-dropped in save(). A consumer
+         * overlay produces no archive artifact, so the caller must skip the S3
+         * upload — otherwise it would stat/upload a non-existent archivePath.
+         */
+        this.overlayDropped = false;
         /** True if the current mount is read-only. */
         this.mountIsReadOnly = false;
         /**
@@ -108325,8 +108540,13 @@ class LoopContainer extends Container_1.Container {
                 return;
             }
             if (this.usingOverlay) {
-                this.logInfo("Skipping save — workspace is an overlay on a node-local WORM " +
-                    "image (consumer restore; nothing to persist back to S3)");
+                this.logInfo("Workspace is a consumer overlay on a node-local WORM image " +
+                    "(nothing to persist to S3); dropping it O(1) instead of " +
+                    "leaving the pod to reap the upper.");
+                yield this.dropOverlayFast();
+                // No archive is produced for a consumer overlay; signal the caller
+                // to skip the S3 upload (else it stats a non-existent archivePath).
+                this.overlayDropped = true;
                 return;
             }
             if (this.mountIsReadOnly) {
@@ -108395,7 +108615,7 @@ class LoopContainer extends Container_1.Container {
         });
     }
     shouldSkipS3Upload() {
-        return this.mountIsReadOnly || this.saveAborted;
+        return this.mountIsReadOnly || this.saveAborted || this.overlayDropped;
     }
     // ── Private: mount orchestration ─────────────────────────────────
     mountImageReadOnly(imageFile) {
@@ -108532,10 +108752,58 @@ class LoopContainer extends Container_1.Container {
             const nodeLocalDir = path.dirname(imageFile);
             const safeKey = this.cacheKey.replace(/[^a-zA-Z0-9\-_.]/g, "_");
             const overlayBase = path.join(nodeLocalDir, `.overlay-${safeKey}-${crypto.randomBytes(6).toString("hex")}`);
-            const upper = path.join(overlayBase, "upper"); // RW deltas (node-local fs)
+            const upper = path.join(overlayBase, "upper"); // RW deltas
             const work = path.join(overlayBase, "work"); // overlay workdir (same fs)
             this.overlayBaseDir = overlayBase;
+            // PERF (teardown): optionally back overlayBase (which holds upper+work)
+            // with a DEDICATED per-job ext4 loop image instead of a plain dir on the
+            // shared node-local fs. The upper accumulates a copy-up of everything the
+            // job writes to the workspace (a full node_modules + checkout is ~700k
+            // files); on a plain shared dir, teardown must unlink() every one of them
+            // on the runner's critical path (~56s, blocking job.completed_at). On its
+            // own filesystem, teardown is O(1): unmount + delete the single backing
+            // file drops all inodes with the fs.
+            //
+            // The image is fallocate-FULL (non-sparse) + no-journal ext4 + direct-io
+            // (see Ext4UpperImage). A sparse XFS-on-loop attempt stalled 17 min on a
+            // live job (per-block host-fs allocation journaling + block-layer
+            // writeback throttle) — full-alloc + no journal + direct-io is what
+            // avoids that. NO live growth (avoids losetup -c corruption on a mounted
+            // device). Best-effort: any failure (e.g. host disk can't fallocate the
+            // full size) falls back to a plain-dir upper — correctness over the
+            // optimization.
+            const overlayUpperSize = this.options.overlayUpperSize;
+            const upperImageFile = `${overlayBase}.img`;
+            let upperImage;
             try {
+                yield fs.mkdir(overlayBase, { recursive: true });
+                if (overlayUpperSize) {
+                    const img = new Ext4UpperImage_1.Ext4UpperImage(upperImageFile, this.safeCwd);
+                    try {
+                        yield img.create(overlayUpperSize);
+                        yield img.mountRW(overlayBase);
+                        upperImage = img;
+                        this.overlayUpperImage = img;
+                        this.overlayUpperImageFile = upperImageFile;
+                    }
+                    catch (e) {
+                        this.logInfo(`Overlay upper ext4 loop-image setup failed (${e instanceof Error ? e.message : e}); using plain-dir upper (slower teardown)`);
+                        try {
+                            yield img.unmount(overlayBase);
+                        }
+                        catch (_a) {
+                            /* not mounted */
+                        }
+                        try {
+                            yield fs.rm(upperImageFile, { force: true });
+                        }
+                        catch (_b) {
+                            /* ignore */
+                        }
+                        this.overlayUpperImage = undefined;
+                        this.overlayUpperImageFile = undefined;
+                    }
+                }
                 yield fs.mkdir(lower, { recursive: true });
                 yield fs.mkdir(upper, { recursive: true });
                 yield fs.mkdir(work, { recursive: true });
@@ -108597,18 +108865,37 @@ class LoopContainer extends Container_1.Container {
                 try {
                     yield this.image.unmount(lower);
                 }
-                catch (_a) {
+                catch (_c) {
                     /* ignore */
+                }
+                // If the upper is image-backed, unmount the ext4 image (detach its
+                // loop) + delete the backing file BEFORE removing the base dir —
+                // otherwise fs.rm hits a live mount / leaks a loop device.
+                if (upperImage) {
+                    try {
+                        yield upperImage.unmount(overlayBase);
+                    }
+                    catch (_d) {
+                        /* ignore */
+                    }
+                    try {
+                        yield fs.rm(upperImageFile, { force: true });
+                    }
+                    catch (_e) {
+                        /* ignore */
+                    }
                 }
                 try {
                     yield fs.rm(overlayBase, { recursive: true, force: true });
                 }
-                catch (_b) {
+                catch (_f) {
                     /* ignore */
                 }
                 this.usingOverlay = false;
                 this.overlayLowerMount = undefined;
                 this.overlayBaseDir = undefined;
+                this.overlayUpperImage = undefined;
+                this.overlayUpperImageFile = undefined;
                 throw new Error(`Overlay RW mount failed for node-local image ${imageFile}: ${error instanceof Error ? error.message : error}`);
             }
         });
@@ -108760,11 +109047,192 @@ class LoopContainer extends Container_1.Container {
         });
     }
     // ── Discovery ────────────────────────────────────────────────────
+    /**
+     * Detect an active consumer overlay mounted at `expectedMountPoint` and
+     * re-derive the teardown targets from its live mount options. Runs in the
+     * SAVE process (a fresh instance where usingOverlay/overlayBaseDir/etc. are
+     * unset), so everything is recovered from `findmnt -t overlay`:
+     *   upperdir=<overlayBase>/upper  → overlayBaseDir = dirname(upperdir)
+     *   lowerdir=<tempDir>/lower       → overlayLowerMount
+     * The upper filesystem image (if used) is <overlayBase>.img; if it exists,
+     * re-derive its loop device from findmnt so dropOverlayFast can detach it.
+     * Returns true if an overlay was found (caller should stop normal discovery).
+     */
+    detectOverlayMount(expectedMountPoint) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const out = yield exec.getExecOutput("findmnt", [
+                    "-t",
+                    "overlay",
+                    "-n",
+                    "-o",
+                    "TARGET,OPTIONS",
+                    expectedMountPoint
+                ], {
+                    cwd: this.safeCwd,
+                    silent: !core.isDebug(),
+                    ignoreReturnCode: true
+                });
+                const line = out.stdout.trim();
+                if (out.exitCode !== 0 || !line)
+                    return false;
+                const options = line.split(/\s+/).slice(1).join(" ");
+                const upperM = options.match(/upperdir=([^,\s]+)/);
+                const lowerM = options.match(/lowerdir=([^,\s]+)/);
+                if (!upperM)
+                    return false;
+                this.mountPoint = expectedMountPoint;
+                this.usingOverlay = true;
+                this.overlayBaseDir = path.dirname(upperM[1]); // .../upper → base
+                if (lowerM)
+                    this.overlayLowerMount = lowerM[1];
+                // Only treat the upper as image-backed if the .img file exists.
+                const candidateImg = `${this.overlayBaseDir}.img`;
+                try {
+                    yield fs.access(candidateImg);
+                    this.overlayUpperImageFile = candidateImg;
+                    // Re-derive the loop device backing the upper image mount so we
+                    // can detach it at teardown (this fresh process did not attach
+                    // it). findmnt the base dir → SOURCE is the /dev/loopN device.
+                    const upperMnt = yield exec.getExecOutput("findmnt", ["-n", "-o", "SOURCE", this.overlayBaseDir], {
+                        cwd: this.safeCwd,
+                        silent: !core.isDebug(),
+                        ignoreReturnCode: true
+                    });
+                    const dev = upperMnt.stdout.trim().split(/\s+/)[0];
+                    const img = new Ext4UpperImage_1.Ext4UpperImage(candidateImg, this.safeCwd);
+                    if (dev && dev.startsWith("/dev/loop")) {
+                        img.setLoopDevice(dev);
+                    }
+                    this.overlayUpperImage = img;
+                }
+                catch (_a) {
+                    this.overlayUpperImageFile = undefined;
+                    this.overlayUpperImage = undefined;
+                }
+                this.logInfo(`Detected consumer overlay at ${expectedMountPoint} (base=${this.overlayBaseDir}` +
+                    `${this.overlayUpperImageFile
+                        ? ", ext4 image-backed upper"
+                        : ""})`);
+                return true;
+            }
+            catch (_b) {
+                return false;
+            }
+        });
+    }
+    /**
+     * Tear down a consumer overlay in O(1) (not O(files)). Order:
+     *   1. plain `umount` the merged overlay (NO loop-detach — the merged mount
+     *      has no loop device; the upper image's loop is detached in step 2).
+     *   2. if the upper is on a dedicated ext4 loop image: unmount it (detaches
+     *      its loop) then delete the ONE backing .img file — frees all upper
+     *      inodes with the filesystem, no per-file unlink. Then rmdir the (now
+     *      empty) base.
+     *      else (plain-dir upper fallback): recursively rm the base — the slow
+     *      O(files) path, only when no image backed the upper.
+     *   3. unmount the RO lower image mount + detach its loop.
+     * All best-effort: on failure the pod teardown still reaps it (slow but
+     * correct).
+     */
+    dropOverlayFast() {
+        return __awaiter(this, void 0, void 0, function* () {
+            const base = this.overlayBaseDir;
+            // 1. Unmount the merged overlay (plain umount, lazy fallback for busy).
+            if (this.mountPoint) {
+                try {
+                    yield this.execSudo("umount", [this.mountPoint]);
+                }
+                catch (_a) {
+                    try {
+                        yield this.execSudo("umount", ["-l", this.mountPoint]);
+                    }
+                    catch (_b) {
+                        /* ignore — pod teardown reaps it */
+                    }
+                }
+            }
+            // 2. Drop the upper.
+            if (base) {
+                if (this.overlayUpperImage && this.overlayUpperImageFile) {
+                    // Image-backed upper → unmount the ext4 image (detaches loop) +
+                    // rm the single backing file. O(1) regardless of file count.
+                    try {
+                        yield this.overlayUpperImage.unmount(base);
+                    }
+                    catch (_c) {
+                        try {
+                            yield this.execSudo("umount", ["-l", base]);
+                        }
+                        catch (_d) {
+                            /* ignore */
+                        }
+                    }
+                    try {
+                        yield fs.rm(this.overlayUpperImageFile, { force: true });
+                    }
+                    catch (_e) {
+                        /* ignore */
+                    }
+                    try {
+                        // base is now an empty dir (its contents lived in the image).
+                        yield fs.rm(base, { recursive: false, force: true });
+                    }
+                    catch (_f) {
+                        /* dir may be non-empty if unmount failed; leave for sweeper */
+                    }
+                    this.logInfo("Dropped overlay upper ext4 image (O(1) teardown)");
+                }
+                else {
+                    // Plain-dir upper fallback → recursive rm (the slow O(files)
+                    // path; only hit when no image backed the upper).
+                    try {
+                        yield fs.rm(base, { recursive: true, force: true });
+                        this.logInfo("Removed plain-dir overlay upper (O(files) teardown)");
+                    }
+                    catch (e) {
+                        this.logInfo(`Overlay upper removal failed (${e instanceof Error ? e.message : e}); pod teardown will reap it`);
+                    }
+                }
+            }
+            // 3. Unmount the RO lower image (detach its loop).
+            if (this.overlayLowerMount) {
+                try {
+                    yield this.image.unmount(this.overlayLowerMount);
+                }
+                catch (_g) {
+                    try {
+                        yield this.execSudo("umount", [
+                            "-l",
+                            this.overlayLowerMount
+                        ]);
+                    }
+                    catch (_h) {
+                        /* ignore */
+                    }
+                }
+            }
+            this.usingOverlay = false;
+            this.overlayBaseDir = undefined;
+            this.overlayLowerMount = undefined;
+            this.overlayUpperImage = undefined;
+            this.overlayUpperImageFile = undefined;
+        });
+    }
     discoverMountInfo() {
         return __awaiter(this, void 0, void 0, function* () {
             const tempDir = yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(this.cacheKey);
             const expectedMountPoint = path.join(tempDir, "mount");
             this.logDebug(`Looking for ${this.fsDisplayName} mount at: ${expectedMountPoint}`);
+            // OVERLAY consumer path FIRST: the save process is a fresh instance, so
+            // usingOverlay/overlayBaseDir/etc. are unset and the `-t <xfs|btrfs>`
+            // search below can't see an overlay-type mount (it lives at
+            // expectedMountPoint but is fs-type "overlay", and the RO lower is at
+            // .../lower). Detect the overlay here and re-derive the teardown targets
+            // from its mount options so dropOverlayFast() can run in the save step.
+            if (yield this.detectOverlayMount(expectedMountPoint)) {
+                return;
+            }
             let output = "";
             yield exec.exec("findmnt", ["-t", this.findmntFsType(), "-n", "-o", "TARGET,SOURCE,OPTIONS"], {
                 cwd: this.safeCwd,
