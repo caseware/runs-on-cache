@@ -108787,12 +108787,21 @@ class LoopContainer extends Container_1.Container {
                     try {
                         yield img.create(overlayUpperSize);
                         yield img.mountRW(overlayBase);
+                        // The image is mounted via sudo, so its root dir is
+                        // root:root 0755. This process runs as the (non-root) runner
+                        // uid and must mkdir upper/work INSIDE the mount below —
+                        // chown the mount root to us first, or those mkdirs EACCES
+                        // and we'd fall back to a plain-dir upper every time.
+                        yield this.execSudo("chown", [
+                            `${os.userInfo().uid}:${os.userInfo().gid}`,
+                            overlayBase
+                        ]);
                         upperImage = img;
                         this.overlayUpperImage = img;
                         this.overlayUpperImageFile = upperImageFile;
                     }
                     catch (e) {
-                        this.logInfo(`Overlay upper ext4 loop-image setup failed (${e instanceof Error ? e.message : e}); using plain-dir upper (slower teardown)`);
+                        core.warning(`${this.getLogPrefix()} Overlay upper ext4 loop-image setup failed (${e instanceof Error ? e.stack || e.message : e}); using plain-dir upper (slower teardown)`);
                         try {
                             yield img.unmount(overlayBase);
                         }
