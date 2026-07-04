@@ -107792,16 +107792,21 @@ class Ext4UpperImage {
             yield exec.exec("fallocate", ["-l", `${bytes}`, this.imageFile], {
                 cwd: this.safeCwd
             });
-            this.info("Formatting upper image as ext4 (no journal)");
+            this.info("Formatting upper image as ext4 (no journal, nodiscard)");
             // -F: force (operate on a file). -O ^has_journal: NO journal (throwaway
-            // upper). lazy_*_init=0: do inode/journal table init at mkfs time so the
-            // first writes aren't slowed by lazy background init on the hot path.
+            // upper). -E nodiscard: CRITICAL — mkfs.ext4 discards the whole device
+            // by default, which DEALLOCATES the blocks fallocate just reserved
+            // (punching the full image back into holes → sparse → per-block host-fs
+            // allocation journaling on the copy-up hot path, the exact stall we're
+            // avoiding). nodiscard keeps the fallocated extents intact. lazy_*_init=0:
+            // do inode/journal table init at mkfs time so the first writes aren't
+            // slowed by lazy background init on the hot path.
             yield exec.exec("mkfs.ext4", [
                 "-F",
                 "-O",
                 "^has_journal",
                 "-E",
-                "lazy_itable_init=0,lazy_journal_init=0",
+                "nodiscard,lazy_itable_init=0,lazy_journal_init=0",
                 this.imageFile
             ], { cwd: this.safeCwd, silent: !core.isDebug() });
         });
