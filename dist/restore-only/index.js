@@ -107738,27 +107738,30 @@ exports.Ext4UpperImage = void 0;
  *   verify, no headroom growth. It needs only: create → mount RW → unmount +
  *   delete. So this is a small self-contained class, not a LoopImage subclass.
  *
- * Performance design (learned the hard way — the sparse-XFS-on-loop attempt
- * stalled for 17 min on a live job):
- *   1. `fallocate -l <size>` FULL (non-sparse). A sparse backing file forces
- *      the HOST fs to allocate an extent (a host-journal metadata txn) on the
- *      FIRST write to every block — i.e. per-block host-fs journaling amortized
- *      across ~700k copy-ups. fallocate pre-allocates all host extents up front
- *      in a handful of big-extent transactions, so copy-up writes hit
- *      already-allocated blocks → NO host-fs allocation on the hot path.
- *   2. `mkfs.ext4 -O ^has_journal` — the upper is throwaway, so its own journal
- *      buys nothing and only adds write traffic (xlog commits were half the
- *      stall). No guest journal → no guest-journal txns on copy-up.
- *   3. `losetup --direct-io=on` — bypass the host page cache for the loop
- *      device, so dirty pages don't pile up and trip block-layer writeback
- *      throttling (rq_qos_wait/wbt_wait — the other half of the stall).
- *   4. mount `noatime,nobarrier` — no atime writes; barriers are moot without a
- *      journal and the upper needs zero durability.
+ * Performance + sizing design (all measured on-node — see below):
+ *   1. SPARSE, LARGE virtual size (`truncate -s <bigSize>`, NOT fallocate-full).
+ *      The upper holds only the job's copy-up DELTA (build output, dist/, cp-rf
+ *      devkits) — NOT node_modules (that's in the RO lower) — so real usage is
+ *      typically a few hundred MB. A large VIRTUAL size gives generous headroom
+ *      (no in-image ENOSPC / fill-race) while consuming ~0 real host bytes until
+ *      written (allocate-on-write). This is critical because the image is
+ *      created PER JOB × N concurrent runner pods on the SHARED node-local
+ *      hostPath: fallocate-FULL would reserve size×N and exhaust that disk;
+ *      sparse reserves ~nothing. Measured on a live node: 20G sparse ext4 = 325
+ *      MB real after mkfs vs 4097 MB for fallocate-full 4G.
+ *   2. `mkfs.ext4 -O ^has_journal` — throwaway upper, no journal needed; also
+ *      avoids the guest-journal write traffic.
+ *   3. `losetup --direct-io=on` — bypass the host page cache so dirty pages
+ *      don't pile up and trip block-layer writeback throttling.
+ *   4. mount `noatime,nobarrier` — no atime; barriers moot without a journal.
  *
- * NO live growth: growing a mounted loop fs needs `losetup -c` on the attached
- * device, which is the exact operation that corrupted a just-recovered fs
- * before (see LoopImage.growBackingFile's warm-restore corruption note). The
- * backing file is fallocated to its full size ONCE, up front, and never grown.
+ * WHY SPARSE IS SAFE HERE (the earlier 17-min stall was XFS, not sparse): that
+ * stall was sparse XFS-on-loop, where XFS's CIL journal storms on per-block
+ * host allocation. A NO-JOURNAL ext4 has no such journal. Measured on-node: a
+ * 20G sparse no-journal ext4 writes 2GB at 140 MB/s — identical to fallocate-
+ * full 4G (140 MB/s) — i.e. ZERO throughput penalty and no stall. So sparse-
+ * large removes host-exhaustion AND the fill-race AND needs no grow-watcher /
+ * live `losetup -c` (which is what forbade growing the WORM XFS image).
  */
 const core = __importStar(__nccwpck_require__(37484));
 const exec = __importStar(__nccwpck_require__(95236));
@@ -107776,37 +107779,35 @@ class Ext4UpperImage {
         return this.imageFile;
     }
     /**
-     * Create the backing file (fallocate FULL — non-sparse) and format it as a
-     * no-journal ext4. `size` is a human string like "4G" / "3200M".
-     *
-     * fallocate reserves the whole size on the host disk immediately; if the
-     * host doesn't have the room, fallocate fails HERE (before any mount), and
-     * the caller falls back to a plain-dir upper.
+     * Create the backing file (SPARSE, via truncate) and format it as a
+     * no-journal ext4. `size` is the VIRTUAL size (e.g. "20G") — real host
+     * bytes are consumed only as the overlay copies up (allocate-on-write), so
+     * a large virtual size is cheap and gives generous in-image headroom.
      */
     create(size) {
         return __awaiter(this, void 0, void 0, function* () {
             const bytes = (0, LoopImage_1.parseSizeToBytes)(size);
-            this.info(`Allocating full (non-sparse) upper image: ${this.imageFile} (${size} = ${bytes} bytes)`);
-            // fallocate FULL — reserves all host extents up front so copy-up writes
-            // never trigger host-fs allocation/journaling on the hot path.
-            yield exec.exec("fallocate", ["-l", `${bytes}`, this.imageFile], {
+            this.info(`Creating sparse upper image: ${this.imageFile} (virtual ${size} = ${bytes} bytes; real bytes grow on write)`);
+            // truncate → sparse file at the virtual size. NOT fallocate: the image
+            // is created per-job × N runner pods on the shared node-local hostPath,
+            // so full reservation would exhaust that disk. Measured: 20G sparse
+            // ext4 = ~325 MB real after mkfs vs 4 GB for fallocate-full.
+            yield exec.exec("truncate", ["-s", `${bytes}`, this.imageFile], {
                 cwd: this.safeCwd
             });
-            this.info("Formatting upper image as ext4 (no journal, nodiscard)");
+            this.info("Formatting upper image as ext4 (no journal)");
             // -F: force (operate on a file). -O ^has_journal: NO journal (throwaway
-            // upper). -E nodiscard: CRITICAL — mkfs.ext4 discards the whole device
-            // by default, which DEALLOCATES the blocks fallocate just reserved
-            // (punching the full image back into holes → sparse → per-block host-fs
-            // allocation journaling on the copy-up hot path, the exact stall we're
-            // avoiding). nodiscard keeps the fallocated extents intact. lazy_*_init=0:
-            // do inode/journal table init at mkfs time so the first writes aren't
-            // slowed by lazy background init on the hot path.
+            // upper — also why sparse is safe: no journal means no CIL storm on
+            // per-block host allocation, the XFS-on-loop stall we hit before; a
+            // no-journal ext4 writes at full disk speed sparse, measured 140 MB/s).
+            // lazy_*_init=0: init tables at mkfs so first writes aren't slowed by
+            // lazy background init.
             yield exec.exec("mkfs.ext4", [
                 "-F",
                 "-O",
                 "^has_journal",
                 "-E",
-                "nodiscard,lazy_itable_init=0,lazy_journal_init=0",
+                "lazy_itable_init=0,lazy_journal_init=0",
                 this.imageFile
             ], { cwd: this.safeCwd, silent: !core.isDebug() });
         });
