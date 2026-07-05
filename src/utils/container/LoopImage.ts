@@ -502,9 +502,23 @@ export abstract class LoopImage {
         let loopDev = "";
         let stderrOutput = "";
         try {
+            // --show: print the chosen /dev/loopN.
+            // --autoclear (LO_FLAGS_AUTOCLEAR): the loop device auto-detaches
+            //   the instant its LAST user closes it. This is what keeps pod
+            //   teardown O(1) on ephemeral k8s/ARC runners: at job end the
+            //   workspace overlay can only be *lazily* unmounted (`umount -l`)
+            //   because the runner agent still holds it as CWD, so an explicit
+            //   `losetup -d` during the POST step always fails (device still
+            //   referenced) and, without autoclear, the loop would linger
+            //   attached — forcing the kubelet to reap a still-attached loop at
+            //   container exit (measured 30-90s of "job spinning after it
+            //   visually finished"). With autoclear the kernel drops the loop
+            //   automatically when the container exits and the last reference
+            //   closes, so the kubelet inherits nothing. Harmless on reused
+            //   EC2 runners (the explicit detach still fires there).
             await exec.exec(
                 "sudo",
-                ["losetup", "--find", "--show", imageFile],
+                ["losetup", "--find", "--show", "--autoclear", imageFile],
                 {
                     cwd: this.safeCwd,
                     listeners: {

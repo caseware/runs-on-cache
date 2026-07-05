@@ -113,6 +113,15 @@ export class Ext4UpperImage {
     async mountRW(mountPoint: string): Promise<void> {
         // Attach with direct-io=on so loop writes bypass the host page cache
         // (avoids dirty-page pileup → block-layer writeback throttling).
+        // --autoclear (LO_FLAGS_AUTOCLEAR): auto-detach when the last user
+        //   closes the device. At job end the merged overlay (whose upper is
+        //   this ext4 loop) can only be lazily unmounted (runner holds the
+        //   workspace as CWD), so an explicit `losetup -d` during POST fails
+        //   while the mount is still referenced. Without autoclear the loop
+        //   lingers attached and the kubelet must reap it at container exit
+        //   (30-90s pod-teardown stall). With autoclear the kernel drops it
+        //   automatically once the container exits and the last reference
+        //   closes, so the kubelet inherits nothing.
         const attach = await exec.getExecOutput(
             "sudo",
             [
@@ -120,6 +129,7 @@ export class Ext4UpperImage {
                 "--find",
                 "--show",
                 "--direct-io=on",
+                "--autoclear",
                 this.imageFile
             ],
             { cwd: this.safeCwd }
