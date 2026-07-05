@@ -111535,22 +111535,25 @@ class XfsContainer extends LoopContainer_1.LoopContainer {
     // ── Compression helpers (explicit zstd for S3) ───────────────────
     compressRawToArchive(rawFile, archive) {
         return __awaiter(this, void 0, void 0, function* () {
-            this.logInfo(`Compressing raw XFS image with lz4 -T0: ${rawFile} → ${archive}`);
+            this.logInfo(`Compressing raw XFS image with lz4: ${rawFile} → ${archive}`);
             // Codec is lz4, NOT zstd. The restore-side bottleneck is DECOMPRESSION,
             // not download: the raw image is a ~25G sparse XFS whose decompress must
             // materialize ~8-12G of real blocks. zstd `-d` of a single-frame stream
-            // is single-threaded (`-T0` only helps compression), so it pinned one
-            // core for ~200s (measured: 82% of jobs take the S3 path at ~215s avg).
-            // lz4 decompresses several times faster (GB/s class) for a ~1.5x larger
-            // artifact — and since S3→EKS is intra-region ($0 egress) the extra
-            // bytes are effectively free, while the larger artifact also stages
-            // FASTER on the prewarm DaemonSet (download-bound, not CPU-bound) and
-            // the producer's cold-boot save is cheaper too. `-T0` multithreads the
-            // compress; source is KEPT (`-k`) so the node-local commit can still
-            // copy the RAW image afterwards. (`this.zstdLevel` no longer applies to
-            // the codec; lz4 default level is fine — ratio barely moves and is not
-            // the lever here.)
-            yield exec.exec("lz4", ["-T0", "-f", "-k", rawFile, archive], {
+            // is single-threaded, so it pinned one core for ~200s (measured: 82% of
+            // jobs take the S3 path at ~215s avg). lz4 decompresses several times
+            // faster (GB/s class) for a ~1.5x larger artifact — and since S3→EKS is
+            // intra-region ($0 egress) the extra bytes are effectively free, while
+            // the larger artifact also stages FASTER on the prewarm DaemonSet
+            // (download-bound, not CPU-bound) and the producer's cold-boot save is
+            // cheaper too. Source is KEPT (`-k`) so the node-local commit can still
+            // copy the RAW image afterwards.
+            //
+            // NOTE: NO `-T0` — lz4 multithread flag support varies across versions
+            // (runner images ship lz4 1.9.x vs 1.10.x); `-T0` made lz4 exit 1 on an
+            // older build. Compression is not the bottleneck here (decompress is),
+            // and single-threaded lz4 already runs at GB/s, so dropping the flag
+            // costs nothing and works on every lz4 build.
+            yield exec.exec("lz4", ["-f", "-k", rawFile, archive], {
                 cwd: this.safeCwd,
                 silent: !core.isDebug()
             });
