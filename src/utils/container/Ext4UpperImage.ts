@@ -154,7 +154,9 @@ export class Ext4UpperImage {
         if (mount.exitCode !== 0) {
             core.warning(
                 `${LOG_PREFIX} mount with noatime,nobarrier failed (exit ${mount.exitCode}: ` +
-                    `${mount.stderr.trim() || mount.stdout.trim()}); retrying with noatime only`
+                    `${
+                        mount.stderr.trim() || mount.stdout.trim()
+                    }); retrying with noatime only`
             );
             await exec.exec(
                 "sudo",

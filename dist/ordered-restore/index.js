@@ -111027,22 +111027,25 @@ class XfsContainer extends LoopContainer_1.LoopContainer {
     // ── Compression helpers (explicit zstd for S3) ───────────────────
     compressRawToArchive(rawFile, archive) {
         return __awaiter(this, void 0, void 0, function* () {
-            this.logInfo(`Compressing raw XFS image with zstd -${this.zstdLevel} -T0: ${rawFile} → ${archive}`);
-            // Use the zstd CLI (baked into the runner image; async exec, never
-            // execFileSync) rather than Node's single-threaded zlib zstd. `-T0`
-            // multithreads across all cores, which is the dominant lever on the
-            // producer's 25G→~3G zstd:9 save (single-threaded zstd:9 on a 25G
-            // sparse image is minutes of CPU). The source is KEPT (`-k`) so the
-            // node-local commit can still copy the RAW image afterwards.
-            yield exec.exec("zstd", [
-                `-${this.zstdLevel}`,
-                "-T0",
-                "-f",
-                "-k",
-                "-o",
-                archive,
-                rawFile
-            ], { cwd: this.safeCwd, silent: !core.isDebug() });
+            this.logInfo(`Compressing raw XFS image with lz4 -T0: ${rawFile} → ${archive}`);
+            // Codec is lz4, NOT zstd. The restore-side bottleneck is DECOMPRESSION,
+            // not download: the raw image is a ~25G sparse XFS whose decompress must
+            // materialize ~8-12G of real blocks. zstd `-d` of a single-frame stream
+            // is single-threaded (`-T0` only helps compression), so it pinned one
+            // core for ~200s (measured: 82% of jobs take the S3 path at ~215s avg).
+            // lz4 decompresses several times faster (GB/s class) for a ~1.5x larger
+            // artifact — and since S3→EKS is intra-region ($0 egress) the extra
+            // bytes are effectively free, while the larger artifact also stages
+            // FASTER on the prewarm DaemonSet (download-bound, not CPU-bound) and
+            // the producer's cold-boot save is cheaper too. `-T0` multithreads the
+            // compress; source is KEPT (`-k`) so the node-local commit can still
+            // copy the RAW image afterwards. (`this.zstdLevel` no longer applies to
+            // the codec; lz4 default level is fine — ratio barely moves and is not
+            // the lever here.)
+            yield exec.exec("lz4", ["-T0", "-f", "-k", rawFile, archive], {
+                cwd: this.safeCwd,
+                silent: !core.isDebug()
+            });
             const [srcStat, dstStat] = yield Promise.all([
                 fs.stat(rawFile),
                 fs.stat(archive)
@@ -111053,16 +111056,59 @@ class XfsContainer extends LoopContainer_1.LoopContainer {
     }
     decompressToRaw(archive, rawFile) {
         return __awaiter(this, void 0, void 0, function* () {
-            this.logInfo(`Decompressing artifact with zstd --sparse: ${archive} → ${rawFile}`);
-            // Use the zstd CLI with `--sparse` (async exec, never execFileSync).
-            // This is the fix for the ~4-min restore: the raw XFS image is a sparse
-            // 25G file whose holes zstd:9 squashes to near-nothing, but Node's
-            // streaming zlib decompress re-materialized all 25G as REAL bytes (incl.
-            // gigabytes of zeros) → a 25G disk write every restore. `zstd --sparse`
-            // detects zero-runs and seeks over them, so only the ~8-12G of actual
-            // data blocks touch disk. Ratio is unchanged (same artifact) — this only
-            // changes how the output is written. `-f` overwrites any stale temp.
-            yield exec.exec("zstd", ["-d", "--sparse", "-f", "-o", rawFile, archive], { cwd: this.safeCwd, silent: !core.isDebug() });
+            // Detect the codec by MAGIC BYTES rather than assuming one, so a cache
+            // artifact written by either codec restores correctly. This matters
+            // across the lz4-cutover: images saved by an older producer are zstd,
+            // newer ones are lz4, and both can be live under different keys until
+            // the cache key next rotates. Magic: zstd = 28 B5 2F FD, lz4 = 04 22 4D 18.
+            const codec = yield this.detectArchiveCodec(archive);
+            this.logInfo(`Decompressing artifact with ${codec} --sparse: ${archive} → ${rawFile}`);
+            // `--sparse` is the fix for the ~4-min restore: the raw XFS image is a
+            // sparse 25G file whose holes compress to near-nothing, but a streaming
+            // decompress would re-materialize all 25G as REAL bytes (incl. gigabytes
+            // of zeros) → a 25G disk write every restore. Sparse decompress detects
+            // zero-runs and seeks over them, so only the ~8-12G of actual data
+            // blocks touch disk. `-f` overwrites any stale temp.
+            if (codec === "lz4") {
+                // lz4 writes sparse by default when the output is a regular file;
+                // `--sparse` is accepted explicitly for clarity/forward-compat.
+                yield exec.exec("lz4", ["-d", "--sparse", "-f", archive, rawFile], {
+                    cwd: this.safeCwd,
+                    silent: !core.isDebug()
+                });
+            }
+            else {
+                yield exec.exec("zstd", ["-d", "--sparse", "-f", "-o", rawFile, archive], { cwd: this.safeCwd, silent: !core.isDebug() });
+            }
+        });
+    }
+    /**
+     * Sniff the compression codec of a cache artifact by its 4-byte magic
+     * number: lz4 frame = 04 22 4D 18, zstd frame = 28 B5 2F FD. Defaults to
+     * zstd on any read/unknown result (the pre-lz4 codec), so a corrupt or
+     * truncated header fails in the same place it always did rather than
+     * silently mis-routing.
+     */
+    detectArchiveCodec(archive) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                const fh = yield fs.open(archive, "r");
+                try {
+                    const buf = Buffer.alloc(4);
+                    yield fh.read(buf, 0, 4, 0);
+                    if (buf.readUInt32LE(0) === 0x184d2204)
+                        return "lz4";
+                    if (buf.readUInt32LE(0) === 0xfd2fb528)
+                        return "zstd";
+                }
+                finally {
+                    yield fh.close();
+                }
+            }
+            catch (err) {
+                core.debug(`${this.getLogPrefix()} codec sniff failed (${err instanceof Error ? err.message : err}); defaulting to zstd`);
+            }
+            return "zstd";
         });
     }
 }
