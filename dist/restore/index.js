@@ -107820,23 +107820,10 @@ class Ext4UpperImage {
         return __awaiter(this, void 0, void 0, function* () {
             // Attach with direct-io=on so loop writes bypass the host page cache
             // (avoids dirty-page pileup → block-layer writeback throttling).
-            // --autoclear (LO_FLAGS_AUTOCLEAR): auto-detach when the last user
-            //   closes the device. At job end the merged overlay (whose upper is
-            //   this ext4 loop) can only be lazily unmounted (runner holds the
-            //   workspace as CWD), so an explicit `losetup -d` during POST fails
-            //   while the mount is still referenced. Without autoclear the loop
-            //   lingers attached and the kubelet must reap it at container exit
-            //   (30-90s pod-teardown stall). With autoclear the kernel drops it
-            //   automatically once the container exits and the last reference
-            //   closes, so the kubelet inherits nothing.
-            const attach = yield exec.getExecOutput("sudo", [
-                "losetup",
-                "--find",
-                "--show",
-                "--direct-io=on",
-                "--autoclear",
-                this.imageFile
-            ], { cwd: this.safeCwd });
+            // NOTE: no `--autoclear` flag — the runner's util-linux (Ubuntu 20.04)
+            // rejects that long option and would fail the whole attach. Autoclear is
+            // armed PORTABLY below via a deferred `losetup -d` after the mount.
+            const attach = yield exec.getExecOutput("sudo", ["losetup", "--find", "--show", "--direct-io=on", this.imageFile], { cwd: this.safeCwd });
             const dev = attach.stdout.trim();
             if (!dev) {
                 throw new Error(`losetup did not return a loop device for ${this.imageFile}`);
@@ -107853,6 +107840,21 @@ class Ext4UpperImage {
                 yield exec.exec("sudo", ["mount", "-t", "ext4", "-o", "noatime", dev, mountPoint], { cwd: this.safeCwd });
             }
             this.info(`Mounted ${dev} → ${mountPoint} (ext4, noatime)`);
+            // Portable autoclear: `losetup -d` on the now-mounted device does not
+            // detach immediately (the mount holds it) but marks LO_FLAGS_AUTOCLEAR,
+            // so the loop auto-frees when the overlay is (lazily) unmounted at job
+            // end — the kubelet then inherits no attached loop to reap. Works on all
+            // util-linux versions (unlike the `--autoclear` attach flag).
+            try {
+                yield exec.exec("sudo", ["losetup", "-d", dev], {
+                    cwd: this.safeCwd,
+                    silent: !core.isDebug()
+                });
+                core.debug(`${LOG_PREFIX} Armed autoclear (deferred detach) on ${dev}`);
+            }
+            catch (_a) {
+                /* non-fatal: falls back to explicit detach in unmount() */
+            }
         });
     }
     /**
@@ -109426,21 +109428,17 @@ class LoopImage {
             let loopDev = "";
             let stderrOutput = "";
             try {
-                // --show: print the chosen /dev/loopN.
-                // --autoclear (LO_FLAGS_AUTOCLEAR): the loop device auto-detaches
-                //   the instant its LAST user closes it. This is what keeps pod
-                //   teardown O(1) on ephemeral k8s/ARC runners: at job end the
-                //   workspace overlay can only be *lazily* unmounted (`umount -l`)
-                //   because the runner agent still holds it as CWD, so an explicit
-                //   `losetup -d` during the POST step always fails (device still
-                //   referenced) and, without autoclear, the loop would linger
-                //   attached — forcing the kubelet to reap a still-attached loop at
-                //   container exit (measured 30-90s of "job spinning after it
-                //   visually finished"). With autoclear the kernel drops the loop
-                //   automatically when the container exits and the last reference
-                //   closes, so the kubelet inherits nothing. Harmless on reused
-                //   EC2 runners (the explicit detach still fires there).
-                yield exec.exec("sudo", ["losetup", "--find", "--show", "--autoclear", imageFile], {
+                // --show: print the chosen /dev/loopN. NOTE: do NOT pass
+                // `--autoclear` here — the runner image's util-linux (Ubuntu 20.04)
+                // does not support that long option and rejects the whole attach
+                // ("losetup: unrecognized option '--autoclear'"), which broke EVERY
+                // xfs/ext4 cache mount. Autoclear (auto-detach on last close, needed
+                // so the kubelet doesn't stall reaping a lazily-unmounted loop at pod
+                // teardown) is instead requested PORTABLY via a deferred `losetup -d`
+                // issued while the device is still mounted — see enableAutoclear(),
+                // called right after a successful mount. That marks LO_FLAGS_AUTOCLEAR
+                // on ALL util-linux versions.
+                yield exec.exec("sudo", ["losetup", "--find", "--show", imageFile], {
                     cwd: this.safeCwd,
                     listeners: {
                         stdout: (data) => {
@@ -109491,6 +109489,25 @@ class LoopImage {
                     cwd: this.safeCwd,
                     silent: !core.isDebug()
                 }), MOUNT_TIMEOUT_MS, `mount ${actualDevice} at ${mountPath}`, this.logPrefix);
+                // Portable autoclear: once the device is mounted, `losetup -d` on it
+                // does NOT detach immediately (the mount holds it) — the kernel
+                // instead sets LO_FLAGS_AUTOCLEAR, so the loop is auto-freed the
+                // moment its last user (the mount) goes away. On ephemeral k8s/ARC
+                // runners the workspace overlay can only be lazily unmounted at job
+                // end (the runner holds it as CWD), so an explicit detach in the
+                // POST step can't succeed; with autoclear armed here the kubelet
+                // inherits no still-attached loop at pod teardown (was 30-90s of
+                // "job spinning after it visually finished"). Best-effort: on reused
+                // EC2 runners the explicit POST detach still fires as before.
+                if (isLoopMount && this.activeLoopDevice) {
+                    try {
+                        yield sudoExec("losetup", ["-d", this.activeLoopDevice], this.safeCwd);
+                        core.debug(`${this.logPrefix} Armed autoclear (deferred detach) on ${this.activeLoopDevice}`);
+                    }
+                    catch (e) {
+                        core.debug(`${this.logPrefix} Could not arm autoclear on ${this.activeLoopDevice} (non-fatal): ${e instanceof Error ? e.message : e}`);
+                    }
+                }
             }
             catch (error) {
                 // Diagnostics: only collect in debug mode to keep normal failures fast

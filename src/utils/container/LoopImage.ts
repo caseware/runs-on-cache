@@ -502,23 +502,19 @@ export abstract class LoopImage {
         let loopDev = "";
         let stderrOutput = "";
         try {
-            // --show: print the chosen /dev/loopN.
-            // --autoclear (LO_FLAGS_AUTOCLEAR): the loop device auto-detaches
-            //   the instant its LAST user closes it. This is what keeps pod
-            //   teardown O(1) on ephemeral k8s/ARC runners: at job end the
-            //   workspace overlay can only be *lazily* unmounted (`umount -l`)
-            //   because the runner agent still holds it as CWD, so an explicit
-            //   `losetup -d` during the POST step always fails (device still
-            //   referenced) and, without autoclear, the loop would linger
-            //   attached — forcing the kubelet to reap a still-attached loop at
-            //   container exit (measured 30-90s of "job spinning after it
-            //   visually finished"). With autoclear the kernel drops the loop
-            //   automatically when the container exits and the last reference
-            //   closes, so the kubelet inherits nothing. Harmless on reused
-            //   EC2 runners (the explicit detach still fires there).
+            // --show: print the chosen /dev/loopN. NOTE: do NOT pass
+            // `--autoclear` here — the runner image's util-linux (Ubuntu 20.04)
+            // does not support that long option and rejects the whole attach
+            // ("losetup: unrecognized option '--autoclear'"), which broke EVERY
+            // xfs/ext4 cache mount. Autoclear (auto-detach on last close, needed
+            // so the kubelet doesn't stall reaping a lazily-unmounted loop at pod
+            // teardown) is instead requested PORTABLY via a deferred `losetup -d`
+            // issued while the device is still mounted — see enableAutoclear(),
+            // called right after a successful mount. That marks LO_FLAGS_AUTOCLEAR
+            // on ALL util-linux versions.
             await exec.exec(
                 "sudo",
-                ["losetup", "--find", "--show", "--autoclear", imageFile],
+                ["losetup", "--find", "--show", imageFile],
                 {
                     cwd: this.safeCwd,
                     listeners: {
@@ -586,6 +582,35 @@ export abstract class LoopImage {
                 `mount ${actualDevice} at ${mountPath}`,
                 this.logPrefix
             );
+
+            // Portable autoclear: once the device is mounted, `losetup -d` on it
+            // does NOT detach immediately (the mount holds it) — the kernel
+            // instead sets LO_FLAGS_AUTOCLEAR, so the loop is auto-freed the
+            // moment its last user (the mount) goes away. On ephemeral k8s/ARC
+            // runners the workspace overlay can only be lazily unmounted at job
+            // end (the runner holds it as CWD), so an explicit detach in the
+            // POST step can't succeed; with autoclear armed here the kubelet
+            // inherits no still-attached loop at pod teardown (was 30-90s of
+            // "job spinning after it visually finished"). Best-effort: on reused
+            // EC2 runners the explicit POST detach still fires as before.
+            if (isLoopMount && this.activeLoopDevice) {
+                try {
+                    await sudoExec(
+                        "losetup",
+                        ["-d", this.activeLoopDevice],
+                        this.safeCwd
+                    );
+                    core.debug(
+                        `${this.logPrefix} Armed autoclear (deferred detach) on ${this.activeLoopDevice}`
+                    );
+                } catch (e) {
+                    core.debug(
+                        `${this.logPrefix} Could not arm autoclear on ${
+                            this.activeLoopDevice
+                        } (non-fatal): ${e instanceof Error ? e.message : e}`
+                    );
+                }
+            }
         } catch (error) {
             // Diagnostics: only collect in debug mode to keep normal failures fast
             if (core.isDebug()) {

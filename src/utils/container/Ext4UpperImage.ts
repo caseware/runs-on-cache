@@ -113,25 +113,12 @@ export class Ext4UpperImage {
     async mountRW(mountPoint: string): Promise<void> {
         // Attach with direct-io=on so loop writes bypass the host page cache
         // (avoids dirty-page pileup → block-layer writeback throttling).
-        // --autoclear (LO_FLAGS_AUTOCLEAR): auto-detach when the last user
-        //   closes the device. At job end the merged overlay (whose upper is
-        //   this ext4 loop) can only be lazily unmounted (runner holds the
-        //   workspace as CWD), so an explicit `losetup -d` during POST fails
-        //   while the mount is still referenced. Without autoclear the loop
-        //   lingers attached and the kubelet must reap it at container exit
-        //   (30-90s pod-teardown stall). With autoclear the kernel drops it
-        //   automatically once the container exits and the last reference
-        //   closes, so the kubelet inherits nothing.
+        // NOTE: no `--autoclear` flag — the runner's util-linux (Ubuntu 20.04)
+        // rejects that long option and would fail the whole attach. Autoclear is
+        // armed PORTABLY below via a deferred `losetup -d` after the mount.
         const attach = await exec.getExecOutput(
             "sudo",
-            [
-                "losetup",
-                "--find",
-                "--show",
-                "--direct-io=on",
-                "--autoclear",
-                this.imageFile
-            ],
+            ["losetup", "--find", "--show", "--direct-io=on", this.imageFile],
             { cwd: this.safeCwd }
         );
         const dev = attach.stdout.trim();
@@ -165,6 +152,23 @@ export class Ext4UpperImage {
             );
         }
         this.info(`Mounted ${dev} → ${mountPoint} (ext4, noatime)`);
+
+        // Portable autoclear: `losetup -d` on the now-mounted device does not
+        // detach immediately (the mount holds it) but marks LO_FLAGS_AUTOCLEAR,
+        // so the loop auto-frees when the overlay is (lazily) unmounted at job
+        // end — the kubelet then inherits no attached loop to reap. Works on all
+        // util-linux versions (unlike the `--autoclear` attach flag).
+        try {
+            await exec.exec("sudo", ["losetup", "-d", dev], {
+                cwd: this.safeCwd,
+                silent: !core.isDebug()
+            });
+            core.debug(
+                `${LOG_PREFIX} Armed autoclear (deferred detach) on ${dev}`
+            );
+        } catch {
+            /* non-fatal: falls back to explicit detach in unmount() */
+        }
     }
 
     /**
