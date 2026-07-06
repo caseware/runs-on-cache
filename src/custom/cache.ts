@@ -1,21 +1,26 @@
 // https://github.com/actions/toolkit/blob/%40actions/cache%403.2.2/packages/cache/src/cache.ts
 
-import * as core from "@actions/core";
-import * as path from "path";
 import * as utils from "@actions/cache/lib/internal/cacheUtils";
-import * as cacheHttpClient from "./backend";
+import { CompressionMethod } from "@actions/cache/lib/internal/constants";
 import {
     createTar,
     extractTar,
     listTar
 } from "@actions/cache/lib/internal/tar";
 import { DownloadOptions, UploadOptions } from "@actions/cache/lib/options";
+import * as core from "@actions/core";
 import { execSync } from "child_process";
-import { createCacheKeySpecificTempDirectory, getCacheFileName, getCompressionMethod } from "../utils/actionUtils";
-import { CompressionMethod } from "@actions/cache/lib/internal/constants";
-import { ContainerFactory } from "../utils/container/ContainerFactory";
+import * as path from "path";
+
 import { Inputs, Outputs } from "../constants";
+import {
+    createCacheKeySpecificTempDirectory,
+    getCacheFileName,
+    getCompressionMethod
+} from "../utils/actionUtils";
 import { Container } from "../utils/container/Container";
+import { ContainerFactory } from "../utils/container/ContainerFactory";
+import * as cacheHttpClient from "./backend";
 
 export class ValidationError extends Error {
     constructor(message: string) {
@@ -109,10 +114,15 @@ export async function restoreCache(
     core.debug(`Using fsSize: ${fsSize}`);
     const bufferMb = parseInt(core.getInput(Inputs.FsBufferMB) || "2048");
     core.debug(`Using bufferMb: ${bufferMb}`);
-    const saveCompressionLevel = core.getInput(Inputs.SaveCompressionLevel) || undefined;
-    const nodeLocalCacheDir = core.getInput(Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
+    const saveCompressionLevel =
+        core.getInput(Inputs.SaveCompressionLevel) || undefined;
+    const nodeLocalCacheDir =
+        core.getInput(Inputs.NodeLocalCacheDir) ||
+        process.env["NODE_LOCAL_CACHE_DIR"] ||
+        "";
     const mountMode = (core.getInput(Inputs.MountMode) || "rw") as "ro" | "rw";
-    const overlayUpperSize = core.getInput(Inputs.OverlayUpperSize) || undefined;
+    const overlayUpperSize =
+        core.getInput(Inputs.OverlayUpperSize) || undefined;
     let cacheContainer: Container | undefined = undefined;
     try {
         const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
@@ -130,7 +140,14 @@ export async function restoreCache(
             baseDir,
             paths,
             primaryKey,
-            { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode, overlayUpperSize }
+            {
+                fsSize,
+                bufferMb,
+                saveCompressionLevel,
+                nodeLocalCacheDir,
+                mountMode,
+                overlayUpperSize
+            }
         );
 
         // Initialize container (prerequisite checks, stale temp cleanup)
@@ -159,7 +176,9 @@ export async function restoreCache(
 
         // Try node-local restore first (fast path: ~1-2s on warm node)
         const nodeLocalEnabled = cacheContainer.isNodeLocalEnabled();
-        const restoredFromLocal = await cacheContainer.tryRestoreFromNodeLocal(restoreKeys);
+        const restoredFromLocal = await cacheContainer.tryRestoreFromNodeLocal(
+            restoreKeys
+        );
         if (restoredFromLocal) {
             core.info("Cache restored from node-local storage (fast path)");
             core.setOutput(Outputs.NodeLocalCacheHit, "true");
@@ -182,7 +201,10 @@ export async function restoreCache(
         if (!cacheEntry?.archiveLocation) {
             // Cache not found
             core.debug("Cache not found");
-            core.setOutput(Outputs.NodeLocalCacheHit, nodeLocalEnabled ? "false" : "disabled");
+            core.setOutput(
+                Outputs.NodeLocalCacheHit,
+                nodeLocalEnabled ? "false" : "disabled"
+            );
             core.setOutput(Outputs.CacheSource, "cold-boot");
             if (cacheContainer && cacheContainer.requiresCreateEmptyCache) {
                 await cacheContainer.createEmptyCache();
@@ -201,40 +223,97 @@ export async function restoreCache(
         // When node-local is enabled, download directly to the HostPath dir
         // so we avoid a redundant copy. The temp file is committed atomically after download.
         let downloadPath = archivePath;
-        const nodeLocalTempPath = await cacheContainer.getNodeLocalDownloadPath();
-        if (nodeLocalTempPath) {
-            downloadPath = nodeLocalTempPath;
-            core.info(`[NodeLocal] S3 downloading directly to node-local temp: ${downloadPath}`);
+
+        // IN-FLIGHT COALESCE: before spending ~5 min downloading + decompressing a
+        // ~25 GB image, check whether another populator (a concurrent runner OR
+        // the prewarm DaemonSet) is already producing this exact node-local key.
+        // If so, wait for their result and reuse it — skipping the redundant work
+        // entirely. Only the lock holder ("populate") actually downloads.
+        let holdsPopulateLock = false;
+        if (cacheContainer.isNodeLocalEnabled()) {
+            const decision = await cacheContainer.coalesceNodeLocalPopulate();
+            if (decision === "hit") {
+                // Another populator produced the image while we waited. Mount it
+                // via the normal node-local fast path (sets workspace + the
+                // node-local-hit / cache-source outputs) instead of downloading.
+                const restored = await cacheContainer.tryRestoreFromNodeLocal(
+                    restoreKeys
+                );
+                if (restored) {
+                    core.info(
+                        "[NodeLocal] Coalesced onto an in-flight populate — restored from node-local (skipped redundant download+decompress)"
+                    );
+                    core.setOutput(Outputs.NodeLocalCacheHit, "true");
+                    core.setOutput(
+                        Outputs.CacheSource,
+                        cacheContainer.getRestoreSource() || "node-local"
+                    );
+                    return cacheEntry.cacheKey;
+                }
+                // Mount failed (e.g. file removed under us) — fall through and populate.
+                core.warning(
+                    "[NodeLocal] Coalesce hit but node-local restore failed — populating ourselves"
+                );
+            }
+            holdsPopulateLock = true; // decision === "populate"
         }
 
-        await cacheHttpClient.downloadCache(
-            cacheEntry.archiveLocation,
-            downloadPath,
-            options
-        );
-
-        // If downloaded to node-local temp, commit (atomic mv) and point container at the final path
-        if (nodeLocalTempPath) {
-            const committed = await cacheContainer.commitNodeLocalDownload(nodeLocalTempPath);
-            if (committed) {
-                core.info(`[NodeLocal] Committed download to node-local cache`);
-            } else {
-                core.info(`[NodeLocal] Another runner already committed — using existing`);
+        try {
+            const nodeLocalTempPath =
+                await cacheContainer.getNodeLocalDownloadPath();
+            if (nodeLocalTempPath) {
+                downloadPath = nodeLocalTempPath;
+                core.info(
+                    `[NodeLocal] S3 downloading directly to node-local temp: ${downloadPath}`
+                );
             }
-            // After commit, the temp file has been renamed to the final path.
-            // Use the final committed path (not the temp path which no longer exists).
-            const finalPath = cacheContainer.getNodeLocalFinalPath();
-            if (finalPath) {
-                downloadPath = finalPath;
-                archivePath = finalPath;
+
+            await cacheHttpClient.downloadCache(
+                cacheEntry.archiveLocation,
+                downloadPath,
+                options
+            );
+
+            // If downloaded to node-local temp, commit (atomic mv) and point container at the final path
+            if (nodeLocalTempPath) {
+                const committed = await cacheContainer.commitNodeLocalDownload(
+                    nodeLocalTempPath
+                );
+                if (committed) {
+                    core.info(
+                        `[NodeLocal] Committed download to node-local cache`
+                    );
+                } else {
+                    core.info(
+                        `[NodeLocal] Another runner already committed — using existing`
+                    );
+                }
+                // After commit, the temp file has been renamed to the final path.
+                // Use the final committed path (not the temp path which no longer exists).
+                const finalPath = cacheContainer.getNodeLocalFinalPath();
+                if (finalPath) {
+                    downloadPath = finalPath;
+                    archivePath = finalPath;
+                }
+            }
+        } finally {
+            // Release the populate lock so waiters can proceed (they mount the
+            // now-final image). Best-effort; a leaked lock self-expires as stale.
+            if (holdsPopulateLock) {
+                await cacheContainer.releaseNodeLocalPopulateLock();
             }
         }
 
         if (core.isDebug()) {
             if (customCompression) {
-                core.debug("ListTar unavailable with custom compression method");
+                core.debug(
+                    "ListTar unavailable with custom compression method"
+                );
             } else {
-                await listTar(archivePath, compressionMethod as CompressionMethod);
+                await listTar(
+                    archivePath,
+                    compressionMethod as CompressionMethod
+                );
             }
         }
 
@@ -252,7 +331,10 @@ export async function restoreCache(
         core.info("Cache restored successfully from S3");
 
         // Report node-local cache miss (S3 fallback) or disabled
-        core.setOutput(Outputs.NodeLocalCacheHit, nodeLocalEnabled ? "false" : "disabled");
+        core.setOutput(
+            Outputs.NodeLocalCacheHit,
+            nodeLocalEnabled ? "false" : "disabled"
+        );
         core.setOutput(Outputs.CacheSource, "s3");
 
         return cacheEntry.cacheKey;
@@ -279,11 +361,15 @@ export async function restoreCache(
             // image (e.g. after a corrupted cache download).
             if (cacheContainer && cacheContainer.requiresCreateEmptyCache) {
                 try {
-                    core.info("Creating empty BTRFS cache as fallback after restore failure");
+                    core.info(
+                        "Creating empty BTRFS cache as fallback after restore failure"
+                    );
                     await cacheContainer.createEmptyCache();
                 } catch (createError) {
                     core.warning(
-                        `Fallback createEmptyCache also failed: ${(createError as Error).message}`
+                        `Fallback createEmptyCache also failed: ${
+                            (createError as Error).message
+                        }`
                     );
                 }
             }
@@ -315,7 +401,7 @@ export async function restoreCache(
 export async function restoreCacheSync(
     paths: string[],
     primaryKey: string,
-    options?: DownloadOptions,
+    options?: DownloadOptions
 ): Promise<string | undefined> {
     checkPaths(paths);
 
@@ -325,7 +411,10 @@ export async function restoreCacheSync(
 
     try {
         // path are needed to compute version
-        const cacheEntry = await cacheHttpClient.getCacheEntrySync(primaryKey, paths);
+        const cacheEntry = await cacheHttpClient.getCacheEntrySync(
+            primaryKey,
+            paths
+        );
         if (!cacheEntry?.archiveLocation) {
             // Cache not found
             return undefined;
@@ -412,13 +501,18 @@ export async function saveCache(
         const baseDir = process.env["GITHUB_WORKSPACE"] || process.cwd();
 
         const fsSize = core.getInput(Inputs.FsSize) || "50G";
-        const bufferMb = parseInt(
-            core.getInput(Inputs.FsBufferMB) || "2048"
-        );
-        const saveCompressionLevel = core.getInput(Inputs.SaveCompressionLevel) || undefined;
-        const nodeLocalCacheDir = core.getInput(Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
-        const mountMode = (core.getInput(Inputs.MountMode) || "rw") as "ro" | "rw";
-        const overlayUpperSize = core.getInput(Inputs.OverlayUpperSize) || undefined;
+        const bufferMb = parseInt(core.getInput(Inputs.FsBufferMB) || "2048");
+        const saveCompressionLevel =
+            core.getInput(Inputs.SaveCompressionLevel) || undefined;
+        const nodeLocalCacheDir =
+            core.getInput(Inputs.NodeLocalCacheDir) ||
+            process.env["NODE_LOCAL_CACHE_DIR"] ||
+            "";
+        const mountMode = (core.getInput(Inputs.MountMode) || "rw") as
+            | "ro"
+            | "rw";
+        const overlayUpperSize =
+            core.getInput(Inputs.OverlayUpperSize) || undefined;
         const cacheContainer = ContainerFactory.getCacheContainer(
             customCompression,
             customCompressionLevel,
@@ -426,37 +520,59 @@ export async function saveCache(
             baseDir,
             paths,
             key,
-            { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode, overlayUpperSize }
+            {
+                fsSize,
+                bufferMb,
+                saveCompressionLevel,
+                nodeLocalCacheDir,
+                mountMode,
+                overlayUpperSize
+            }
         );
 
         await cacheContainer.initialize();
         await cacheContainer.save();
 
         // After save, persist to node-local if enabled (so subsequent runs on this node get a hit)
-        if (cacheContainer.isNodeLocalEnabled() && !cacheContainer.shouldSkipS3Upload()) {
+        if (
+            cacheContainer.isNodeLocalEnabled() &&
+            !cacheContainer.shouldSkipS3Upload()
+        ) {
             const tempPath = await cacheContainer.getNodeLocalDownloadPath();
             if (tempPath) {
                 try {
                     const fsModule = await import("fs/promises");
                     await fsModule.copyFile(archivePath, tempPath);
-                    const committed = await cacheContainer.commitNodeLocalDownload(tempPath);
+                    const committed =
+                        await cacheContainer.commitNodeLocalDownload(tempPath);
                     if (committed) {
-                        core.info("[NodeLocal] Saved image to node-local cache for future runs");
+                        core.info(
+                            "[NodeLocal] Saved image to node-local cache for future runs"
+                        );
                     } else {
-                        core.info("[NodeLocal] Node-local cache already populated by another runner");
+                        core.info(
+                            "[NodeLocal] Node-local cache already populated by another runner"
+                        );
                     }
                 } catch (err) {
-                    core.warning(`[NodeLocal] Failed to persist to node-local: ${err instanceof Error ? err.message : err}`);
+                    core.warning(
+                        `[NodeLocal] Failed to persist to node-local: ${
+                            err instanceof Error ? err.message : err
+                        }`
+                    );
                 }
             }
         }
 
         // Skip S3 upload if the container was restored from node-local storage (WORM)
         if (cacheContainer.shouldSkipS3Upload()) {
-            core.info("Skipping S3 upload — restored from node-local cache (WORM)");
+            core.info(
+                "Skipping S3 upload — restored from node-local cache (WORM)"
+            );
             cacheId = 1;
         } else {
-            const archiveFileSize = utils.getArchiveFileSizeInBytes(archivePath);
+            const archiveFileSize =
+                utils.getArchiveFileSizeInBytes(archivePath);
             core.info(`File Size: ${archiveFileSize}`);
 
             await cacheHttpClient.saveCache(key, paths, archivePath, {
@@ -474,12 +590,23 @@ export async function saveCache(
             core.info(`Failed to save: ${typedError.message}`);
         } else {
             let failOnError = false;
-            try { failOnError = core.getBooleanInput(Inputs.FailOnSaveError, { required: false }); } catch { /* input not set */ }
+            try {
+                failOnError = core.getBooleanInput(Inputs.FailOnSaveError, {
+                    required: false
+                });
+            } catch {
+                /* input not set */
+            }
             // Post-step fallback: action inputs are not reliably present in the
             // post step, so getBooleanInput throws/defaults to false and the
             // save failure would be swallowed (job goes green). Fall back to the
             // value persisted to state during restore.
-            if (!failOnError && core.getState("FAIL_ON_SAVE_ERROR") === "true") { failOnError = true; }
+            if (
+                !failOnError &&
+                core.getState("FAIL_ON_SAVE_ERROR") === "true"
+            ) {
+                failOnError = true;
+            }
             if (failOnError) {
                 core.setFailed(`Cache save failed: ${typedError.message}`);
             } else {
@@ -537,12 +664,23 @@ export async function saveCacheSync(
             core.info(`Failed to save: ${typedError.message}`);
         } else {
             let failOnError = false;
-            try { failOnError = core.getBooleanInput(Inputs.FailOnSaveError, { required: false }); } catch { /* input not set */ }
+            try {
+                failOnError = core.getBooleanInput(Inputs.FailOnSaveError, {
+                    required: false
+                });
+            } catch {
+                /* input not set */
+            }
             // Post-step fallback: action inputs are not reliably present in the
             // post step, so getBooleanInput throws/defaults to false and the
             // save failure would be swallowed (job goes green). Fall back to the
             // value persisted to state during restore.
-            if (!failOnError && core.getState("FAIL_ON_SAVE_ERROR") === "true") { failOnError = true; }
+            if (
+                !failOnError &&
+                core.getState("FAIL_ON_SAVE_ERROR") === "true"
+            ) {
+                failOnError = true;
+            }
             if (failOnError) {
                 core.setFailed(`Cache save failed: ${typedError.message}`);
             } else {

@@ -1,7 +1,7 @@
 import * as core from "@actions/core";
+import * as crypto from "crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
-import * as crypto from "crypto";
 
 const STALE_TEMP_FILE_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
 
@@ -44,7 +44,10 @@ export class NodeLocalCache {
      * e.g. /opt/local-volumes/btrfs-cache/<cache-key>.btrfs
      */
     get localPath(): string {
-        return path.join(this.cacheDir, `${this.sanitizeKey(this.cacheKey)}${this.extension}`);
+        return path.join(
+            this.cacheDir,
+            `${this.sanitizeKey(this.cacheKey)}${this.extension}`
+        );
     }
 
     /**
@@ -92,21 +95,50 @@ export class NodeLocalCache {
             // Try without sudo first; fall back to sudo if permission denied.
             try {
                 await fs.mkdir(this.cacheDir, { recursive: true });
-                await fs.access(this.cacheDir, (await import("fs")).constants.W_OK);
+                await fs.access(
+                    this.cacheDir,
+                    (
+                        await import("fs")
+                    ).constants.W_OK
+                );
             } catch {
                 // mkdir or access failed — try with sudo (runners have privileged: true)
                 const { exec: execCmd } = await import("@actions/exec");
-                await execCmd("sudo", ["mkdir", "-p", this.cacheDir], { silent: true });
+                await execCmd("sudo", ["mkdir", "-p", this.cacheDir], {
+                    silent: true
+                });
                 // getuid/getgid are typed optional (undefined on Windows) under
                 // @types/node 24; this path is Linux-runner-only, so assert.
-                await execCmd("sudo", ["chown", `${process.getuid!()}:${process.getgid!()}`, this.cacheDir], { silent: true });
-                await fs.access(this.cacheDir, (await import("fs")).constants.W_OK);
+                await execCmd(
+                    "sudo",
+                    [
+                        "chown",
+                        `${process.getuid!()}:${process.getgid!()}`,
+                        this.cacheDir
+                    ],
+                    { silent: true }
+                );
+                await fs.access(
+                    this.cacheDir,
+                    (
+                        await import("fs")
+                    ).constants.W_OK
+                );
             }
 
             const randomSuffix = crypto.randomBytes(8).toString("hex");
+            // Embed the sanitized cache key so the temp file is ATTRIBUTABLE to
+            // this key. The coalesce liveness check (populateIsDead) keys off an
+            // active temp file's mtime; with multiple distinct keys populating
+            // concurrently on the same node (e.g. aarch64 + x86_64, or across a
+            // yarn.lock/base-fp change), a keyless `.tempXXX` name would make one
+            // key's download look like liveness for a DIFFERENT key's lock. The
+            // `.temp-<key>-<rand>` form lets the check match only this key's temp.
             const tempPath = path.join(
                 this.cacheDir,
-                `.temp${randomSuffix}${this.extension}`
+                `.temp-${this.sanitizeKey(this.cacheKey)}-${randomSuffix}${
+                    this.extension
+                }`
             );
             core.debug(`[NodeLocal] Created temp path: ${tempPath}`);
             return tempPath;
@@ -137,7 +169,9 @@ export class NodeLocalCache {
             try {
                 await fs.access(finalPath);
                 // Another runner already placed it — clean up our temp and move on
-                core.info(`[NodeLocal] Another runner already populated ${finalPath} — skipping`);
+                core.info(
+                    `[NodeLocal] Another runner already populated ${finalPath} — skipping`
+                );
                 await this.removeSafe(tempPath);
                 return false;
             } catch {
@@ -152,7 +186,9 @@ export class NodeLocalCache {
             // rename can fail with ENOTEMPTY or EEXIST on race — that's fine
             const code = (error as NodeJS.ErrnoException).code;
             if (code === "ENOTEMPTY" || code === "EEXIST") {
-                core.info(`[NodeLocal] Race detected on commit — another runner won. Cleaning up.`);
+                core.info(
+                    `[NodeLocal] Race detected on commit — another runner won. Cleaning up.`
+                );
                 await this.removeSafe(tempPath);
                 return false;
             }
@@ -165,6 +201,184 @@ export class NodeLocalCache {
             await this.removeSafe(tempPath);
             return false;
         }
+    }
+
+    /**
+     * In-flight COALESCE for node-local population.
+     *
+     * Problem: when a key is cold node-local (e.g. right after a key rotation, or
+     * on a fresh node), EVERY runner that lands on the node AND the prewarm
+     * DaemonSet all race to download (~5 GB) + decompress (~25 GB) the SAME image
+     * simultaneously. Only one wins the final atomic rename; the rest throw away
+     * minutes of identical work ("Another runner already committed — using
+     * existing"). Deploying the prewarm DS made this near-certain.
+     *
+     * Fix: a per-key lock (atomic `mkdir <key>.lock.d`, which is atomic even on a
+     * shared hostPath). The first caller acquires it and populates; concurrent
+     * callers WAIT for the final image to appear and reuse it — skipping the
+     * redundant download+decompress entirely.
+     *
+     * Returns:
+     *   "hit"      — the final image appeared while we waited; caller should mount it (no work).
+     *   "populate" — we hold the lock; caller does the download+decompress+commit,
+     *                then MUST call releasePopulateLock().
+     *
+     * Liveness WITHOUT a heartbeat process (this is the crux). The GitHub Actions
+     * runner executes the restore action as a short-lived node process that EXITS
+     * between composite steps — an in-process setInterval heartbeat dies with it,
+     * so the lock's freshness must be observable from the FILESYSTEM alone. It is:
+     * the populator downloads into a `.temp<ext>` file that the kernel keeps
+     * writing (mtime advances) for the whole ~1-5 min download+decompress, with NO
+     * surviving process required. So:
+     *   - lock present + an active `.temp<ext>` (mtime advanced < STALE_LOCK_MS
+     *     ago)  ⇒ a populate is genuinely in flight ⇒ WAIT.
+     *   - lock present + NO fresh temp file (none, or mtime stale)  ⇒ the producer
+     *     died (or hasn't started writing within GRACE_MS) ⇒ STEAL atomically.
+     *   - final image present ⇒ "hit".
+     *
+     * Steal is atomic via rename(lockDir → lockDir.dead-<uniq>): only one waiter's
+     * rename of a given source can succeed, so no thundering-herd double-steal;
+     * losers get ENOENT and re-race for the fresh lock. Waiter self-populates after
+     * WAIT_TIMEOUT_MS (never deadlock).
+     */
+    private get lockDir(): string {
+        return path.join(
+            this.cacheDir,
+            `${this.sanitizeKey(this.cacheKey)}.lock.d`
+        );
+    }
+
+    // A populate = download (~1 min) + decompress (~5 min). Liveness is proven by
+    // the .temp file's mtime advancing; we tolerate STALE_LOCK_MS of no-growth
+    // before declaring the producer dead. GRACE_MS gives a just-acquired lock time
+    // to create its temp file before any waiter can judge it stale.
+    private static readonly STALE_LOCK_MS = 60_000; // no temp-file growth for 60s ⇒ dead
+    private static readonly GRACE_MS = 45_000; // new lock's head-start to start writing
+    private static readonly WAIT_TIMEOUT_MS = 12 * 60_000; // waiter ceiling → self-populate
+
+    async acquirePopulateLockOrWait(): Promise<"hit" | "populate"> {
+        if (!this.enabled) return "populate";
+        const POLL_MS = 3000;
+        const started = Date.now();
+
+        if (await this.exists()) return "hit";
+
+        while (Date.now() - started <= NodeLocalCache.WAIT_TIMEOUT_MS) {
+            // Acquire: mkdir is atomic; EEXIST ⇒ someone else holds it.
+            try {
+                await fs.mkdir(this.lockDir);
+                core.info(
+                    `[NodeLocal] Acquired populate lock for ${this.sanitizeKey(
+                        this.cacheKey
+                    )} — populating`
+                );
+                return "populate";
+            } catch (e) {
+                if ((e as NodeJS.ErrnoException).code !== "EEXIST") {
+                    core.debug(
+                        `[NodeLocal] Lock mkdir failed (${
+                            (e as Error).message
+                        }); populating without coalesce`
+                    );
+                    return "populate";
+                }
+            }
+
+            // Held by another populator. If the image landed, reuse it.
+            if (await this.exists()) {
+                core.info(
+                    `[NodeLocal] Coalesced: another populator finished ${this.sanitizeKey(
+                        this.cacheKey
+                    )} — reusing (skipped redundant download+decompress)`
+                );
+                return "hit";
+            }
+
+            // Is a populate genuinely in flight? Proven by an active temp file
+            // (filesystem-observable, no heartbeat process needed).
+            if (!(await this.populateIsDead())) {
+                await new Promise(r => setTimeout(r, POLL_MS));
+                continue;
+            }
+
+            // Dead producer — steal ATOMICALLY via rename (single winner).
+            const graveyard = `${this.lockDir}.dead-${crypto
+                .randomBytes(6)
+                .toString("hex")}`;
+            try {
+                await fs.rename(this.lockDir, graveyard);
+                core.warning(
+                    `[NodeLocal] Populate lock has no active download for >${
+                        NodeLocalCache.STALE_LOCK_MS / 1000
+                    }s — stealing it atomically (producer died)`
+                );
+                await this.removeSafe(graveyard);
+                continue; // we won the steal; retry mkdir
+            } catch (e) {
+                if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+                    // Another waiter stole it first — re-race for the fresh lock.
+                    continue;
+                }
+                // Unexpected — fall through to poll/timeout.
+                await new Promise(r => setTimeout(r, POLL_MS));
+            }
+        }
+
+        // Waited past the ceiling without a result — self-populate rather than
+        // wait forever (worst case = one redundant populate, never a deadlock).
+        core.warning(
+            `[NodeLocal] Waited ${
+                NodeLocalCache.WAIT_TIMEOUT_MS / 60000
+            }m for another populator without result — populating ourselves`
+        );
+        return "populate";
+    }
+
+    /**
+     * Decide whether the lock's owner is DEAD, using only the filesystem (no live
+     * process). Alive ⇔ (a) the lock is younger than GRACE_MS (just acquired, temp
+     * file may not exist yet), OR (b) there is a `.temp<ext>` file whose mtime
+     * advanced within STALE_LOCK_MS (an active download is writing it). Otherwise
+     * dead (crashed producer / abandoned lock).
+     */
+    private async populateIsDead(): Promise<boolean> {
+        // (a) grace window for a freshly-acquired lock.
+        try {
+            const lst = await fs.stat(this.lockDir);
+            if (Date.now() - lst.mtimeMs < NodeLocalCache.GRACE_MS)
+                return false;
+        } catch {
+            return false; // lock vanished — not dead, just released
+        }
+        // (b) newest THIS-KEY temp mtime = download liveness. Only temps for our
+        // own key count — a different key's active download must not read as
+        // liveness for this lock (the multi-hash gap). Temp names are
+        // `.temp-<sanitizedKey>-<rand><ext>` (+ a transient `.raw` during
+        // decompress), so we match on our key prefix.
+        const tempPrefix = `.temp-${this.sanitizeKey(this.cacheKey)}-`;
+        try {
+            const entries = await fs.readdir(this.cacheDir);
+            let newestTempMtime = 0;
+            for (const e of entries) {
+                if (!e.startsWith(tempPrefix)) continue;
+                try {
+                    const st = await fs.stat(path.join(this.cacheDir, e));
+                    if (st.mtimeMs > newestTempMtime)
+                        newestTempMtime = st.mtimeMs;
+                } catch {
+                    /* raced away */
+                }
+            }
+            if (newestTempMtime === 0) return true; // no active download for THIS key → dead
+            return Date.now() - newestTempMtime > NodeLocalCache.STALE_LOCK_MS;
+        } catch {
+            return true; // can't inspect → assume dead so we don't wait forever
+        }
+    }
+
+    async releasePopulateLock(): Promise<void> {
+        if (!this.enabled) return;
+        await this.removeSafe(this.lockDir);
     }
 
     /**
@@ -206,17 +420,38 @@ export class NodeLocalCache {
                 //   on the node-local fs because $RUNNER_TEMP is overlayfs and
                 //   can't be an overlay upperdir). Normally removed at job end,
                 //   but a killed/cancelled job can orphan one — prune by age.
-                if (!entry.startsWith(".temp") && !entry.startsWith(".overlay-"))
+                // *.lock.d / *.lock.d.dead-* → populate-coalesce locks. A lock is
+                //   only live for the minutes of a populate, so any lock older
+                //   than the temp-file grace ceiling is abandoned (crashed
+                //   producer whose process never released it) — sweep it so it
+                //   can't wedge coalesce. Uses a much shorter age than temps.
+                const isLock =
+                    entry.endsWith(".lock.d") ||
+                    entry.includes(".lock.d.dead-");
+                if (
+                    !entry.startsWith(".temp") &&
+                    !entry.startsWith(".overlay-") &&
+                    !isLock
+                )
                     continue;
 
                 const fullPath = path.join(this.cacheDir, entry);
                 try {
                     const stat = await fs.stat(fullPath);
                     const ageMs = now - stat.mtimeMs;
+                    const maxAge = isLock
+                        ? 30 * 60 * 1000 // locks: 30 min (well past any real populate)
+                        : STALE_TEMP_FILE_AGE_MS;
 
-                    if (ageMs > STALE_TEMP_FILE_AGE_MS) {
+                    if (ageMs > maxAge) {
                         core.info(
-                            `[NodeLocal] Removing stale ${entry.startsWith(".overlay-") ? "overlay" : "temp"} entry (${Math.floor(ageMs / 3600000)}h old): ${entry}`
+                            `[NodeLocal] Removing stale ${
+                                entry.startsWith(".overlay-")
+                                    ? "overlay"
+                                    : "temp"
+                            } entry (${Math.floor(
+                                ageMs / 3600000
+                            )}h old): ${entry}`
                         );
                         await this.removeSafe(fullPath);
                         cleaned++;
@@ -231,7 +466,11 @@ export class NodeLocalCache {
             }
         } catch (error) {
             // Cache dir may not exist yet — that's fine
-            core.debug(`[NodeLocal] Cleanup skipped: ${error instanceof Error ? error.message : error}`);
+            core.debug(
+                `[NodeLocal] Cleanup skipped: ${
+                    error instanceof Error ? error.message : error
+                }`
+            );
         }
 
         return cleaned;
@@ -274,7 +513,10 @@ export class NodeLocalCache {
                     const fullPath = path.join(this.cacheDir, entry);
                     try {
                         const stat = await fs.stat(fullPath);
-                        candidates.push({ path: fullPath, mtime: stat.mtimeMs });
+                        candidates.push({
+                            path: fullPath,
+                            mtime: stat.mtimeMs
+                        });
                     } catch {
                         // File may have been removed by another runner
                     }
@@ -282,20 +524,25 @@ export class NodeLocalCache {
             }
 
             if (candidates.length === 0) {
-                core.debug("[NodeLocal] No partial match found for restore-keys");
+                core.debug(
+                    "[NodeLocal] No partial match found for restore-keys"
+                );
                 return null;
             }
 
             // Return the most recently modified match (newest = closest to current)
             candidates.sort((a, b) => b.mtime - a.mtime);
             core.info(
-                `[NodeLocal] Partial match found: ${path.basename(candidates[0].path)} ` +
-                `(${candidates.length} candidate(s), using newest)`
+                `[NodeLocal] Partial match found: ${path.basename(
+                    candidates[0].path
+                )} ` + `(${candidates.length} candidate(s), using newest)`
             );
             return candidates[0].path;
         } catch (error) {
             core.debug(
-                `[NodeLocal] findClosestMatch failed: ${error instanceof Error ? error.message : error}`
+                `[NodeLocal] findClosestMatch failed: ${
+                    error instanceof Error ? error.message : error
+                }`
             );
             return null;
         }
@@ -312,7 +559,9 @@ export class NodeLocalCache {
         } catch (error) {
             const code = (error as NodeJS.ErrnoException).code;
             if (code !== "ENOENT") {
-                core.debug(`[NodeLocal] Failed to remove ${filePath}: ${error}`);
+                core.debug(
+                    `[NodeLocal] Failed to remove ${filePath}: ${error}`
+                );
             }
         }
     }

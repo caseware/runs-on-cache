@@ -105877,14 +105877,14 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.saveCacheSync = exports.saveCache = exports.restoreCacheSync = exports.restoreCache = exports.isFeatureAvailable = exports.ReserveCacheError = exports.ValidationError = void 0;
+const utils = __importStar(__nccwpck_require__(98299));
+const tar_1 = __nccwpck_require__(95321);
 const core = __importStar(__nccwpck_require__(37484));
 const path = __importStar(__nccwpck_require__(16928));
-const utils = __importStar(__nccwpck_require__(98299));
-const cacheHttpClient = __importStar(__nccwpck_require__(35951));
-const tar_1 = __nccwpck_require__(95321);
+const constants_1 = __nccwpck_require__(27242);
 const actionUtils_1 = __nccwpck_require__(8270);
 const ContainerFactory_1 = __nccwpck_require__(58066);
-const constants_1 = __nccwpck_require__(27242);
+const cacheHttpClient = __importStar(__nccwpck_require__(35951));
 class ValidationError extends Error {
     constructor(message) {
         super(message);
@@ -105956,7 +105956,9 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
         const bufferMb = parseInt(core.getInput(constants_1.Inputs.FsBufferMB) || "2048");
         core.debug(`Using bufferMb: ${bufferMb}`);
         const saveCompressionLevel = core.getInput(constants_1.Inputs.SaveCompressionLevel) || undefined;
-        const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
+        const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) ||
+            process.env["NODE_LOCAL_CACHE_DIR"] ||
+            "";
         const mountMode = (core.getInput(constants_1.Inputs.MountMode) || "rw");
         const overlayUpperSize = core.getInput(constants_1.Inputs.OverlayUpperSize) || undefined;
         let cacheContainer = undefined;
@@ -105965,7 +105967,14 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             core.debug(`Using baseDir: ${baseDir}`);
             archivePath = path.join(yield (0, actionUtils_1.createCacheKeySpecificTempDirectory)(primaryKey), (0, actionUtils_1.getCacheFileName)(compressionMethod));
             core.debug(`Archive Path: ${archivePath}`);
-            cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode, overlayUpperSize });
+            cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, primaryKey, {
+                fsSize,
+                bufferMb,
+                saveCompressionLevel,
+                nodeLocalCacheDir,
+                mountMode,
+                overlayUpperSize
+            });
             // Initialize container (prerequisite checks, stale temp cleanup)
             yield cacheContainer.initialize();
             // Producer / force-rebuild: never restore a (possibly stale or corrupt)
@@ -106017,27 +106026,60 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
             // When node-local is enabled, download directly to the HostPath dir
             // so we avoid a redundant copy. The temp file is committed atomically after download.
             let downloadPath = archivePath;
-            const nodeLocalTempPath = yield cacheContainer.getNodeLocalDownloadPath();
-            if (nodeLocalTempPath) {
-                downloadPath = nodeLocalTempPath;
-                core.info(`[NodeLocal] S3 downloading directly to node-local temp: ${downloadPath}`);
+            // IN-FLIGHT COALESCE: before spending ~5 min downloading + decompressing a
+            // ~25 GB image, check whether another populator (a concurrent runner OR
+            // the prewarm DaemonSet) is already producing this exact node-local key.
+            // If so, wait for their result and reuse it — skipping the redundant work
+            // entirely. Only the lock holder ("populate") actually downloads.
+            let holdsPopulateLock = false;
+            if (cacheContainer.isNodeLocalEnabled()) {
+                const decision = yield cacheContainer.coalesceNodeLocalPopulate();
+                if (decision === "hit") {
+                    // Another populator produced the image while we waited. Mount it
+                    // via the normal node-local fast path (sets workspace + the
+                    // node-local-hit / cache-source outputs) instead of downloading.
+                    const restored = yield cacheContainer.tryRestoreFromNodeLocal(restoreKeys);
+                    if (restored) {
+                        core.info("[NodeLocal] Coalesced onto an in-flight populate — restored from node-local (skipped redundant download+decompress)");
+                        core.setOutput(constants_1.Outputs.NodeLocalCacheHit, "true");
+                        core.setOutput(constants_1.Outputs.CacheSource, cacheContainer.getRestoreSource() || "node-local");
+                        return cacheEntry.cacheKey;
+                    }
+                    // Mount failed (e.g. file removed under us) — fall through and populate.
+                    core.warning("[NodeLocal] Coalesce hit but node-local restore failed — populating ourselves");
+                }
+                holdsPopulateLock = true; // decision === "populate"
             }
-            yield cacheHttpClient.downloadCache(cacheEntry.archiveLocation, downloadPath, options);
-            // If downloaded to node-local temp, commit (atomic mv) and point container at the final path
-            if (nodeLocalTempPath) {
-                const committed = yield cacheContainer.commitNodeLocalDownload(nodeLocalTempPath);
-                if (committed) {
-                    core.info(`[NodeLocal] Committed download to node-local cache`);
+            try {
+                const nodeLocalTempPath = yield cacheContainer.getNodeLocalDownloadPath();
+                if (nodeLocalTempPath) {
+                    downloadPath = nodeLocalTempPath;
+                    core.info(`[NodeLocal] S3 downloading directly to node-local temp: ${downloadPath}`);
                 }
-                else {
-                    core.info(`[NodeLocal] Another runner already committed — using existing`);
+                yield cacheHttpClient.downloadCache(cacheEntry.archiveLocation, downloadPath, options);
+                // If downloaded to node-local temp, commit (atomic mv) and point container at the final path
+                if (nodeLocalTempPath) {
+                    const committed = yield cacheContainer.commitNodeLocalDownload(nodeLocalTempPath);
+                    if (committed) {
+                        core.info(`[NodeLocal] Committed download to node-local cache`);
+                    }
+                    else {
+                        core.info(`[NodeLocal] Another runner already committed — using existing`);
+                    }
+                    // After commit, the temp file has been renamed to the final path.
+                    // Use the final committed path (not the temp path which no longer exists).
+                    const finalPath = cacheContainer.getNodeLocalFinalPath();
+                    if (finalPath) {
+                        downloadPath = finalPath;
+                        archivePath = finalPath;
+                    }
                 }
-                // After commit, the temp file has been renamed to the final path.
-                // Use the final committed path (not the temp path which no longer exists).
-                const finalPath = cacheContainer.getNodeLocalFinalPath();
-                if (finalPath) {
-                    downloadPath = finalPath;
-                    archivePath = finalPath;
+            }
+            finally {
+                // Release the populate lock so waiters can proceed (they mount the
+                // now-final image). Best-effort; a leaked lock self-expires as stale.
+                if (holdsPopulateLock) {
+                    yield cacheContainer.releaseNodeLocalPopulateLock();
                 }
             }
             if (core.isDebug()) {
@@ -106188,14 +106230,24 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
             const fsSize = core.getInput(constants_1.Inputs.FsSize) || "50G";
             const bufferMb = parseInt(core.getInput(constants_1.Inputs.FsBufferMB) || "2048");
             const saveCompressionLevel = core.getInput(constants_1.Inputs.SaveCompressionLevel) || undefined;
-            const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) || process.env["NODE_LOCAL_CACHE_DIR"] || "";
+            const nodeLocalCacheDir = core.getInput(constants_1.Inputs.NodeLocalCacheDir) ||
+                process.env["NODE_LOCAL_CACHE_DIR"] ||
+                "";
             const mountMode = (core.getInput(constants_1.Inputs.MountMode) || "rw");
             const overlayUpperSize = core.getInput(constants_1.Inputs.OverlayUpperSize) || undefined;
-            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, key, { fsSize, bufferMb, saveCompressionLevel, nodeLocalCacheDir, mountMode, overlayUpperSize });
+            const cacheContainer = ContainerFactory_1.ContainerFactory.getCacheContainer(customCompression, customCompressionLevel, archivePath, baseDir, paths, key, {
+                fsSize,
+                bufferMb,
+                saveCompressionLevel,
+                nodeLocalCacheDir,
+                mountMode,
+                overlayUpperSize
+            });
             yield cacheContainer.initialize();
             yield cacheContainer.save();
             // After save, persist to node-local if enabled (so subsequent runs on this node get a hit)
-            if (cacheContainer.isNodeLocalEnabled() && !cacheContainer.shouldSkipS3Upload()) {
+            if (cacheContainer.isNodeLocalEnabled() &&
+                !cacheContainer.shouldSkipS3Upload()) {
                 const tempPath = yield cacheContainer.getNodeLocalDownloadPath();
                 if (tempPath) {
                     try {
@@ -106241,14 +106293,19 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
             else {
                 let failOnError = false;
                 try {
-                    failOnError = core.getBooleanInput(constants_1.Inputs.FailOnSaveError, { required: false });
+                    failOnError = core.getBooleanInput(constants_1.Inputs.FailOnSaveError, {
+                        required: false
+                    });
                 }
-                catch ( /* input not set */_a) { /* input not set */ }
+                catch (_a) {
+                    /* input not set */
+                }
                 // Post-step fallback: action inputs are not reliably present in the
                 // post step, so getBooleanInput throws/defaults to false and the
                 // save failure would be swallowed (job goes green). Fall back to the
                 // value persisted to state during restore.
-                if (!failOnError && core.getState("FAIL_ON_SAVE_ERROR") === "true") {
+                if (!failOnError &&
+                    core.getState("FAIL_ON_SAVE_ERROR") === "true") {
                     failOnError = true;
                 }
                 if (failOnError) {
@@ -106307,14 +106364,19 @@ function saveCacheSync(paths, key) {
             else {
                 let failOnError = false;
                 try {
-                    failOnError = core.getBooleanInput(constants_1.Inputs.FailOnSaveError, { required: false });
+                    failOnError = core.getBooleanInput(constants_1.Inputs.FailOnSaveError, {
+                        required: false
+                    });
                 }
-                catch ( /* input not set */_a) { /* input not set */ }
+                catch (_a) {
+                    /* input not set */
+                }
                 // Post-step fallback: action inputs are not reliably present in the
                 // post step, so getBooleanInput throws/defaults to false and the
                 // save failure would be swallowed (job goes green). Fall back to the
                 // value persisted to state during restore.
-                if (!failOnError && core.getState("FAIL_ON_SAVE_ERROR") === "true") {
+                if (!failOnError &&
+                    core.getState("FAIL_ON_SAVE_ERROR") === "true") {
                     failOnError = true;
                 }
                 if (failOnError) {
@@ -107572,6 +107634,23 @@ class Container {
     commitNodeLocalDownload(tempPath) {
         return __awaiter(this, void 0, void 0, function* () {
             return this.nodeLocal.commitTempFile(tempPath);
+        });
+    }
+    /**
+     * In-flight coalesce: returns "hit" if another populator (runner or the
+     * prewarm DaemonSet) already produced the node-local image while we waited —
+     * the caller should then skip the S3 download+decompress and mount the final
+     * image. Returns "populate" if we hold the lock and must do the work, then
+     * call releaseNodeLocalPopulateLock() when done. See NodeLocalCache.
+     */
+    coalesceNodeLocalPopulate() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.nodeLocal.acquirePopulateLockOrWait();
+        });
+    }
+    releaseNodeLocalPopulateLock() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.nodeLocal.releasePopulateLock();
         });
     }
     getNodeLocalFinalPath() {
@@ -109711,9 +109790,9 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.NodeLocalCache = void 0;
 const core = __importStar(__nccwpck_require__(37484));
+const crypto = __importStar(__nccwpck_require__(76982));
 const fs = __importStar(__nccwpck_require__(91943));
 const path = __importStar(__nccwpck_require__(16928));
-const crypto = __importStar(__nccwpck_require__(76982));
 const STALE_TEMP_FILE_AGE_MS = 12 * 60 * 60 * 1000; // 12 hours
 /**
  * NodeLocalCache provides node-level persistent caching via a HostPath-mounted directory.
@@ -109805,14 +109884,27 @@ class NodeLocalCache {
                 catch (_a) {
                     // mkdir or access failed — try with sudo (runners have privileged: true)
                     const { exec: execCmd } = yield Promise.resolve().then(() => __importStar(__nccwpck_require__(95236)));
-                    yield execCmd("sudo", ["mkdir", "-p", this.cacheDir], { silent: true });
+                    yield execCmd("sudo", ["mkdir", "-p", this.cacheDir], {
+                        silent: true
+                    });
                     // getuid/getgid are typed optional (undefined on Windows) under
                     // @types/node 24; this path is Linux-runner-only, so assert.
-                    yield execCmd("sudo", ["chown", `${process.getuid()}:${process.getgid()}`, this.cacheDir], { silent: true });
+                    yield execCmd("sudo", [
+                        "chown",
+                        `${process.getuid()}:${process.getgid()}`,
+                        this.cacheDir
+                    ], { silent: true });
                     yield fs.access(this.cacheDir, (yield Promise.resolve().then(() => __importStar(__nccwpck_require__(79896)))).constants.W_OK);
                 }
                 const randomSuffix = crypto.randomBytes(8).toString("hex");
-                const tempPath = path.join(this.cacheDir, `.temp${randomSuffix}${this.extension}`);
+                // Embed the sanitized cache key so the temp file is ATTRIBUTABLE to
+                // this key. The coalesce liveness check (populateIsDead) keys off an
+                // active temp file's mtime; with multiple distinct keys populating
+                // concurrently on the same node (e.g. aarch64 + x86_64, or across a
+                // yarn.lock/base-fp change), a keyless `.tempXXX` name would make one
+                // key's download look like liveness for a DIFFERENT key's lock. The
+                // `.temp-<key>-<rand>` form lets the check match only this key's temp.
+                const tempPath = path.join(this.cacheDir, `.temp-${this.sanitizeKey(this.cacheKey)}-${randomSuffix}${this.extension}`);
                 core.debug(`[NodeLocal] Created temp path: ${tempPath}`);
                 return tempPath;
             }
@@ -109867,6 +109959,159 @@ class NodeLocalCache {
         });
     }
     /**
+     * In-flight COALESCE for node-local population.
+     *
+     * Problem: when a key is cold node-local (e.g. right after a key rotation, or
+     * on a fresh node), EVERY runner that lands on the node AND the prewarm
+     * DaemonSet all race to download (~5 GB) + decompress (~25 GB) the SAME image
+     * simultaneously. Only one wins the final atomic rename; the rest throw away
+     * minutes of identical work ("Another runner already committed — using
+     * existing"). Deploying the prewarm DS made this near-certain.
+     *
+     * Fix: a per-key lock (atomic `mkdir <key>.lock.d`, which is atomic even on a
+     * shared hostPath). The first caller acquires it and populates; concurrent
+     * callers WAIT for the final image to appear and reuse it — skipping the
+     * redundant download+decompress entirely.
+     *
+     * Returns:
+     *   "hit"      — the final image appeared while we waited; caller should mount it (no work).
+     *   "populate" — we hold the lock; caller does the download+decompress+commit,
+     *                then MUST call releasePopulateLock().
+     *
+     * Liveness WITHOUT a heartbeat process (this is the crux). The GitHub Actions
+     * runner executes the restore action as a short-lived node process that EXITS
+     * between composite steps — an in-process setInterval heartbeat dies with it,
+     * so the lock's freshness must be observable from the FILESYSTEM alone. It is:
+     * the populator downloads into a `.temp<ext>` file that the kernel keeps
+     * writing (mtime advances) for the whole ~1-5 min download+decompress, with NO
+     * surviving process required. So:
+     *   - lock present + an active `.temp<ext>` (mtime advanced < STALE_LOCK_MS
+     *     ago)  ⇒ a populate is genuinely in flight ⇒ WAIT.
+     *   - lock present + NO fresh temp file (none, or mtime stale)  ⇒ the producer
+     *     died (or hasn't started writing within GRACE_MS) ⇒ STEAL atomically.
+     *   - final image present ⇒ "hit".
+     *
+     * Steal is atomic via rename(lockDir → lockDir.dead-<uniq>): only one waiter's
+     * rename of a given source can succeed, so no thundering-herd double-steal;
+     * losers get ENOENT and re-race for the fresh lock. Waiter self-populates after
+     * WAIT_TIMEOUT_MS (never deadlock).
+     */
+    get lockDir() {
+        return path.join(this.cacheDir, `${this.sanitizeKey(this.cacheKey)}.lock.d`);
+    }
+    acquirePopulateLockOrWait() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.enabled)
+                return "populate";
+            const POLL_MS = 3000;
+            const started = Date.now();
+            if (yield this.exists())
+                return "hit";
+            while (Date.now() - started <= NodeLocalCache.WAIT_TIMEOUT_MS) {
+                // Acquire: mkdir is atomic; EEXIST ⇒ someone else holds it.
+                try {
+                    yield fs.mkdir(this.lockDir);
+                    core.info(`[NodeLocal] Acquired populate lock for ${this.sanitizeKey(this.cacheKey)} — populating`);
+                    return "populate";
+                }
+                catch (e) {
+                    if (e.code !== "EEXIST") {
+                        core.debug(`[NodeLocal] Lock mkdir failed (${e.message}); populating without coalesce`);
+                        return "populate";
+                    }
+                }
+                // Held by another populator. If the image landed, reuse it.
+                if (yield this.exists()) {
+                    core.info(`[NodeLocal] Coalesced: another populator finished ${this.sanitizeKey(this.cacheKey)} — reusing (skipped redundant download+decompress)`);
+                    return "hit";
+                }
+                // Is a populate genuinely in flight? Proven by an active temp file
+                // (filesystem-observable, no heartbeat process needed).
+                if (!(yield this.populateIsDead())) {
+                    yield new Promise(r => setTimeout(r, POLL_MS));
+                    continue;
+                }
+                // Dead producer — steal ATOMICALLY via rename (single winner).
+                const graveyard = `${this.lockDir}.dead-${crypto
+                    .randomBytes(6)
+                    .toString("hex")}`;
+                try {
+                    yield fs.rename(this.lockDir, graveyard);
+                    core.warning(`[NodeLocal] Populate lock has no active download for >${NodeLocalCache.STALE_LOCK_MS / 1000}s — stealing it atomically (producer died)`);
+                    yield this.removeSafe(graveyard);
+                    continue; // we won the steal; retry mkdir
+                }
+                catch (e) {
+                    if (e.code === "ENOENT") {
+                        // Another waiter stole it first — re-race for the fresh lock.
+                        continue;
+                    }
+                    // Unexpected — fall through to poll/timeout.
+                    yield new Promise(r => setTimeout(r, POLL_MS));
+                }
+            }
+            // Waited past the ceiling without a result — self-populate rather than
+            // wait forever (worst case = one redundant populate, never a deadlock).
+            core.warning(`[NodeLocal] Waited ${NodeLocalCache.WAIT_TIMEOUT_MS / 60000}m for another populator without result — populating ourselves`);
+            return "populate";
+        });
+    }
+    /**
+     * Decide whether the lock's owner is DEAD, using only the filesystem (no live
+     * process). Alive ⇔ (a) the lock is younger than GRACE_MS (just acquired, temp
+     * file may not exist yet), OR (b) there is a `.temp<ext>` file whose mtime
+     * advanced within STALE_LOCK_MS (an active download is writing it). Otherwise
+     * dead (crashed producer / abandoned lock).
+     */
+    populateIsDead() {
+        return __awaiter(this, void 0, void 0, function* () {
+            // (a) grace window for a freshly-acquired lock.
+            try {
+                const lst = yield fs.stat(this.lockDir);
+                if (Date.now() - lst.mtimeMs < NodeLocalCache.GRACE_MS)
+                    return false;
+            }
+            catch (_a) {
+                return false; // lock vanished — not dead, just released
+            }
+            // (b) newest THIS-KEY temp mtime = download liveness. Only temps for our
+            // own key count — a different key's active download must not read as
+            // liveness for this lock (the multi-hash gap). Temp names are
+            // `.temp-<sanitizedKey>-<rand><ext>` (+ a transient `.raw` during
+            // decompress), so we match on our key prefix.
+            const tempPrefix = `.temp-${this.sanitizeKey(this.cacheKey)}-`;
+            try {
+                const entries = yield fs.readdir(this.cacheDir);
+                let newestTempMtime = 0;
+                for (const e of entries) {
+                    if (!e.startsWith(tempPrefix))
+                        continue;
+                    try {
+                        const st = yield fs.stat(path.join(this.cacheDir, e));
+                        if (st.mtimeMs > newestTempMtime)
+                            newestTempMtime = st.mtimeMs;
+                    }
+                    catch (_b) {
+                        /* raced away */
+                    }
+                }
+                if (newestTempMtime === 0)
+                    return true; // no active download for THIS key → dead
+                return Date.now() - newestTempMtime > NodeLocalCache.STALE_LOCK_MS;
+            }
+            catch (_c) {
+                return true; // can't inspect → assume dead so we don't wait forever
+            }
+        });
+    }
+    releasePopulateLock() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.enabled)
+                return;
+            yield this.removeSafe(this.lockDir);
+        });
+    }
+    /**
      * Get the path where S3 should download the archive to.
      * When node-local caching is enabled, returns a .tempXXX path in the HostPath dir
      * so the download goes directly to the right place (no copy needed).
@@ -109903,14 +110148,28 @@ class NodeLocalCache {
                     //   on the node-local fs because $RUNNER_TEMP is overlayfs and
                     //   can't be an overlay upperdir). Normally removed at job end,
                     //   but a killed/cancelled job can orphan one — prune by age.
-                    if (!entry.startsWith(".temp") && !entry.startsWith(".overlay-"))
+                    // *.lock.d / *.lock.d.dead-* → populate-coalesce locks. A lock is
+                    //   only live for the minutes of a populate, so any lock older
+                    //   than the temp-file grace ceiling is abandoned (crashed
+                    //   producer whose process never released it) — sweep it so it
+                    //   can't wedge coalesce. Uses a much shorter age than temps.
+                    const isLock = entry.endsWith(".lock.d") ||
+                        entry.includes(".lock.d.dead-");
+                    if (!entry.startsWith(".temp") &&
+                        !entry.startsWith(".overlay-") &&
+                        !isLock)
                         continue;
                     const fullPath = path.join(this.cacheDir, entry);
                     try {
                         const stat = yield fs.stat(fullPath);
                         const ageMs = now - stat.mtimeMs;
-                        if (ageMs > STALE_TEMP_FILE_AGE_MS) {
-                            core.info(`[NodeLocal] Removing stale ${entry.startsWith(".overlay-") ? "overlay" : "temp"} entry (${Math.floor(ageMs / 3600000)}h old): ${entry}`);
+                        const maxAge = isLock
+                            ? 30 * 60 * 1000 // locks: 30 min (well past any real populate)
+                            : STALE_TEMP_FILE_AGE_MS;
+                        if (ageMs > maxAge) {
+                            core.info(`[NodeLocal] Removing stale ${entry.startsWith(".overlay-")
+                                ? "overlay"
+                                : "temp"} entry (${Math.floor(ageMs / 3600000)}h old): ${entry}`);
                             yield this.removeSafe(fullPath);
                             cleaned++;
                         }
@@ -109964,7 +110223,10 @@ class NodeLocalCache {
                         const fullPath = path.join(this.cacheDir, entry);
                         try {
                             const stat = yield fs.stat(fullPath);
-                            candidates.push({ path: fullPath, mtime: stat.mtimeMs });
+                            candidates.push({
+                                path: fullPath,
+                                mtime: stat.mtimeMs
+                            });
                         }
                         catch (_a) {
                             // File may have been removed by another runner
@@ -109977,8 +110239,7 @@ class NodeLocalCache {
                 }
                 // Return the most recently modified match (newest = closest to current)
                 candidates.sort((a, b) => b.mtime - a.mtime);
-                core.info(`[NodeLocal] Partial match found: ${path.basename(candidates[0].path)} ` +
-                    `(${candidates.length} candidate(s), using newest)`);
+                core.info(`[NodeLocal] Partial match found: ${path.basename(candidates[0].path)} ` + `(${candidates.length} candidate(s), using newest)`);
                 return candidates[0].path;
             }
             catch (error) {
@@ -110007,6 +110268,13 @@ class NodeLocalCache {
     }
 }
 exports.NodeLocalCache = NodeLocalCache;
+// A populate = download (~1 min) + decompress (~5 min). Liveness is proven by
+// the .temp file's mtime advancing; we tolerate STALE_LOCK_MS of no-growth
+// before declaring the producer dead. GRACE_MS gives a just-acquired lock time
+// to create its temp file before any waiter can judge it stale.
+NodeLocalCache.STALE_LOCK_MS = 60000; // no temp-file growth for 60s ⇒ dead
+NodeLocalCache.GRACE_MS = 45000; // new lock's head-start to start writing
+NodeLocalCache.WAIT_TIMEOUT_MS = 12 * 60000; // waiter ceiling → self-populate
 
 
 /***/ }),

@@ -132,6 +132,21 @@ export abstract class Container {
         return this.nodeLocal.commitTempFile(tempPath);
     }
 
+    /**
+     * In-flight coalesce: returns "hit" if another populator (runner or the
+     * prewarm DaemonSet) already produced the node-local image while we waited —
+     * the caller should then skip the S3 download+decompress and mount the final
+     * image. Returns "populate" if we hold the lock and must do the work, then
+     * call releaseNodeLocalPopulateLock() when done. See NodeLocalCache.
+     */
+    async coalesceNodeLocalPopulate(): Promise<"hit" | "populate"> {
+        return this.nodeLocal.acquirePopulateLockOrWait();
+    }
+
+    async releaseNodeLocalPopulateLock(): Promise<void> {
+        return this.nodeLocal.releasePopulateLock();
+    }
+
     getNodeLocalFinalPath(): string | null {
         return this.nodeLocal.enabled ? this.nodeLocal.localPath : null;
     }

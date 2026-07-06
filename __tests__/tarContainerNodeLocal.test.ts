@@ -160,7 +160,7 @@ describe("TarLz4Container node-local support", () => {
             const container = createTarLz4Container({ nodeLocalCacheDir: cacheDir });
             const dlPath = await container.getNodeLocalDownloadPath();
             expect(dlPath).not.toBeNull();
-            expect(dlPath!).toMatch(/\.temp[0-9a-f]+\.tar\.lz4$/);
+            expect(dlPath!).toMatch(/\.temp-.+-[0-9a-f]+\.tar\.lz4$/);
         });
 
         it("commitNodeLocalDownload commits file to final path", async () => {
@@ -309,7 +309,7 @@ describe("TarContainer node-local support", () => {
             const container = createTarContainer({ nodeLocalCacheDir: cacheDir });
             const dlPath = await container.getNodeLocalDownloadPath();
             expect(dlPath).not.toBeNull();
-            expect(dlPath!).toMatch(/\.temp[0-9a-f]+\.tar$/);
+            expect(dlPath!).toMatch(/\.temp-.+-[0-9a-f]+\.tar$/);
         });
 
         it("commitNodeLocalDownload commits file to final path", async () => {

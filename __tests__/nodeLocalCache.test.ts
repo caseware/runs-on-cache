@@ -1,6 +1,7 @@
 import * as fs from "fs/promises";
-import * as path from "path";
 import * as os from "os";
+import * as path from "path";
+
 import { NodeLocalCache } from "../src/utils/container/NodeLocalCache";
 
 // Mock @actions/core
@@ -37,12 +38,20 @@ describe("NodeLocalCache", () => {
 
     describe("localPath", () => {
         it("constructs correct path for btrfs", () => {
-            const nlc = new NodeLocalCache("/opt/cache", "node-modules-abc123", ".btrfs");
+            const nlc = new NodeLocalCache(
+                "/opt/cache",
+                "node-modules-abc123",
+                ".btrfs"
+            );
             expect(nlc.localPath).toBe("/opt/cache/node-modules-abc123.btrfs");
         });
 
         it("constructs correct path for vhdx", () => {
-            const nlc = new NodeLocalCache("/opt/cache", "my-cache-key", ".vhdx");
+            const nlc = new NodeLocalCache(
+                "/opt/cache",
+                "my-cache-key",
+                ".vhdx"
+            );
             expect(nlc.localPath).toBe("/opt/cache/my-cache-key.vhdx");
         });
 
@@ -52,7 +61,11 @@ describe("NodeLocalCache", () => {
         });
 
         it("sanitizes keys with path separators", () => {
-            const nlc = new NodeLocalCache("/opt/cache", "my/key:with*special", ".btrfs");
+            const nlc = new NodeLocalCache(
+                "/opt/cache",
+                "my/key:with*special",
+                ".btrfs"
+            );
             expect(nlc.localPath).toBe("/opt/cache/my-key-with-special.btrfs");
         });
     });
@@ -85,7 +98,7 @@ describe("NodeLocalCache", () => {
             const nlc = new NodeLocalCache(tempDir, "key", ".btrfs");
             const tempPath = await nlc.createTempFile();
             expect(tempPath).not.toBeNull();
-            expect(tempPath!).toMatch(/\.temp[0-9a-f]+\.btrfs$/);
+            expect(tempPath!).toMatch(/\.temp-.+-[0-9a-f]+\.btrfs$/);
             expect(path.dirname(tempPath!)).toBe(tempDir);
         });
 
@@ -155,7 +168,7 @@ describe("NodeLocalCache", () => {
             const nlc = new NodeLocalCache(tempDir, "dl-path-test", ".btrfs");
             const dlPath = await nlc.getDownloadPath();
             expect(dlPath).not.toBeNull();
-            expect(dlPath!).toMatch(/\.temp[0-9a-f]+\.btrfs$/);
+            expect(dlPath!).toMatch(/\.temp-.+-[0-9a-f]+\.btrfs$/);
             expect(path.dirname(dlPath!)).toBe(tempDir);
         });
 
@@ -163,7 +176,11 @@ describe("NodeLocalCache", () => {
             // Use a path that can't be created (file exists where dir would be)
             const blockingFile = path.join(tempDir, "blocker");
             await fs.writeFile(blockingFile, "I block mkdir");
-            const nlc = new NodeLocalCache(path.join(blockingFile, "subdir"), "key", ".btrfs");
+            const nlc = new NodeLocalCache(
+                path.join(blockingFile, "subdir"),
+                "key",
+                ".btrfs"
+            );
             const dlPath = await nlc.getDownloadPath();
             expect(dlPath).toBeNull();
         });
@@ -198,7 +215,11 @@ describe("NodeLocalCache", () => {
         });
 
         it("returns 0 when cache dir does not exist", async () => {
-            const nlc = new NodeLocalCache("/nonexistent/path", "key", ".btrfs");
+            const nlc = new NodeLocalCache(
+                "/nonexistent/path",
+                "key",
+                ".btrfs"
+            );
             expect(await nlc.cleanupStaleTempFiles()).toBe(0);
         });
 
@@ -305,13 +326,20 @@ describe("NodeLocalCache", () => {
 
         it("returns null when no files match restore keys", async () => {
             const nlc = new NodeLocalCache(tempDir, "my-key", ".btrfs");
-            await fs.writeFile(path.join(tempDir, "unrelated-key.btrfs"), "data");
+            await fs.writeFile(
+                path.join(tempDir, "unrelated-key.btrfs"),
+                "data"
+            );
             const result = await nlc.findClosestMatch(["nodemodules-"]);
             expect(result).toBeNull();
         });
 
         it("finds a file matching restore-key prefix", async () => {
-            const nlc = new NodeLocalCache(tempDir, "nodemodules-abc123", ".btrfs");
+            const nlc = new NodeLocalCache(
+                tempDir,
+                "nodemodules-abc123",
+                ".btrfs"
+            );
             const matchFile = path.join(tempDir, "nodemodules-old-hash.btrfs");
             await fs.writeFile(matchFile, "cached-data");
             const result = await nlc.findClosestMatch(["nodemodules-"]);
@@ -334,14 +362,20 @@ describe("NodeLocalCache", () => {
 
         it("ignores temp files", async () => {
             const nlc = new NodeLocalCache(tempDir, "my-key", ".btrfs");
-            await fs.writeFile(path.join(tempDir, ".tempabc.btrfs"), "temp-data");
+            await fs.writeFile(
+                path.join(tempDir, ".tempabc.btrfs"),
+                "temp-data"
+            );
             const result = await nlc.findClosestMatch(["my-"]);
             expect(result).toBeNull();
         });
 
         it("ignores files with wrong extension", async () => {
             const nlc = new NodeLocalCache(tempDir, "my-key", ".btrfs");
-            await fs.writeFile(path.join(tempDir, "my-key-old.tar.lz4"), "tar-data");
+            await fs.writeFile(
+                path.join(tempDir, "my-key-old.tar.lz4"),
+                "tar-data"
+            );
             const result = await nlc.findClosestMatch(["my-key-"]);
             expect(result).toBeNull();
         });
@@ -354,6 +388,55 @@ describe("NodeLocalCache", () => {
             // First prefix doesn't match, second does
             const result = await nlc.findClosestMatch(["nm-exact-", "nm-"]);
             expect(result).toBe(fallbackFile);
+        });
+    });
+
+    describe("acquirePopulateLockOrWait (in-flight coalesce)", () => {
+        it("first caller gets 'populate' and creates the lock dir", async () => {
+            const nlc = new NodeLocalCache(tempDir, "keyA", ".btrfs");
+            const decision = await nlc.acquirePopulateLockOrWait();
+            expect(decision).toBe("populate");
+            await expect(
+                fs.access(path.join(tempDir, "keyA.lock.d"))
+            ).resolves.toBeUndefined();
+        });
+
+        it("returns 'hit' immediately when the final image already exists", async () => {
+            const nlc = new NodeLocalCache(tempDir, "keyHit", ".btrfs");
+            await fs.writeFile(path.join(tempDir, "keyHit.btrfs"), "image");
+            expect(await nlc.acquirePopulateLockOrWait()).toBe("hit");
+        });
+
+        it("release removes the lock dir", async () => {
+            const nlc = new NodeLocalCache(tempDir, "keyR", ".btrfs");
+            await nlc.acquirePopulateLockOrWait();
+            await nlc.releasePopulateLock();
+            await expect(
+                fs.access(path.join(tempDir, "keyR.lock.d"))
+            ).rejects.toThrow();
+        });
+
+        it("a DIFFERENT key's active temp file does NOT read as liveness (multi-hash gap)", async () => {
+            // keyB holds a lock but never writes a keyB temp; meanwhile keyOther
+            // has a fresh temp download in flight. A waiter on keyB must judge
+            // keyB DEAD (its own temp is absent) and not be fooled by keyOther's.
+            const other = new NodeLocalCache(tempDir, "keyOther", ".btrfs");
+            const otherTemp = await other.getDownloadPath(); // .temp-keyOther-...
+            expect(otherTemp).not.toBeNull();
+            await fs.writeFile(otherTemp as string, "downloading"); // fresh mtime
+
+            // Pre-create keyB's lock dir aged past the grace window so it's eligible
+            // for the liveness check (backdate its mtime).
+            const lockB = path.join(tempDir, "keyB.lock.d");
+            await fs.mkdir(lockB);
+            const old = new Date(Date.now() - 5 * 60_000);
+            await fs.utimes(lockB, old, old);
+
+            const nlc = new NodeLocalCache(tempDir, "keyB", ".btrfs");
+            // Should STEAL (keyB has no fresh temp of its own) and return populate,
+            // NOT hang waiting on keyOther's temp.
+            const decision = await nlc.acquirePopulateLockOrWait();
+            expect(decision).toBe("populate");
         });
     });
 });
