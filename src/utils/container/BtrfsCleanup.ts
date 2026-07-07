@@ -6,8 +6,8 @@
  */
 import * as core from "@actions/core";
 import { execSync } from "node:child_process";
-import * as path from "node:path";
 import { tmpdir } from "node:os";
+import * as path from "node:path";
 
 const LOG_PREFIX = "[BTRFS cleanup]";
 
@@ -29,9 +29,7 @@ export async function cleanupForCacheKey(cacheKey: string): Promise<void> {
         core.info(`${LOG_PREFIX} Scoped cleanup for: ${entryTempDir}`);
         await scopedCleanup(entryTempDir);
     } else {
-        core.info(
-            `${LOG_PREFIX} No cache key — running global cleanup`
-        );
+        core.info(`${LOG_PREFIX} No cache key — running global cleanup`);
         await globalCleanup();
     }
 }
@@ -49,7 +47,16 @@ async function scopedCleanup(entryTempDir: string): Promise<void> {
         // workspace-root bind mount + loop device attached on REUSED runners
         // (EC2/persistent), which made the next job's "Set up job" fail with
         // "<workspace> already exists". Scope by path/loop ownership instead.
-        const output = execSyncSafe("findmnt -n -o TARGET,SOURCE");
+        //
+        // CRITICAL: `-l` (list). Without it, findmnt renders a TREE for any
+        // nested mount (exactly our case: bind mount -> overlay -> lower) and
+        // prefixes child TARGET paths with box-drawing characters (├─/└─),
+        // which silently broke `target.startsWith(entryTempDir)` below —
+        // ownedMounts came up empty, nothing ever got unmounted, and the
+        // runner's own end-of-job temp cleanup was left to walk + unlinkat()
+        // the entire live overlay tree one file at a time (confirmed via
+        // strace: the exact "teardown gap" root cause, DEV-2078).
+        const output = execSyncSafe("findmnt -l -n -o TARGET,SOURCE");
         if (!output) return;
 
         const allMounts = output
@@ -130,9 +137,9 @@ async function scopedCleanup(entryTempDir: string): Promise<void> {
 async function globalCleanup(): Promise<void> {
     try {
         // Match any loop-backed cache mount (btrfs or xfs), not just btrfs.
-        const output = execSyncSafe(
-            "findmnt -n -o TARGET,SOURCE"
-        );
+        // `-l` (list) — see scopedCleanup's comment: without it, findmnt
+        // renders a tree with box-drawing prefixes on nested-mount TARGETs.
+        const output = execSyncSafe("findmnt -l -n -o TARGET,SOURCE");
         if (!output) return;
 
         // Only unmount loop-backed cache mounts (source is /dev/loopN), so we
@@ -155,9 +162,7 @@ async function globalCleanup(): Promise<void> {
             if (losetupOutput) {
                 const loopLines = losetupOutput
                     .split("\n")
-                    .filter(
-                        l => l.includes(".btrfs") || l.includes(".xfs")
-                    );
+                    .filter(l => l.includes(".btrfs") || l.includes(".xfs"));
                 for (const line of loopLines) {
                     const device = line.split(":")[0];
                     if (device) {
@@ -187,7 +192,9 @@ export function unmountIfMounted(targetPath: string, cwd: string): void {
         return; // not a mountpoint or doesn't exist
     }
     // If we get here, it's a mountpoint
-    core.warning(`${LOG_PREFIX} Stale mount detected at ${targetPath}, unmounting...`);
+    core.warning(
+        `${LOG_PREFIX} Stale mount detected at ${targetPath}, unmounting...`
+    );
     umountSafe(targetPath);
 }
 

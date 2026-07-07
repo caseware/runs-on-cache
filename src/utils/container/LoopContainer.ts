@@ -738,7 +738,11 @@ export abstract class LoopContainer extends Container {
                             "-c",
                             "sudo dmesg 2>/dev/null | grep -i overlay | tail -5 || true"
                         ],
-                        { cwd: this.safeCwd, ignoreReturnCode: true, silent: true }
+                        {
+                            cwd: this.safeCwd,
+                            ignoreReturnCode: true,
+                            silent: true
+                        }
                     )
                     .catch(() => ({ stdout: "" }));
                 throw new Error(
@@ -1184,7 +1188,14 @@ export abstract class LoopContainer extends Container {
         let output = "";
         await exec.exec(
             "findmnt",
-            ["-t", this.findmntFsType(), "-n", "-o", "TARGET,SOURCE,OPTIONS"],
+            [
+                "-l",
+                "-t",
+                this.findmntFsType(),
+                "-n",
+                "-o",
+                "TARGET,SOURCE,OPTIONS"
+            ],
             {
                 cwd: this.safeCwd,
                 listeners: {
