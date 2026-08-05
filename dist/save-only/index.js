@@ -95445,6 +95445,15 @@ const cacheHttpClient = __importStar(__nccwpck_require__(9268));
 const tar_1 = __nccwpck_require__(6490);
 const child_process_1 = __nccwpck_require__(2081);
 const actionUtils_1 = __nccwpck_require__(6850);
+const constants_1 = __nccwpck_require__(8840);
+// The Windows branches below pass GNU-only flags (--force-local, --posix,
+// --use-compress-program), so resolve the Git for Windows GNU tar and only
+// fall back to the system (BSD) tar if it is missing.
+function getWindowsTarPath() {
+    return __awaiter(this, void 0, void 0, function* () {
+        return (yield utils.getGnuTarPathOnWindows()) || constants_1.SystemTarPathOnWindows;
+    });
+}
 class ValidationError extends Error {
     constructor(message) {
         super(message);
@@ -95548,8 +95557,7 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
                 }
             }
             else if (customCompression && process.platform === "win32") {
-                const tarPathObj = yield (0, tar_1.getTarPath)();
-                const tarPath = tarPathObj.path; // Access the 'path' property
+                const tarPath = yield getWindowsTarPath();
                 const lz4Path = 'lz4.exe';
                 // Build the arguments array
                 let args = [];
@@ -95688,8 +95696,7 @@ function saveCache(paths, key, options, enableCrossOsArchive = false, customComp
             }
             else if (customCompression && process.platform === "win32") {
                 core.info(`Archive Path5: ${archivePath}`);
-                const tarPathObj = yield (0, tar_1.getTarPath)();
-                const tarPath = tarPathObj.path; // Access the 'path' property
+                const tarPath = yield getWindowsTarPath();
                 // Use 'lz4' directly, assuming it's in the PATH
                 const lz4Path = 'lz4.exe';
                 // Build the arguments array
