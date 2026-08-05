@@ -1,4 +1,8 @@
-import { CompressionMethod } from "@actions/cache/lib/internal/constants";
+import { getGnuTarPathOnWindows } from "@actions/cache/lib/internal/cacheUtils";
+import {
+    CompressionMethod,
+    SystemTarPathOnWindows
+} from "@actions/cache/lib/internal/constants";
 import {
     createTar,
     extractTar,
@@ -34,6 +38,15 @@ export class TarLz4Container extends Container {
         return method === "lz4";
     }
 
+    // The win32 branches pass GNU-only flags (--force-local, --posix,
+    // --use-compress-program), which the system BSD tar rejects. A bare "tar"
+    // resolves to System32\tar.exe (BSD) on GitHub-hosted Windows runners, so
+    // resolve Git for Windows' GNU tar explicitly and only fall back to the
+    // system one when it is missing.
+    private async windowsTarPath(): Promise<string> {
+        return (await getGnuTarPathOnWindows()) || SystemTarPathOnWindows;
+    }
+
     async restore(): Promise<void> {
         try {
             if (this.compressionMethod && process.platform !== "win32") {
@@ -50,7 +63,7 @@ export class TarLz4Container extends Container {
                     this.logInfo(output.toString());
                 }
             } else if (this.compressionMethod && process.platform === "win32") {
-                const tarPath = "tar";
+                const tarPath = await this.windowsTarPath();
 
                 const lz4Path = "lz4.exe";
 
@@ -108,7 +121,7 @@ export class TarLz4Container extends Container {
                 }
             } else if (this.compressionMethod && process.platform === "win32") {
                 this.logDebug(`Creating archive: ${this.containerFile}`);
-                const tarPath = "tar";
+                const tarPath = await this.windowsTarPath();
 
                 // Use 'lz4' directly, assuming it's in the PATH
                 const lz4Path = "lz4.exe";
