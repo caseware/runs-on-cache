@@ -95210,6 +95210,8 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.TarLz4Container = void 0;
+const cacheUtils_1 = __nccwpck_require__(91518);
+const constants_1 = __nccwpck_require__(88840);
 const tar_1 = __nccwpck_require__(56490);
 const core = __importStar(__nccwpck_require__(42186));
 const child_process_1 = __nccwpck_require__(32081);
@@ -95240,6 +95242,16 @@ class TarLz4Container extends Container_1.Container {
     isSupportedMethod(method) {
         return method === "lz4";
     }
+    // The win32 branches pass GNU-only flags (--force-local, --posix,
+    // --use-compress-program), which the system BSD tar rejects. A bare "tar"
+    // resolves to System32\tar.exe (BSD) on GitHub-hosted Windows runners, so
+    // resolve Git for Windows' GNU tar explicitly and only fall back to the
+    // system one when it is missing.
+    windowsTarPath() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return (yield (0, cacheUtils_1.getGnuTarPathOnWindows)()) || constants_1.SystemTarPathOnWindows;
+        });
+    }
     restore() {
         return __awaiter(this, void 0, void 0, function* () {
             try {
@@ -95255,7 +95267,7 @@ class TarLz4Container extends Container_1.Container {
                     }
                 }
                 else if (this.compressionMethod && process.platform === "win32") {
-                    const tarPath = "tar";
+                    const tarPath = yield this.windowsTarPath();
                     const lz4Path = "lz4.exe";
                     // Build the arguments array
                     const args = [];
@@ -95301,7 +95313,7 @@ class TarLz4Container extends Container_1.Container {
                 }
                 else if (this.compressionMethod && process.platform === "win32") {
                     this.logDebug(`Creating archive: ${this.containerFile}`);
-                    const tarPath = "tar";
+                    const tarPath = yield this.windowsTarPath();
                     // Use 'lz4' directly, assuming it's in the PATH
                     const lz4Path = "lz4.exe";
                     // Build the arguments array
