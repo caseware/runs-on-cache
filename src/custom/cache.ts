@@ -7,13 +7,22 @@ import * as cacheHttpClient from "./backend";
 import {
     createTar,
     extractTar,
-    listTar,
-    getTarPath
+    listTar
 } from "@actions/cache/lib/internal/tar";
 import { DownloadOptions, UploadOptions } from "@actions/cache/lib/options";
 import { execSync } from "child_process";
 import { getCacheFileName, getCompressionMethod } from "../utils/actionUtils";
-import { CompressionMethod } from "@actions/cache/lib/internal/constants";
+import {
+    CompressionMethod,
+    SystemTarPathOnWindows
+} from "@actions/cache/lib/internal/constants";
+
+// The Windows branches below pass GNU-only flags (--force-local, --posix,
+// --use-compress-program), so resolve the Git for Windows GNU tar and only
+// fall back to the system (BSD) tar if it is missing.
+async function getWindowsTarPath(): Promise<string> {
+    return (await utils.getGnuTarPathOnWindows()) || SystemTarPathOnWindows;
+}
 
 export class ValidationError extends Error {
     constructor(message: string) {
@@ -154,8 +163,7 @@ export async function restoreCache(
                 core.info(output.toString());
             }
         } else if (customCompression && process.platform === "win32") {
-            const tarPathObj = await getTarPath();
-            const tarPath = tarPathObj.path; // Access the 'path' property
+            const tarPath = await getWindowsTarPath();
 
             const lz4Path = 'lz4.exe';
 
@@ -325,8 +333,7 @@ export async function saveCache(
             }
         } else if (customCompression && process.platform === "win32") {
             core.info(`Archive Path5: ${archivePath}`);
-            const tarPathObj = await getTarPath();
-            const tarPath = tarPathObj.path; // Access the 'path' property
+            const tarPath = await getWindowsTarPath();
 
             // Use 'lz4' directly, assuming it's in the PATH
             const lz4Path = 'lz4.exe';
