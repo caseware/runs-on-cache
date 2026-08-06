@@ -34,10 +34,29 @@ export abstract class Container {
      * cache-warmer prewarm stamp; the S3 / cold-boot paths are set by cache.ts.
      */
     protected restoreSource: string | undefined;
+    /**
+     * The cache key that was ACTUALLY restored from node-local storage.
+     *
+     * Equals the primary `cacheKey` on an exact node-local hit. On a PARTIAL
+     * (restore-key prefix) hit it is the key of the FOREIGN image that got
+     * mounted — `findClosestMatch` matches on the restore-key prefix, so the
+     * image can belong to any key sharing that prefix.
+     *
+     * cache.ts reports this instead of blindly returning the primary key, so
+     * `isExactKeyMatch` — and therefore the `cache-hit` output — describes what
+     * was really restored. Returning the primary key for a partial match made
+     * `cache-hit` claim an exact match for a foreign image.
+     */
+    protected restoredKey: string | undefined;
 
     /** Precise restore provenance for metrics (see restoreSource). */
     getRestoreSource(): string | undefined {
         return this.restoreSource;
+    }
+
+    /** The cache key actually restored from node-local (see restoredKey). */
+    getRestoredKey(): string | undefined {
+        return this.restoredKey;
     }
 
     constructor(
@@ -93,11 +112,19 @@ export abstract class Container {
         let localPath: string | null = localExists
             ? this.nodeLocal.localPath
             : null;
+        // Exact hit restores this instance's own key; a partial hit restores
+        // whichever key the matched image belongs to (see restoredKey).
+        let matchedKey: string | undefined = localExists
+            ? this.cacheKey
+            : undefined;
 
         if (!localPath && restoreKeys && restoreKeys.length > 0) {
             localPath = await this.nodeLocal.findClosestMatch(restoreKeys);
             if (localPath) {
-                this.logInfo(`Node-local partial hit — using ${localPath}`);
+                matchedKey = this.nodeLocal.keyForImagePath(localPath);
+                this.logInfo(
+                    `Node-local partial hit — using ${localPath} (restored key: ${matchedKey}, requested: ${this.nodeLocal.sanitizedCacheKey})`
+                );
             }
         }
 
@@ -109,6 +136,7 @@ export abstract class Container {
             this.containerFile = localPath;
             await this.restore();
             this.restoredFromNodeLocal = true;
+            this.restoredKey = matchedKey;
             return true;
         } catch (error) {
             core.warning(

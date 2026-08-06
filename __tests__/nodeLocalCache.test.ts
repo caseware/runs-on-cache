@@ -36,6 +36,32 @@ describe("NodeLocalCache", () => {
         });
     });
 
+    describe("keyForImagePath / sanitizedCacheKey", () => {
+        it("derives the owning key from an image path", () => {
+            const nlc = new NodeLocalCache("/opt/cache", "key-a", ".xfs");
+            expect(nlc.keyForImagePath("/opt/cache/key-b.xfs")).toBe("key-b");
+        });
+
+        it("round-trips its own localPath back to its sanitized key", () => {
+            const nlc = new NodeLocalCache("/opt/cache", "key-a", ".xfs");
+            expect(nlc.keyForImagePath(nlc.localPath)).toBe(
+                nlc.sanitizedCacheKey
+            );
+        });
+
+        it("exposes the sanitized form of the primary key", () => {
+            const nlc = new NodeLocalCache("/opt/cache", "a/b:c", ".xfs");
+            expect(nlc.sanitizedCacheKey).toBe("a-b-c");
+        });
+
+        it("leaves a basename without the extension untouched", () => {
+            const nlc = new NodeLocalCache("/opt/cache", "key-a", ".xfs");
+            expect(nlc.keyForImagePath("/opt/cache/weird-name")).toBe(
+                "weird-name"
+            );
+        });
+    });
+
     describe("localPath", () => {
         it("constructs correct path for btrfs", () => {
             const nlc = new NodeLocalCache(

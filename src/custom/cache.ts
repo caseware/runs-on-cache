@@ -188,7 +188,18 @@ export async function restoreCache(
                 Outputs.CacheSource,
                 cacheContainer.getRestoreSource() || "node-local"
             );
-            return primaryKey;
+            // Report the key ACTUALLY restored, not the requested one.
+            //
+            // tryRestoreFromNodeLocal covers both an exact hit and a PARTIAL
+            // (restore-key prefix) hit. Unconditionally returning primaryKey
+            // made restoreImpl compute isExactKeyMatch(primaryKey, primaryKey)
+            // === true, so `cache-hit` reported an exact match even when the
+            // mounted image belonged to a different key. Consumers that gate
+            // dependency installs on cache-hit then reused a foreign tree.
+            //
+            // The S3 path below already returns cacheEntry.cacheKey (the real
+            // matched key); this makes the node-local path consistent with it.
+            return cacheContainer.getRestoredKey() ?? primaryKey;
         }
 
         // path are needed to compute version
@@ -248,7 +259,12 @@ export async function restoreCache(
                         Outputs.CacheSource,
                         cacheContainer.getRestoreSource() || "node-local"
                     );
-                    return cacheEntry.cacheKey;
+                    // Prefer the key actually mounted from node-local: the
+                    // coalesced restore can land on a prefix-matched image that
+                    // differs from the S3 entry we looked up.
+                    return (
+                        cacheContainer.getRestoredKey() ?? cacheEntry.cacheKey
+                    );
                 }
                 // Mount failed (e.g. file removed under us) — fall through and populate.
                 core.warning(
