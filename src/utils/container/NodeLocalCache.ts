@@ -484,6 +484,27 @@ export class NodeLocalCache {
         return key.replace(/[/\\:*?"<>|]/g, "-");
     }
 
+    /** The on-disk (sanitized) identifier for this instance's primary key. */
+    get sanitizedCacheKey(): string {
+        return this.sanitizeKey(this.cacheKey);
+    }
+
+    /**
+     * The cache-key identifier an on-disk node-local image belongs to, derived
+     * from its filename (`sanitizeKey(cacheKey) + extension`).
+     *
+     * `sanitizeKey` is lossy, so this returns the SANITIZED form rather than a
+     * reconstructed original key. That is sufficient for its only purpose:
+     * reporting WHICH entry a partial match actually restored, so callers can
+     * tell it apart from the primary key instead of claiming an exact hit.
+     */
+    keyForImagePath(imagePath: string): string {
+        const base = path.basename(imagePath);
+        return base.endsWith(this.extension)
+            ? base.slice(0, -this.extension.length)
+            : base;
+    }
+
     /**
      * Find the closest matching cache image in the node-local dir.
      * Scans for files matching any of the restore-key prefixes and returns the

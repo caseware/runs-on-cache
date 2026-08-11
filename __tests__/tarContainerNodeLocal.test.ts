@@ -103,6 +103,51 @@ describe("TarLz4Container node-local support", () => {
         });
     });
 
+    describe("getRestoredKey", () => {
+        it("is undefined before any restore", () => {
+            const container = createTarLz4Container({
+                nodeLocalCacheDir: cacheDir
+            });
+            expect(container.getRestoredKey()).toBeUndefined();
+        });
+
+        it("reports the primary key on an exact node-local hit", async () => {
+            const container = createTarLz4Container({
+                nodeLocalCacheDir: cacheDir,
+                cacheKey: "exact-key"
+            });
+
+            await fs.writeFile(
+                path.join(cacheDir, "exact-key.tar.lz4"),
+                "data"
+            );
+
+            expect(await container.tryRestoreFromNodeLocal()).toBe(true);
+            expect(container.getRestoredKey()).toBe("exact-key");
+        });
+
+        it("reports the MATCHED key (not the primary) on a partial hit", async () => {
+            // The node-local dir holds an image for a DIFFERENT key that merely
+            // shares the restore-key prefix. Reporting the primary key here is
+            // what made `cache-hit` claim an exact match for a foreign image.
+            const container = createTarLz4Container({
+                nodeLocalCacheDir: cacheDir,
+                cacheKey: "prefix-newlock"
+            });
+
+            await fs.writeFile(
+                path.join(cacheDir, "prefix-oldlock.tar.lz4"),
+                "data"
+            );
+
+            expect(await container.tryRestoreFromNodeLocal(["prefix-"])).toBe(
+                true
+            );
+            expect(container.getRestoredKey()).toBe("prefix-oldlock");
+            expect(container.getRestoredKey()).not.toBe("prefix-newlock");
+        });
+    });
+
     describe("shouldSkipS3Upload", () => {
         it("returns false when not restored from node-local", () => {
             const container = createTarLz4Container({ nodeLocalCacheDir: cacheDir });

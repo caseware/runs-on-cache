@@ -239,6 +239,8 @@ export abstract class LoopContainer extends Container {
                     await this.mountImageReadOnly(localPath);
                 }
                 this.restoredFromNodeLocal = true;
+                // Exact hit — the mounted image is this key's own image.
+                this.restoredKey = this.cacheKey;
                 this.restoreSource = (await this.nodeLocal.isPrewarmed(
                     localPath
                 ))
@@ -269,6 +271,16 @@ export abstract class LoopContainer extends Container {
                     );
                     await this.overlayMountReadWrite(closestMatch);
                     this.restoredFromNodeLocal = true;
+                    // PARTIAL hit: the mounted image belongs to a DIFFERENT key
+                    // that merely shares the restore-key prefix. Report that key
+                    // so cache-hit is not claimed as an exact match.
+                    this.restoredKey =
+                        this.nodeLocal.keyForImagePath(closestMatch);
+                    core.info(
+                        `${this.getLogPrefix()} Node-local partial restore key: ${
+                            this.restoredKey
+                        } (requested: ${this.nodeLocal.sanitizedCacheKey})`
+                    );
                     this.restoreSource = (await this.nodeLocal.isPrewarmed(
                         closestMatch
                     ))

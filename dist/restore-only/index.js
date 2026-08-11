@@ -90723,6 +90723,7 @@ exports.isFeatureAvailable = isFeatureAvailable;
  * @returns string returns the key for the cache hit, otherwise returns undefined
  */
 function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArchive = false, customCompression = "none", customCompressionLevel = undefined) {
+    var _a, _b;
     return __awaiter(this, void 0, void 0, function* () {
         checkPaths(paths);
         restoreKeys = restoreKeys || [];
@@ -90788,7 +90789,18 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
                 // "prewarmed" (DaemonSet-prestaged) vs "node-local" (prior runner)
                 // — set by tryRestoreFromNodeLocal based on the prewarm stamp.
                 core.setOutput(constants_1.Outputs.CacheSource, cacheContainer.getRestoreSource() || "node-local");
-                return primaryKey;
+                // Report the key ACTUALLY restored, not the requested one.
+                //
+                // tryRestoreFromNodeLocal covers both an exact hit and a PARTIAL
+                // (restore-key prefix) hit. Unconditionally returning primaryKey
+                // made restoreImpl compute isExactKeyMatch(primaryKey, primaryKey)
+                // === true, so `cache-hit` reported an exact match even when the
+                // mounted image belonged to a different key. Consumers that gate
+                // dependency installs on cache-hit then reused a foreign tree.
+                //
+                // The S3 path below already returns cacheEntry.cacheKey (the real
+                // matched key); this makes the node-local path consistent with it.
+                return (_a = cacheContainer.getRestoredKey()) !== null && _a !== void 0 ? _a : primaryKey;
             }
             // path are needed to compute version
             const cacheEntry = yield cacheHttpClient.getCacheEntry(keys, paths, {
@@ -90831,7 +90843,10 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
                         core.info("[NodeLocal] Coalesced onto an in-flight populate — restored from node-local (skipped redundant download+decompress)");
                         core.setOutput(constants_1.Outputs.NodeLocalCacheHit, "true");
                         core.setOutput(constants_1.Outputs.CacheSource, cacheContainer.getRestoreSource() || "node-local");
-                        return cacheEntry.cacheKey;
+                        // Prefer the key actually mounted from node-local: the
+                        // coalesced restore can land on a prefix-matched image that
+                        // differs from the S3 entry we looked up.
+                        return ((_b = cacheContainer.getRestoredKey()) !== null && _b !== void 0 ? _b : cacheEntry.cacheKey);
                     }
                     // Mount failed (e.g. file removed under us) — fall through and populate.
                     core.warning("[NodeLocal] Coalesce hit but node-local restore failed — populating ourselves");
@@ -92385,6 +92400,10 @@ class Container {
     getRestoreSource() {
         return this.restoreSource;
     }
+    /** The cache key actually restored from node-local (see restoredKey). */
+    getRestoredKey() {
+        return this.restoredKey;
+    }
     constructor(containerFile, compressionMethod, compressionLevel, baseDir, pathsToCache, cacheKey, options = {}) {
         this.containerFile = containerFile;
         this.compressionMethod = compressionMethod;
@@ -92428,10 +92447,16 @@ class Container {
             let localPath = localExists
                 ? this.nodeLocal.localPath
                 : null;
+            // Exact hit restores this instance's own key; a partial hit restores
+            // whichever key the matched image belongs to (see restoredKey).
+            let matchedKey = localExists
+                ? this.cacheKey
+                : undefined;
             if (!localPath && restoreKeys && restoreKeys.length > 0) {
                 localPath = yield this.nodeLocal.findClosestMatch(restoreKeys);
                 if (localPath) {
-                    this.logInfo(`Node-local partial hit — using ${localPath}`);
+                    matchedKey = this.nodeLocal.keyForImagePath(localPath);
+                    this.logInfo(`Node-local partial hit — using ${localPath} (restored key: ${matchedKey}, requested: ${this.nodeLocal.sanitizedCacheKey})`);
                 }
             }
             if (!localPath)
@@ -92441,6 +92466,7 @@ class Container {
                 this.containerFile = localPath;
                 yield this.restore();
                 this.restoredFromNodeLocal = true;
+                this.restoredKey = matchedKey;
                 return true;
             }
             catch (error) {
@@ -92968,6 +92994,8 @@ class LoopContainer extends Container_1.Container {
                         yield this.mountImageReadOnly(localPath);
                     }
                     this.restoredFromNodeLocal = true;
+                    // Exact hit — the mounted image is this key's own image.
+                    this.restoredKey = this.cacheKey;
                     this.restoreSource = (yield this.nodeLocal.isPrewarmed(localPath))
                         ? "prewarmed"
                         : "node-local";
@@ -92986,6 +93014,12 @@ class LoopContainer extends Container_1.Container {
                         this.logInfo(`Node-local partial hit — overlay RW on ${path.basename(closestMatch)} (no copy)`);
                         yield this.overlayMountReadWrite(closestMatch);
                         this.restoredFromNodeLocal = true;
+                        // PARTIAL hit: the mounted image belongs to a DIFFERENT key
+                        // that merely shares the restore-key prefix. Report that key
+                        // so cache-hit is not claimed as an exact match.
+                        this.restoredKey =
+                            this.nodeLocal.keyForImagePath(closestMatch);
+                        core.info(`${this.getLogPrefix()} Node-local partial restore key: ${this.restoredKey} (requested: ${this.nodeLocal.sanitizedCacheKey})`);
                         this.restoreSource = (yield this.nodeLocal.isPrewarmed(closestMatch))
                             ? "prewarmed"
                             : "node-local";
@@ -95032,6 +95066,25 @@ class NodeLocalCache {
      */
     sanitizeKey(key) {
         return key.replace(/[/\\:*?"<>|]/g, "-");
+    }
+    /** The on-disk (sanitized) identifier for this instance's primary key. */
+    get sanitizedCacheKey() {
+        return this.sanitizeKey(this.cacheKey);
+    }
+    /**
+     * The cache-key identifier an on-disk node-local image belongs to, derived
+     * from its filename (`sanitizeKey(cacheKey) + extension`).
+     *
+     * `sanitizeKey` is lossy, so this returns the SANITIZED form rather than a
+     * reconstructed original key. That is sufficient for its only purpose:
+     * reporting WHICH entry a partial match actually restored, so callers can
+     * tell it apart from the primary key instead of claiming an exact hit.
+     */
+    keyForImagePath(imagePath) {
+        const base = path.basename(imagePath);
+        return base.endsWith(this.extension)
+            ? base.slice(0, -this.extension.length)
+            : base;
     }
     /**
      * Find the closest matching cache image in the node-local dir.
