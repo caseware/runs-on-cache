@@ -231,15 +231,18 @@ export async function downloadCacheHttpClientConcurrent(
 
         const waitAndWrite: () => Promise<void> = async () => {
             const segment = await Promise.race(Object.values(activeDownloads));
+            // Write the buffer's real length rather than the requested count, so a mismatch can
+            // never surface here as ERR_OUT_OF_RANGE. downloadSegment already rejects short
+            // segments; the final bytesDownloaded check below catches anything that still slips.
             await archiveDescriptor.write(
                 segment.buffer,
                 0,
-                segment.count,
+                segment.buffer.byteLength,
                 segment.offset
             );
             actives--;
             delete activeDownloads[segment.offset];
-            bytesDownloaded += segment.count;
+            bytesDownloaded += segment.buffer.byteLength;
             progressFn({ loadedBytes: bytesDownloaded });
         };
 
@@ -312,10 +315,23 @@ async function downloadSegment(
         );
     }
 
+    const buffer = await partRes.readBodyBuffer();
+
+    // A ranged GET can come back with fewer bytes than were asked for. That is a transport
+    // failure, not a valid segment, so it has to throw: downloadSegmentRetry only re-fetches a
+    // range when downloadSegment throws, and a short buffer that slips through used to abort
+    // the whole restore in waitAndWrite with ERR_OUT_OF_RANGE after the archive had already
+    // been downloaded.
+    if (buffer.byteLength !== count) {
+        throw new Error(
+            `Downloaded segment at offset ${offset} is ${buffer.byteLength} bytes, expected ${count}`
+        );
+    }
+
     return {
         offset,
-        count,
-        buffer: await partRes.readBodyBuffer()
+        count: buffer.byteLength,
+        buffer
     };
 }
 
