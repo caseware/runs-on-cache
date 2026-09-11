@@ -91354,6 +91354,8 @@ function downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options
     var _a;
     return __awaiter(this, void 0, void 0, function* () {
         const archiveDescriptor = yield fs.promises.open(archivePath, "w");
+        // Declared out here so the finally block can stop its timer even when the download throws.
+        let progress;
         const httpClient = new http_client_1.HttpClient("actions/cache", undefined, {
             socketTimeout: options.timeoutInMs,
             keepAlive: true
@@ -91383,7 +91385,7 @@ function downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options
                 downloads.push({
                     offset,
                     promiseGetter: () => __awaiter(this, void 0, void 0, function* () {
-                        return yield downloadSegmentRetry(httpClient, archiveLocation, offset, count);
+                        return yield downloadSegmentRetry(httpClient, archiveLocation, offset, count, length);
                     })
                 });
             }
@@ -91391,17 +91393,20 @@ function downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options
             downloads.reverse();
             let actives = 0;
             let bytesDownloaded = 0;
-            const progress = new DownloadProgress(length);
+            progress = new DownloadProgress(length);
             progress.startDisplayTimer();
             const progressFn = progress.onProgress();
             const activeDownloads = [];
             let nextDownload;
             const waitAndWrite = () => __awaiter(this, void 0, void 0, function* () {
                 const segment = yield Promise.race(Object.values(activeDownloads));
-                yield archiveDescriptor.write(segment.buffer, 0, segment.count, segment.offset);
+                // Write the buffer's real length rather than the requested count, so a mismatch can
+                // never surface here as ERR_OUT_OF_RANGE. downloadSegment already rejects short
+                // segments, and the bytesDownloaded check after the loop is the final backstop.
+                yield archiveDescriptor.write(segment.buffer, 0, segment.buffer.byteLength, segment.offset);
                 actives--;
                 delete activeDownloads[segment.offset];
-                bytesDownloaded += segment.count;
+                bytesDownloaded += segment.buffer.byteLength;
                 progressFn({ loadedBytes: bytesDownloaded });
             });
             while ((nextDownload = downloads.pop())) {
@@ -91414,29 +91419,40 @@ function downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options
             while (actives > 0) {
                 yield waitAndWrite();
             }
+            // Backstop ported from upstream runs-on/cache: never hand back an archive that is not
+            // the size the download was planned against.
+            if (bytesDownloaded !== length) {
+                throw new Error(`Download validation failed: Expected ${length} bytes but downloaded ${bytesDownloaded} bytes`);
+            }
         }
         finally {
+            // startDisplayTimer re-arms itself every second until the download reports done, so on a
+            // failed download it never stops on its own and keeps the action process alive. This is
+            // the only call site stopDisplayTimer has ever had.
+            progress === null || progress === void 0 ? void 0 : progress.stopDisplayTimer();
             httpClient.dispose();
             yield archiveDescriptor.close();
         }
     });
 }
 exports.downloadCacheHttpClientConcurrent = downloadCacheHttpClientConcurrent;
-function downloadSegmentRetry(httpClient, archiveLocation, offset, count) {
+function downloadSegmentRetry(httpClient, archiveLocation, offset, count, expectedTotalLength) {
     return __awaiter(this, void 0, void 0, function* () {
         const retries = 5;
         let failures = 0;
         while (true) {
             try {
                 const timeout = 30000;
-                const result = yield promiseWithTimeout(timeout, downloadSegment(httpClient, archiveLocation, offset, count));
+                const result = yield promiseWithTimeout(timeout, downloadSegment(httpClient, archiveLocation, offset, count, expectedTotalLength));
                 if (typeof result === "string") {
                     throw new Error("downloadSegmentRetry failed due to timeout");
                 }
                 return result;
             }
             catch (err) {
-                if (failures >= retries) {
+                // A replaced archive is not transient: every retry would read the new object while
+                // the file on disk holds pieces of the old one.
+                if (err instanceof ArchiveChangedError || failures >= retries) {
                     throw err;
                 }
                 failures++;
@@ -91444,7 +91460,8 @@ function downloadSegmentRetry(httpClient, archiveLocation, offset, count) {
         }
     });
 }
-function downloadSegment(httpClient, archiveLocation, offset, count) {
+function downloadSegment(httpClient, archiveLocation, offset, count, expectedTotalLength) {
+    var _a;
     return __awaiter(this, void 0, void 0, function* () {
         const partRes = yield (0, requestUtils_1.retryHttpClientResponse)("downloadCachePart", () => __awaiter(this, void 0, void 0, function* () {
             return yield httpClient.get(archiveLocation, {
@@ -91454,21 +91471,46 @@ function downloadSegment(httpClient, archiveLocation, offset, count) {
         if (!partRes.readBodyBuffer) {
             throw new Error("Expected HttpClientResponse to implement readBodyBuffer");
         }
+        // Every 206 restates the object's total size. If it no longer matches the size this download
+        // was planned against, the object was replaced mid-download (the cache key was re-saved) and
+        // the segments already on disk belong to a different archive. Retrying the range cannot help
+        // — and if the replacement is larger, every segment comes back full-sized and the file would
+        // silently be a mix of two archives — so fail the whole download, loudly and immediately.
+        const segmentContentRange = partRes.message.headers["content-range"];
+        const segmentTotal = (_a = segmentContentRange === null || segmentContentRange === void 0 ? void 0 : segmentContentRange.match(/bytes \d+-\d+\/(\d+)/)) === null || _a === void 0 ? void 0 : _a[1];
+        if (segmentTotal !== undefined &&
+            Number(segmentTotal) !== expectedTotalLength) {
+            throw new ArchiveChangedError(`The cache archive changed while it was being downloaded: it was ${expectedTotalLength} bytes when the download started and is now ${segmentTotal}. Refusing to assemble a mixed archive.`);
+        }
+        const buffer = yield partRes.readBodyBuffer();
+        // A ranged GET can come back with fewer bytes than were asked for. That is a transport
+        // failure, not a valid segment, so it has to throw: downloadSegmentRetry only re-fetches a
+        // range when downloadSegment throws, and a short buffer that slips through used to abort
+        // the whole restore in waitAndWrite with ERR_OUT_OF_RANGE after the archive had already
+        // been downloaded.
+        if (buffer.byteLength !== count) {
+            throw new Error(`Downloaded segment at offset ${offset} is ${buffer.byteLength} bytes, expected ${count}`);
+        }
         return {
             offset,
-            count,
-            buffer: yield partRes.readBodyBuffer()
+            count: buffer.byteLength,
+            buffer
         };
     });
+}
+/** The cache object was replaced while it was being downloaded; retrying cannot recover it. */
+class ArchiveChangedError extends Error {
 }
 const promiseWithTimeout = (timeoutMs, promise) => __awaiter(void 0, void 0, void 0, function* () {
     let timeoutHandle;
     const timeoutPromise = new Promise(resolve => {
         timeoutHandle = setTimeout(() => resolve("timeout"), timeoutMs);
     });
-    return Promise.race([promise, timeoutPromise]).then(result => {
+    // `finally` rather than `then`: on the rejection path `then` never runs, so the 30s timer
+    // stayed armed for every failed attempt and kept the process alive after the download had
+    // already given up.
+    return Promise.race([promise, timeoutPromise]).finally(() => {
         clearTimeout(timeoutHandle);
-        return result;
     });
 });
 
