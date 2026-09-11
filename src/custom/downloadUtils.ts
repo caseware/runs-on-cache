@@ -211,7 +211,8 @@ export async function downloadCacheHttpClientConcurrent(
                         httpClient,
                         archiveLocation,
                         offset,
-                        count
+                        count,
+                        length
                     );
                 }
             });
@@ -235,7 +236,7 @@ export async function downloadCacheHttpClientConcurrent(
             const segment = await Promise.race(Object.values(activeDownloads));
             // Write the buffer's real length rather than the requested count, so a mismatch can
             // never surface here as ERR_OUT_OF_RANGE. downloadSegment already rejects short
-            // segments; the final bytesDownloaded check below catches anything that still slips.
+            // segments, and the bytesDownloaded check after the loop is the final backstop.
             await archiveDescriptor.write(
                 segment.buffer,
                 0,
@@ -260,6 +261,14 @@ export async function downloadCacheHttpClientConcurrent(
         while (actives > 0) {
             await waitAndWrite();
         }
+
+        // Backstop ported from upstream runs-on/cache: never hand back an archive that is not
+        // the size the download was planned against.
+        if (bytesDownloaded !== length) {
+            throw new Error(
+                `Download validation failed: Expected ${length} bytes but downloaded ${bytesDownloaded} bytes`
+            );
+        }
     } finally {
         // startDisplayTimer re-arms itself every second until the download reports done, so on a
         // failed download it never stops on its own and keeps the action process alive. This is
@@ -274,7 +283,8 @@ async function downloadSegmentRetry(
     httpClient: HttpClient,
     archiveLocation: string,
     offset: number,
-    count: number
+    count: number,
+    expectedTotalLength: number
 ): Promise<DownloadSegment> {
     const retries = 5;
     let failures = 0;
@@ -284,7 +294,13 @@ async function downloadSegmentRetry(
             const timeout = 30000;
             const result = await promiseWithTimeout(
                 timeout,
-                downloadSegment(httpClient, archiveLocation, offset, count)
+                downloadSegment(
+                    httpClient,
+                    archiveLocation,
+                    offset,
+                    count,
+                    expectedTotalLength
+                )
             );
             if (typeof result === "string") {
                 throw new Error("downloadSegmentRetry failed due to timeout");
@@ -292,7 +308,9 @@ async function downloadSegmentRetry(
 
             return result;
         } catch (err) {
-            if (failures >= retries) {
+            // A replaced archive is not transient: every retry would read the new object while
+            // the file on disk holds pieces of the old one.
+            if (err instanceof ArchiveChangedError || failures >= retries) {
                 throw err;
             }
 
@@ -305,7 +323,8 @@ async function downloadSegment(
     httpClient: HttpClient,
     archiveLocation: string,
     offset: number,
-    count: number
+    count: number,
+    expectedTotalLength: number
 ): Promise<DownloadSegment> {
     const partRes = await retryHttpClientResponse(
         "downloadCachePart",
@@ -318,6 +337,23 @@ async function downloadSegment(
     if (!partRes.readBodyBuffer) {
         throw new Error(
             "Expected HttpClientResponse to implement readBodyBuffer"
+        );
+    }
+
+    // Every 206 restates the object's total size. If it no longer matches the size this download
+    // was planned against, the object was replaced mid-download (the cache key was re-saved) and
+    // the segments already on disk belong to a different archive. Retrying the range cannot help
+    // — and if the replacement is larger, every segment comes back full-sized and the file would
+    // silently be a mix of two archives — so fail the whole download, loudly and immediately.
+    const segmentContentRange = partRes.message.headers["content-range"];
+    const segmentTotal =
+        segmentContentRange?.match(/bytes \d+-\d+\/(\d+)/)?.[1];
+    if (
+        segmentTotal !== undefined &&
+        Number(segmentTotal) !== expectedTotalLength
+    ) {
+        throw new ArchiveChangedError(
+            `The cache archive changed while it was being downloaded: it was ${expectedTotalLength} bytes when the download started and is now ${segmentTotal}. Refusing to assemble a mixed archive.`
         );
     }
 
@@ -340,6 +376,9 @@ async function downloadSegment(
         buffer
     };
 }
+
+/** The cache object was replaced while it was being downloaded; retrying cannot recover it. */
+class ArchiveChangedError extends Error {}
 
 declare class DownloadSegment {
     offset: number;

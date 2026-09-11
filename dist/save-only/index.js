@@ -91385,7 +91385,7 @@ function downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options
                 downloads.push({
                     offset,
                     promiseGetter: () => __awaiter(this, void 0, void 0, function* () {
-                        return yield downloadSegmentRetry(httpClient, archiveLocation, offset, count);
+                        return yield downloadSegmentRetry(httpClient, archiveLocation, offset, count, length);
                     })
                 });
             }
@@ -91402,7 +91402,7 @@ function downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options
                 const segment = yield Promise.race(Object.values(activeDownloads));
                 // Write the buffer's real length rather than the requested count, so a mismatch can
                 // never surface here as ERR_OUT_OF_RANGE. downloadSegment already rejects short
-                // segments; the final bytesDownloaded check below catches anything that still slips.
+                // segments, and the bytesDownloaded check after the loop is the final backstop.
                 yield archiveDescriptor.write(segment.buffer, 0, segment.buffer.byteLength, segment.offset);
                 actives--;
                 delete activeDownloads[segment.offset];
@@ -91419,6 +91419,11 @@ function downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options
             while (actives > 0) {
                 yield waitAndWrite();
             }
+            // Backstop ported from upstream runs-on/cache: never hand back an archive that is not
+            // the size the download was planned against.
+            if (bytesDownloaded !== length) {
+                throw new Error(`Download validation failed: Expected ${length} bytes but downloaded ${bytesDownloaded} bytes`);
+            }
         }
         finally {
             // startDisplayTimer re-arms itself every second until the download reports done, so on a
@@ -91431,21 +91436,23 @@ function downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options
     });
 }
 exports.downloadCacheHttpClientConcurrent = downloadCacheHttpClientConcurrent;
-function downloadSegmentRetry(httpClient, archiveLocation, offset, count) {
+function downloadSegmentRetry(httpClient, archiveLocation, offset, count, expectedTotalLength) {
     return __awaiter(this, void 0, void 0, function* () {
         const retries = 5;
         let failures = 0;
         while (true) {
             try {
                 const timeout = 30000;
-                const result = yield promiseWithTimeout(timeout, downloadSegment(httpClient, archiveLocation, offset, count));
+                const result = yield promiseWithTimeout(timeout, downloadSegment(httpClient, archiveLocation, offset, count, expectedTotalLength));
                 if (typeof result === "string") {
                     throw new Error("downloadSegmentRetry failed due to timeout");
                 }
                 return result;
             }
             catch (err) {
-                if (failures >= retries) {
+                // A replaced archive is not transient: every retry would read the new object while
+                // the file on disk holds pieces of the old one.
+                if (err instanceof ArchiveChangedError || failures >= retries) {
                     throw err;
                 }
                 failures++;
@@ -91453,7 +91460,8 @@ function downloadSegmentRetry(httpClient, archiveLocation, offset, count) {
         }
     });
 }
-function downloadSegment(httpClient, archiveLocation, offset, count) {
+function downloadSegment(httpClient, archiveLocation, offset, count, expectedTotalLength) {
+    var _a;
     return __awaiter(this, void 0, void 0, function* () {
         const partRes = yield (0, requestUtils_1.retryHttpClientResponse)("downloadCachePart", () => __awaiter(this, void 0, void 0, function* () {
             return yield httpClient.get(archiveLocation, {
@@ -91462,6 +91470,17 @@ function downloadSegment(httpClient, archiveLocation, offset, count) {
         }));
         if (!partRes.readBodyBuffer) {
             throw new Error("Expected HttpClientResponse to implement readBodyBuffer");
+        }
+        // Every 206 restates the object's total size. If it no longer matches the size this download
+        // was planned against, the object was replaced mid-download (the cache key was re-saved) and
+        // the segments already on disk belong to a different archive. Retrying the range cannot help
+        // — and if the replacement is larger, every segment comes back full-sized and the file would
+        // silently be a mix of two archives — so fail the whole download, loudly and immediately.
+        const segmentContentRange = partRes.message.headers["content-range"];
+        const segmentTotal = (_a = segmentContentRange === null || segmentContentRange === void 0 ? void 0 : segmentContentRange.match(/bytes \d+-\d+\/(\d+)/)) === null || _a === void 0 ? void 0 : _a[1];
+        if (segmentTotal !== undefined &&
+            Number(segmentTotal) !== expectedTotalLength) {
+            throw new ArchiveChangedError(`The cache archive changed while it was being downloaded: it was ${expectedTotalLength} bytes when the download started and is now ${segmentTotal}. Refusing to assemble a mixed archive.`);
         }
         const buffer = yield partRes.readBodyBuffer();
         // A ranged GET can come back with fewer bytes than were asked for. That is a transport
@@ -91478,6 +91497,9 @@ function downloadSegment(httpClient, archiveLocation, offset, count) {
             buffer
         };
     });
+}
+/** The cache object was replaced while it was being downloaded; retrying cannot recover it. */
+class ArchiveChangedError extends Error {
 }
 const promiseWithTimeout = (timeoutMs, promise) => __awaiter(void 0, void 0, void 0, function* () {
     let timeoutHandle;

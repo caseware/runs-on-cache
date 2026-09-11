@@ -34,17 +34,24 @@ function parseRange(range: string): [number, number] {
 }
 
 interface SegmentResponse {
+    message: { headers: Record<string, string> };
     readBodyBuffer: () => Promise<Buffer>;
 }
 
 /**
- * Minimal HttpClient stub. `truncateFirstAttempt` drops bytes off the end of the given
- * offset's body the first time it is requested, reproducing a short ranged GET.
+ * Minimal HttpClient stub.
+ *
+ * `truncateOffsets` drops bytes off the end of the body for a given offset, for a given number
+ * of attempts, reproducing a short ranged GET. `replacedTotalFrom` makes every segment from that
+ * offset onwards report a different object size in its Content-Range, reproducing the cache key
+ * being re-saved while the download is in flight.
  */
 function createHttpClientMock(options: {
     truncateOffsets?: Map<number, { bytes: number; times: number }>;
+    replacedTotalFrom?: { offset: number; total: number };
 }): { get: jest.Mock; request: jest.Mock; dispose: jest.Mock } {
     const truncateOffsets = options.truncateOffsets ?? new Map();
+    const replaced = options.replacedTotalFrom;
     return {
         request: jest.fn(async () => ({
             message: {
@@ -65,7 +72,18 @@ function createHttpClientMock(options: {
                     truncation.times--;
                     body = body.subarray(0, body.byteLength - truncation.bytes);
                 }
-                return { readBodyBuffer: async () => body };
+                const total =
+                    replaced && start >= replaced.offset
+                        ? replaced.total
+                        : ARCHIVE_SIZE;
+                return {
+                    message: {
+                        headers: {
+                            "content-range": `bytes ${start}-${end}/${total}`
+                        }
+                    },
+                    readBodyBuffer: async () => body
+                };
             }
         ),
         dispose: jest.fn()
@@ -149,5 +167,42 @@ describe("downloadCacheHttpClientConcurrent", () => {
                 }
             )
         ).rejects.toThrow(/is 11 bytes, expected 16/);
+
+        // The offset that keeps coming back short is retried, not attempted once.
+        const attemptsForBadOffset =
+            httpClientMock.current.get.mock.calls.filter(
+                ([, headers]: [string, { Range: string }]) =>
+                    headers.Range.startsWith(`bytes=${PART_SIZE}-`)
+            ).length;
+        expect(attemptsForBadOffset).toBeGreaterThan(1);
+    });
+
+    it("fails fast when the archive is replaced mid-download", async () => {
+        // From the second segment onwards the object reports a different total size, which is
+        // what S3 does once the cache key has been re-saved under the download's feet.
+        httpClientMock.current = createHttpClientMock({
+            replacedTotalFrom: { offset: PART_SIZE, total: ARCHIVE_SIZE - 4 }
+        });
+
+        await expect(
+            downloadCacheHttpClientConcurrent(
+                "https://example.test/cache",
+                archivePath,
+                {
+                    partSize: PART_SIZE,
+                    concurrentBlobDownloads: true,
+                    downloadConcurrency: 1,
+                    timeoutInMs: 30000
+                }
+            )
+        ).rejects.toThrow(/changed while it was being downloaded/);
+
+        // A replaced archive is permanent, so the range is requested once, not six times.
+        const attemptsForChangedOffset =
+            httpClientMock.current.get.mock.calls.filter(
+                ([, headers]: [string, { Range: string }]) =>
+                    headers.Range.startsWith(`bytes=${PART_SIZE}-`)
+            ).length;
+        expect(attemptsForChangedOffset).toBe(1);
     });
 });
