@@ -165,6 +165,8 @@ export async function downloadCacheHttpClientConcurrent(
     options: RunsOnDownloadOptions
 ): Promise<void> {
     const archiveDescriptor = await fs.promises.open(archivePath, "w");
+    // Declared out here so the finally block can stop its timer even when the download throws.
+    let progress: DownloadProgress | undefined;
     const httpClient = new HttpClient("actions/cache", undefined, {
         socketTimeout: options.timeoutInMs,
         keepAlive: true
@@ -219,7 +221,7 @@ export async function downloadCacheHttpClientConcurrent(
         downloads.reverse();
         let actives = 0;
         let bytesDownloaded = 0;
-        const progress = new DownloadProgress(length);
+        progress = new DownloadProgress(length);
         progress.startDisplayTimer();
         const progressFn = progress.onProgress();
 
@@ -259,6 +261,10 @@ export async function downloadCacheHttpClientConcurrent(
             await waitAndWrite();
         }
     } finally {
+        // startDisplayTimer re-arms itself every second until the download reports done, so on a
+        // failed download it never stops on its own and keeps the action process alive. This is
+        // the only call site stopDisplayTimer has ever had.
+        progress?.stopDisplayTimer();
         httpClient.dispose();
         await archiveDescriptor.close();
     }
@@ -350,8 +356,10 @@ const promiseWithTimeout = async <T>(
         timeoutHandle = setTimeout(() => resolve("timeout"), timeoutMs);
     });
 
-    return Promise.race([promise, timeoutPromise]).then(result => {
+    // `finally` rather than `then`: on the rejection path `then` never runs, so the 30s timer
+    // stayed armed for every failed attempt and kept the process alive after the download had
+    // already given up.
+    return Promise.race([promise, timeoutPromise]).finally(() => {
         clearTimeout(timeoutHandle);
-        return result;
     });
 };

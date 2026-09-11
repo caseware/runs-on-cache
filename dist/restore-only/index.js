@@ -91354,6 +91354,8 @@ function downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options
     var _a;
     return __awaiter(this, void 0, void 0, function* () {
         const archiveDescriptor = yield fs.promises.open(archivePath, "w");
+        // Declared out here so the finally block can stop its timer even when the download throws.
+        let progress;
         const httpClient = new http_client_1.HttpClient("actions/cache", undefined, {
             socketTimeout: options.timeoutInMs,
             keepAlive: true
@@ -91391,7 +91393,7 @@ function downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options
             downloads.reverse();
             let actives = 0;
             let bytesDownloaded = 0;
-            const progress = new DownloadProgress(length);
+            progress = new DownloadProgress(length);
             progress.startDisplayTimer();
             const progressFn = progress.onProgress();
             const activeDownloads = [];
@@ -91419,6 +91421,10 @@ function downloadCacheHttpClientConcurrent(archiveLocation, archivePath, options
             }
         }
         finally {
+            // startDisplayTimer re-arms itself every second until the download reports done, so on a
+            // failed download it never stops on its own and keeps the action process alive. This is
+            // the only call site stopDisplayTimer has ever had.
+            progress === null || progress === void 0 ? void 0 : progress.stopDisplayTimer();
             httpClient.dispose();
             yield archiveDescriptor.close();
         }
@@ -91478,9 +91484,11 @@ const promiseWithTimeout = (timeoutMs, promise) => __awaiter(void 0, void 0, voi
     const timeoutPromise = new Promise(resolve => {
         timeoutHandle = setTimeout(() => resolve("timeout"), timeoutMs);
     });
-    return Promise.race([promise, timeoutPromise]).then(result => {
+    // `finally` rather than `then`: on the rejection path `then` never runs, so the 30s timer
+    // stayed armed for every failed attempt and kept the process alive after the download had
+    // already given up.
+    return Promise.race([promise, timeoutPromise]).finally(() => {
         clearTimeout(timeoutHandle);
-        return result;
     });
 });
 

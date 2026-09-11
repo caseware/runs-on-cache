@@ -129,4 +129,25 @@ describe("downloadCacheHttpClientConcurrent", () => {
         // Three segments, one of which was fetched twice.
         expect(httpClientMock.current.get).toHaveBeenCalledTimes(4);
     });
+
+    it("fails instead of writing a corrupt archive when a segment stays short", async () => {
+        httpClientMock.current = createHttpClientMock({
+            truncateOffsets: new Map([
+                [PART_SIZE, { bytes: 5, times: Number.MAX_SAFE_INTEGER }]
+            ])
+        });
+
+        await expect(
+            downloadCacheHttpClientConcurrent(
+                "https://example.test/cache",
+                archivePath,
+                {
+                    partSize: PART_SIZE,
+                    concurrentBlobDownloads: true,
+                    downloadConcurrency: 2,
+                    timeoutInMs: 30000
+                }
+            )
+        ).rejects.toThrow(/is 11 bytes, expected 16/);
+    });
 });
