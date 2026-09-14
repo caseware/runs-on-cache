@@ -42,7 +42,7 @@ describe("TarLz4Container filesystem round trips", () => {
         );
     }
 
-    async function listArchive(): Promise<string[]> {
+    async function listArchive(verbose = false): Promise<string[]> {
         const tarPath =
             process.platform === "win32"
                 ? await getGnuTarPathOnWindows()
@@ -53,7 +53,7 @@ describe("TarLz4Container filesystem round trips", () => {
             );
         }
         const args = process.platform === "win32" ? ["--force-local"] : [];
-        args.push("-tf", archivePath);
+        args.push(verbose ? "-tvf" : "-tf", archivePath);
         return execFileSync(tarPath, args, {
             encoding: "utf8"
         })
@@ -88,7 +88,13 @@ describe("TarLz4Container filesystem round trips", () => {
             await fs.rm(unrelatedFile);
             await container.restore();
 
-            expect((await fs.lstat(junction)).isSymbolicLink()).toBe(true);
+            if (!(await fs.lstat(junction)).isSymbolicLink()) {
+                throw new Error(
+                    `Junction restored as a directory. Archive representation:\n${(
+                        await listArchive(true)
+                    ).join("\n")}`
+                );
+            }
             expect(await fs.realpath(junction)).toBe(
                 await fs.realpath(externalTarget)
             );
