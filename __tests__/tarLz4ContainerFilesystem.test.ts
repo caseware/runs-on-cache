@@ -52,7 +52,9 @@ describe("TarLz4Container filesystem round trips", () => {
                 "Git for Windows GNU tar is required for this test"
             );
         }
-        return execFileSync(tarPath, ["-tf", archivePath], {
+        const args = process.platform === "win32" ? ["--force-local"] : [];
+        args.push("-tf", archivePath);
+        return execFileSync(tarPath, args, {
             encoding: "utf8"
         })
             .split(/\r?\n/)
