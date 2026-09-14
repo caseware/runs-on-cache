@@ -97,7 +97,13 @@ export class TarLz4Container extends Container {
 
                 this.logDebug(`Executing command: ${command}`);
 
-                const output = execSync(command, { stdio: "inherit" });
+                const output = execSync(command, {
+                    stdio: "inherit",
+                    env: {
+                        ...process.env,
+                        MSYS: "winsymlinks:nativestrict"
+                    }
+                });
                 if (output && output.length > 0) {
                     this.logDebug(output.toString());
                 }
@@ -174,7 +180,13 @@ export class TarLz4Container extends Container {
 
                 this.logInfo(`Executing command: ${command}`);
 
-                const output2 = execSync(command, { stdio: "inherit" });
+                const output2 = execSync(command, {
+                    stdio: "inherit",
+                    env: {
+                        ...process.env,
+                        MSYS: "winsymlinks:nativestrict"
+                    }
+                });
                 if (output2 && output2.length > 0) {
                     this.logDebug(output2.toString());
                 }

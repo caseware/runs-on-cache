@@ -95385,7 +95385,10 @@ class TarLz4Container extends Container_1.Container {
                     // Combine all arguments into the command
                     const command = `"${tarPath}" ${args.join(" ")}`;
                     this.logDebug(`Executing command: ${command}`);
-                    const output = (0, child_process_1.execSync)(command, { stdio: "inherit" });
+                    const output = (0, child_process_1.execSync)(command, {
+                        stdio: "inherit",
+                        env: Object.assign(Object.assign({}, process.env), { MSYS: "winsymlinks:nativestrict" })
+                    });
                     if (output && output.length > 0) {
                         this.logDebug(output.toString());
                     }
@@ -95445,7 +95448,10 @@ class TarLz4Container extends Container_1.Container {
                     // Combine all arguments into the command
                     const command = `"${tarPath}" ${args.join(" ")} ${quotedCachePaths.join(" ")}`;
                     this.logInfo(`Executing command: ${command}`);
-                    const output2 = (0, child_process_1.execSync)(command, { stdio: "inherit" });
+                    const output2 = (0, child_process_1.execSync)(command, {
+                        stdio: "inherit",
+                        env: Object.assign(Object.assign({}, process.env), { MSYS: "winsymlinks:nativestrict" })
+                    });
                     if (output2 && output2.length > 0) {
                         this.logDebug(output2.toString());
                     }
