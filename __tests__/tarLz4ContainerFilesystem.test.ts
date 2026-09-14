@@ -185,7 +185,11 @@ describe("TarLz4Container filesystem round trips", () => {
             );
             await fs.mkdir(externalTarget);
             await fs.writeFile(unrelatedFile, "not selected");
-            await fs.symlink(externalTarget, symbolicLink, "dir");
+            await fs.symlink(
+                path.relative(selectedRoot, externalTarget),
+                symbolicLink,
+                "dir"
+            );
 
             const container = createContainer([
                 path.relative(workspace, selectedRoot)
