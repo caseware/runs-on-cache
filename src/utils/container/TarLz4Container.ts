@@ -9,7 +9,7 @@ import {
     listTar
 } from "@actions/cache/lib/internal/tar";
 import * as core from "@actions/core";
-import { execSync } from "child_process";
+import { execFileSync, execSync } from "child_process";
 import { dirname } from "path";
 
 import { Container, ContainerOptions } from "./Container";
@@ -50,15 +50,25 @@ export class TarLz4Container extends Container {
     async restore(): Promise<void> {
         try {
             if (this.compressionMethod && process.platform !== "win32") {
-                const compressionArgs =
-                    this.compressionMethod === "none"
-                        ? ""
-                        : `--use-compress-program=${this.compressionMethod}`;
-                const command = `tar -xf ${this.containerFile} -P -C ${this.baseDir} ${compressionArgs}`;
+                const args = [
+                    "-xf",
+                    this.containerFile,
+                    "-P",
+                    "-C",
+                    this.baseDir
+                ];
+                if (
+                    this.compressionMethod !== "none" &&
+                    process.platform !== "darwin"
+                ) {
+                    args.push(
+                        `--use-compress-program=${this.compressionMethod}`
+                    );
+                }
                 this.logInfo(
                     `Extracting ${this.containerFile} to ${this.baseDir}`
                 );
-                const output = execSync(command);
+                const output = execFileSync("tar", args);
                 if (output && output.length > 0) {
                     this.logInfo(output.toString());
                 }
@@ -106,16 +116,23 @@ export class TarLz4Container extends Container {
         try {
             if (this.compressionMethod && process.platform !== "win32") {
                 this.logDebug(`Creating archive: ${this.containerFile}`);
-                const compressionArgs =
-                    this.compressionMethod === "none"
-                        ? ""
-                        : `--use-compress-program=${this.compressionMethod}`;
-                const command = `tar --posix -cf ${
-                    this.containerFile
-                } --exclude ${this.containerFile} -P -C ${
+                const args = [
+                    "--posix",
+                    "-cf",
+                    this.containerFile,
+                    "--exclude",
+                    this.containerFile,
+                    "-P",
+                    "-C",
                     this.baseDir
-                } ${this.pathsToCache.join(" ")} ${compressionArgs}`;
-                const output = execSync(command);
+                ];
+                if (this.compressionMethod !== "none") {
+                    args.push(
+                        `--use-compress-program=${this.compressionMethod}`
+                    );
+                }
+                args.push(...this.pathsToCache);
+                const output = execFileSync("tar", args);
                 if (output && output.length > 0) {
                     this.logDebug(output.toString());
                 }

@@ -12,8 +12,9 @@ jest.mock("@actions/core", () => ({
     getInput: jest.fn(() => "")
 }));
 
-// Mock child_process for TarLz4Container which uses execSync directly
+// Mock child_process for TarLz4Container which invokes tar directly
 jest.mock("child_process", () => ({
+    execFileSync: jest.fn(() => Buffer.from("")),
     execSync: jest.fn(() => Buffer.from(""))
 }));
 
@@ -26,7 +27,9 @@ jest.mock("@actions/cache/lib/internal/tar", () => ({
 
 import { TarLz4Container } from "../src/utils/container/TarLz4Container";
 import { TarContainer } from "../src/utils/container/TarContainer";
-import { execSync } from "child_process";
+import { execFileSync, execSync } from "child_process";
+
+const tarExec = process.platform === "win32" ? execSync : execFileSync;
 
 describe("TarLz4Container node-local support", () => {
     let tempDir: string;
@@ -82,11 +85,11 @@ describe("TarLz4Container node-local support", () => {
 
             const result = await container.tryRestoreFromNodeLocal();
             expect(result).toBe(true);
-            expect(execSync).toHaveBeenCalled();
+            expect(tarExec).toHaveBeenCalled();
         });
 
         it("falls back to S3 on restore error", async () => {
-            (execSync as jest.Mock).mockImplementationOnce(() => {
+            (tarExec as jest.Mock).mockImplementationOnce(() => {
                 throw new Error("tar extraction failed");
             });
 
