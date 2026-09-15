@@ -23,7 +23,7 @@ inputs:
     description: 'Creates tar archive with custom compression'
     required: false
 runs:
-  using: 'node20'
+  using: 'node24'
   main: '../dist/save-only/index.js'
 branding:
   icon: 'archive'
