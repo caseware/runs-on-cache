@@ -5,14 +5,89 @@ on:
     branches:
       - main
       - releases/**
+      - v5
   push:
     branches:
       - main
       - releases/**
       - fix/**
       - v4
+      - v5
 
 jobs:
+  test-filesystem-archive:
+    name: Filesystem archive (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+    - name: Set up Node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version: 24
+        cache: npm
+    - name: Expose LZ4 on Linux and macOS
+      if: runner.os != 'Windows'
+      shell: bash
+      # The expected digest is pinned here rather than read from the release's
+      # own .sha256 asset: a GitHub release is mutable, so a checksum fetched
+      # from the same release would be replaced alongside the archive and still
+      # verify. Regenerate this value deliberately when bumping LZ4_VERSION.
+      env:
+        LZ4_VERSION: 1.10.0
+        LZ4_SOURCE_SHA256: 537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b
+      run: |
+        set -euo pipefail
+        if command -v lz4 >/dev/null 2>&1; then
+          exit 0
+        fi
+        archive="${RUNNER_TEMP}/lz4-${LZ4_VERSION}.tar.gz"
+        curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
+          --output "${archive}" \
+          "https://github.com/lz4/lz4/releases/download/v${LZ4_VERSION}/lz4-${LZ4_VERSION}.tar.gz"
+        if command -v sha256sum >/dev/null 2>&1; then
+          actual="$(sha256sum "${archive}" | cut -d' ' -f1)"
+        else
+          actual="$(shasum --algorithm 256 "${archive}" | cut -d' ' -f1)"
+        fi
+        if [ "${actual}" != "${LZ4_SOURCE_SHA256}" ]; then
+          echo "::error::LZ4 source digest mismatch: expected ${LZ4_SOURCE_SHA256}, got ${actual}"
+          exit 1
+        fi
+        tar -xzf "${archive}" -C "${RUNNER_TEMP}"
+        make -C "${RUNNER_TEMP}/lz4-${LZ4_VERSION}"
+        echo "${RUNNER_TEMP}/lz4-${LZ4_VERSION}/programs" >> "${GITHUB_PATH}"
+    - name: Expose LZ4 on Windows
+      if: runner.os == 'Windows'
+      shell: powershell
+      # Pinned for the same reason as the Linux and macOS digest above.
+      env:
+        LZ4_VERSION: 1.10.0
+        LZ4_WINDOWS_SHA256: 8cb562a53189dfc8a53ec12469b91f1b51a5075036061a86b55738183bf4ab74
+      run: |
+        $ErrorActionPreference = "Stop"
+        if (Get-Command lz4 -ErrorAction SilentlyContinue) {
+          exit 0
+        }
+        $archive = Join-Path $env:RUNNER_TEMP "lz4.zip"
+        $version = $env:LZ4_VERSION -replace "\.", "_"
+        Invoke-WebRequest -Uri "https://github.com/lz4/lz4/releases/download/v$($env:LZ4_VERSION)/lz4_win64_v$version.zip" -OutFile $archive
+        $actual = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLower()
+        if ($actual -ne $env:LZ4_WINDOWS_SHA256) {
+          Write-Output "::error::LZ4 archive digest mismatch: expected $($env:LZ4_WINDOWS_SHA256), got $actual"
+          exit 1
+        }
+        Expand-Archive -Path $archive -DestinationPath (Join-Path $env:RUNNER_TEMP "lz4")
+        (Join-Path $env:RUNNER_TEMP "lz4") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+    - name: Install dependencies
+      run: npm ci
+    - name: Test filesystem archive round trips
+      run: npm test -- --runInBand __tests__/tarLz4ContainerFilesystem.test.ts
+
   # End to end save and restore
   test-save:
     runs-on: runs-on,runner=2cpu-linux-arm64

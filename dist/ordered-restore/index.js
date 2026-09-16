@@ -95351,12 +95351,19 @@ class TarLz4Container extends Container_1.Container {
         return __awaiter(this, void 0, void 0, function* () {
             try {
                 if (this.compressionMethod && process.platform !== "win32") {
-                    const compressionArgs = this.compressionMethod === "none"
-                        ? ""
-                        : `--use-compress-program=${this.compressionMethod}`;
-                    const command = `tar -xf ${this.containerFile} -P -C ${this.baseDir} ${compressionArgs}`;
+                    const args = [
+                        "-xf",
+                        this.containerFile,
+                        "-P",
+                        "-C",
+                        this.baseDir
+                    ];
+                    if (this.compressionMethod !== "none" &&
+                        process.platform !== "darwin") {
+                        args.push(`--use-compress-program=${this.compressionMethod}`);
+                    }
                     this.logInfo(`Extracting ${this.containerFile} to ${this.baseDir}`);
-                    const output = (0, child_process_1.execSync)(command);
+                    const output = (0, child_process_1.execFileSync)("tar", args);
                     if (output && output.length > 0) {
                         this.logInfo(output.toString());
                     }
@@ -95378,7 +95385,10 @@ class TarLz4Container extends Container_1.Container {
                     // Combine all arguments into the command
                     const command = `"${tarPath}" ${args.join(" ")}`;
                     this.logDebug(`Executing command: ${command}`);
-                    const output = (0, child_process_1.execSync)(command, { stdio: "inherit" });
+                    const output = (0, child_process_1.execSync)(command, {
+                        stdio: "inherit",
+                        env: Object.assign(Object.assign({}, process.env), { MSYS: "winsymlinks:nativestrict" })
+                    });
                     if (output && output.length > 0) {
                         this.logDebug(output.toString());
                     }
@@ -95397,11 +95407,24 @@ class TarLz4Container extends Container_1.Container {
             try {
                 if (this.compressionMethod && process.platform !== "win32") {
                     this.logDebug(`Creating archive: ${this.containerFile}`);
-                    const compressionArgs = this.compressionMethod === "none"
-                        ? ""
-                        : `--use-compress-program=${this.compressionMethod}`;
-                    const command = `tar --posix -cf ${this.containerFile} --exclude ${this.containerFile} -P -C ${this.baseDir} ${this.pathsToCache.join(" ")} ${compressionArgs}`;
-                    const output = (0, child_process_1.execSync)(command);
+                    const args = [
+                        "--posix",
+                        "-cf",
+                        this.containerFile,
+                        "--exclude",
+                        this.containerFile,
+                        "-P",
+                        "-C",
+                        this.baseDir
+                    ];
+                    if (this.compressionMethod !== "none") {
+                        args.push(`--use-compress-program=${this.compressionMethod}`);
+                    }
+                    // Caller-supplied paths are operands, not options. Without
+                    // the end-of-options delimiter, a legitimate cached path such
+                    // as "--checkpoint=1" is parsed by tar as a flag.
+                    args.push("--", ...this.pathsToCache);
+                    const output = (0, child_process_1.execFileSync)("tar", args);
                     if (output && output.length > 0) {
                         this.logDebug(output.toString());
                     }
@@ -95425,10 +95448,14 @@ class TarLz4Container extends Container_1.Container {
                     args.push("-C", `"${this.toTarPath(this.baseDir)}"`);
                     // Properly quote and convert cache paths
                     const quotedCachePaths = this.pathsToCache.map(p => `"${this.toTarPath(p)}"`);
-                    // Combine all arguments into the command
-                    const command = `"${tarPath}" ${args.join(" ")} ${quotedCachePaths.join(" ")}`;
+                    // Combine all arguments into the command. "--" keeps
+                    // option-like cache paths from being parsed as tar flags.
+                    const command = `"${tarPath}" ${args.join(" ")} -- ${quotedCachePaths.join(" ")}`;
                     this.logInfo(`Executing command: ${command}`);
-                    const output2 = (0, child_process_1.execSync)(command, { stdio: "inherit" });
+                    const output2 = (0, child_process_1.execSync)(command, {
+                        stdio: "inherit",
+                        env: Object.assign(Object.assign({}, process.env), { MSYS: "winsymlinks:nativestrict" })
+                    });
                     if (output2 && output2.length > 0) {
                         this.logDebug(output2.toString());
                     }
