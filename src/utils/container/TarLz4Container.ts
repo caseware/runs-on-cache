@@ -137,7 +137,10 @@ export class TarLz4Container extends Container {
                         `--use-compress-program=${this.compressionMethod}`
                     );
                 }
-                args.push(...this.pathsToCache);
+                // Caller-supplied paths are operands, not options. Without
+                // the end-of-options delimiter, a legitimate cached path such
+                // as "--checkpoint=1" is parsed by tar as a flag.
+                args.push("--", ...this.pathsToCache);
                 const output = execFileSync("tar", args);
                 if (output && output.length > 0) {
                     this.logDebug(output.toString());
@@ -173,10 +176,11 @@ export class TarLz4Container extends Container {
                     p => `"${this.toTarPath(p)}"`
                 );
 
-                // Combine all arguments into the command
+                // Combine all arguments into the command. "--" keeps
+                // option-like cache paths from being parsed as tar flags.
                 const command = `"${tarPath}" ${args.join(
                     " "
-                )} ${quotedCachePaths.join(" ")}`;
+                )} -- ${quotedCachePaths.join(" ")}`;
 
                 this.logInfo(`Executing command: ${command}`);
 

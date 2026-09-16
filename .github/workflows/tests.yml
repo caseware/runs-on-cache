@@ -33,32 +33,56 @@ jobs:
     - name: Expose LZ4 on Linux and macOS
       if: runner.os != 'Windows'
       shell: bash
+      # The expected digest is pinned here rather than read from the release's
+      # own .sha256 asset: a GitHub release is mutable, so a checksum fetched
+      # from the same release would be replaced alongside the archive and still
+      # verify. Regenerate this value deliberately when bumping LZ4_VERSION.
+      env:
+        LZ4_VERSION: 1.10.0
+        LZ4_SOURCE_SHA256: 537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b
       run: |
-        if ! command -v lz4 >/dev/null 2>&1; then
-          curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
-            --output "${RUNNER_TEMP}/lz4-1.10.0.tar.gz" \
-            https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz
-          curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
-            --output "${RUNNER_TEMP}/lz4-1.10.0.tar.gz.sha256" \
-            https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz.sha256
-          if command -v sha256sum >/dev/null 2>&1; then
-            (cd "${RUNNER_TEMP}" && sha256sum --check lz4-1.10.0.tar.gz.sha256)
-          else
-            (cd "${RUNNER_TEMP}" && shasum --algorithm 256 --check lz4-1.10.0.tar.gz.sha256)
-          fi
-          tar -xzf "${RUNNER_TEMP}/lz4-1.10.0.tar.gz" -C "${RUNNER_TEMP}"
-          make -C "${RUNNER_TEMP}/lz4-1.10.0"
-          echo "${RUNNER_TEMP}/lz4-1.10.0/programs" >> "${GITHUB_PATH}"
+        set -euo pipefail
+        if command -v lz4 >/dev/null 2>&1; then
+          exit 0
         fi
+        archive="${RUNNER_TEMP}/lz4-${LZ4_VERSION}.tar.gz"
+        curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
+          --output "${archive}" \
+          "https://github.com/lz4/lz4/releases/download/v${LZ4_VERSION}/lz4-${LZ4_VERSION}.tar.gz"
+        if command -v sha256sum >/dev/null 2>&1; then
+          actual="$(sha256sum "${archive}" | cut -d' ' -f1)"
+        else
+          actual="$(shasum --algorithm 256 "${archive}" | cut -d' ' -f1)"
+        fi
+        if [ "${actual}" != "${LZ4_SOURCE_SHA256}" ]; then
+          echo "::error::LZ4 source digest mismatch: expected ${LZ4_SOURCE_SHA256}, got ${actual}"
+          exit 1
+        fi
+        tar -xzf "${archive}" -C "${RUNNER_TEMP}"
+        make -C "${RUNNER_TEMP}/lz4-${LZ4_VERSION}"
+        echo "${RUNNER_TEMP}/lz4-${LZ4_VERSION}/programs" >> "${GITHUB_PATH}"
     - name: Expose LZ4 on Windows
       if: runner.os == 'Windows'
       shell: powershell
+      # Pinned for the same reason as the Linux and macOS digest above.
+      env:
+        LZ4_VERSION: 1.10.0
+        LZ4_WINDOWS_SHA256: 8cb562a53189dfc8a53ec12469b91f1b51a5075036061a86b55738183bf4ab74
       run: |
-        if (-Not (Get-Command lz4 -ErrorAction SilentlyContinue)) {
-          Invoke-WebRequest -Uri "https://github.com/lz4/lz4/releases/download/v1.10.0/lz4_win64_v1_10_0.zip" -OutFile "$env:RUNNER_TEMP\lz4.zip"
-          Expand-Archive -Path "$env:RUNNER_TEMP\lz4.zip" -DestinationPath "$env:RUNNER_TEMP\lz4"
-          "$env:RUNNER_TEMP\lz4" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        $ErrorActionPreference = "Stop"
+        if (Get-Command lz4 -ErrorAction SilentlyContinue) {
+          exit 0
         }
+        $archive = Join-Path $env:RUNNER_TEMP "lz4.zip"
+        $version = $env:LZ4_VERSION -replace "\.", "_"
+        Invoke-WebRequest -Uri "https://github.com/lz4/lz4/releases/download/v$($env:LZ4_VERSION)/lz4_win64_v$version.zip" -OutFile $archive
+        $actual = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLower()
+        if ($actual -ne $env:LZ4_WINDOWS_SHA256) {
+          Write-Output "::error::LZ4 archive digest mismatch: expected $($env:LZ4_WINDOWS_SHA256), got $actual"
+          exit 1
+        }
+        Expand-Archive -Path $archive -DestinationPath (Join-Path $env:RUNNER_TEMP "lz4")
+        (Join-Path $env:RUNNER_TEMP "lz4") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
     - name: Install dependencies
       run: npm ci
     - name: Test filesystem archive round trips

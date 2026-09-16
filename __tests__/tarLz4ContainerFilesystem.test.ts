@@ -138,6 +138,29 @@ describe("TarLz4Container filesystem round trips", () => {
         );
     });
 
+    it("round trips a caller-supplied path that looks like a tar option", async () => {
+        // "--checkpoint=1" is a legitimate directory name and a real GNU tar
+        // flag. Without an end-of-options delimiter tar consumes it as an
+        // option instead of a member to archive.
+        const selectedPath = "--checkpoint=1";
+        const selectedRoot = path.join(workspace, selectedPath);
+        const selectedFile = path.join(selectedRoot, "value.txt");
+        await fs.mkdir(selectedRoot);
+        await fs.writeFile(selectedFile, "option-like");
+
+        const container = createContainer([selectedPath]);
+        await container.save();
+
+        expect(await listArchive()).toEqual(
+            expect.arrayContaining([expect.stringContaining(selectedPath)])
+        );
+
+        await fs.rm(selectedRoot, { recursive: true });
+        await container.restore();
+
+        expect(await fs.readFile(selectedFile, "utf8")).toBe("option-like");
+    });
+
     it("round trips multiple caller-supplied paths inside and outside the workspace", async () => {
         const firstPath = path.join("first root", "nested");
         const secondPath = path.join("second-root");
