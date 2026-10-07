@@ -231,6 +231,12 @@ export async function restoreCache(
             return cacheEntry.cacheKey;
         }
 
+        // A restore-key prefix hit returns another key's archive: populate,
+        // lock and commit it on the node under that key, never the requested one.
+        if (cacheEntry.cacheKey) {
+            cacheContainer.useNodeLocalKeyForDownload(cacheEntry.cacheKey);
+        }
+
         // When node-local is enabled, download directly to the HostPath dir
         // so we avoid a redundant copy. The temp file is committed atomically after download.
         let downloadPath = archivePath;

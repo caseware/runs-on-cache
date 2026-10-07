@@ -366,3 +366,30 @@ describe("ContainerFactory XFS selection", () => {
         expect(container).not.toBeInstanceOf(XfsContainer);
     });
 });
+
+describe("XfsContainer.useNodeLocalKeyForDownload (prefix-matched S3 restore)", () => {
+    it("stores the download under the matched key", () => {
+        const c = createXfsContainer({ nodeLocalCacheDir: "/opt/cache" });
+        expect(c.getNodeLocalFinalPath()).toBe(
+            path.join("/opt/cache", `${TEST_CACHE_KEY}.xfs`)
+        );
+        c.useNodeLocalKeyForDownload("Linux-node-older");
+        expect(c.getNodeLocalFinalPath()).toBe(
+            path.join("/opt/cache", "Linux-node-older.xfs")
+        );
+    });
+
+    it("is a no-op for an exact match", () => {
+        const c = createXfsContainer({ nodeLocalCacheDir: "/opt/cache" });
+        c.useNodeLocalKeyForDownload(TEST_CACHE_KEY);
+        expect(c.getNodeLocalFinalPath()).toBe(
+            path.join("/opt/cache", `${TEST_CACHE_KEY}.xfs`)
+        );
+    });
+
+    it("is a no-op when node-local is disabled", () => {
+        const c = createXfsContainer();
+        c.useNodeLocalKeyForDownload("Linux-node-older");
+        expect(c.getNodeLocalFinalPath()).toBeNull();
+    });
+});

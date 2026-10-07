@@ -239,8 +239,9 @@ export abstract class LoopContainer extends Container {
                     await this.mountImageReadOnly(localPath);
                 }
                 this.restoredFromNodeLocal = true;
-                // Exact hit — the mounted image is this key's own image.
-                this.restoredKey = this.cacheKey;
+                // Exact hit — the mounted image is the node-local key's own
+                // image (the requested key unless retargeted to the S3 match).
+                this.restoredKey = this.nodeLocal.key;
                 this.restoreSource = (await this.nodeLocal.isPrewarmed(
                     localPath
                 ))
