@@ -25,7 +25,7 @@ export abstract class Container {
      * Subclasses that need it set nodeLocalExtension in their constructor;
      * the base class creates the NodeLocalCache from options.
      */
-    protected readonly nodeLocal: NodeLocalCache;
+    protected nodeLocal: NodeLocalCache;
     protected restoredFromNodeLocal = false;
     /**
      * Precise provenance of the restore, for metrics:
@@ -115,7 +115,7 @@ export abstract class Container {
         // Exact hit restores this instance's own key; a partial hit restores
         // whichever key the matched image belongs to (see restoredKey).
         let matchedKey: string | undefined = localExists
-            ? this.cacheKey
+            ? this.nodeLocal.key
             : undefined;
 
         if (!localPath && restoreKeys && restoreKeys.length > 0) {
@@ -150,6 +150,28 @@ export abstract class Container {
 
     shouldSkipS3Upload(): boolean {
         return this.restoredFromNodeLocal;
+    }
+
+    /**
+     * Store the upcoming S3 download under the key S3 actually matched.
+     *
+     * On a restore-key prefix hit, S3 returns a different key's archive. The
+     * node-local cache was built for the requested key, so the download used to
+     * be committed as "<requested key><ext>": a later job on the node then took
+     * a foreign image as an exact hit for its key and skipped installing its own
+     * dependencies. Retargeting the populate lock, temp file and commit to the
+     * matched key stores the image under its real name (a later partial hit
+     * still finds it through the restore-key prefix) and coalesces with any
+     * other populator of that key, such as the prewarm DaemonSet.
+     */
+    useNodeLocalKeyForDownload(matchedKey: string): void {
+        if (!this.nodeLocal.enabled || matchedKey === this.nodeLocal.key) {
+            return;
+        }
+        this.logInfo(
+            `Node-local: storing S3 download under matched key ${matchedKey} (requested: ${this.cacheKey})`
+        );
+        this.nodeLocal = this.nodeLocal.forKey(matchedKey);
     }
 
     async getNodeLocalDownloadPath(): Promise<string | null> {

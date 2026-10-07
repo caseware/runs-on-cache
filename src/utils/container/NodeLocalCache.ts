@@ -32,6 +32,20 @@ export class NodeLocalCache {
         this.extension = extension;
     }
 
+    /** The (unsanitized) cache key this instance stores images under. */
+    get key(): string {
+        return this.cacheKey;
+    }
+
+    /**
+     * Same node-local dir and extension, different key. Used to store an S3
+     * download under the key S3 actually matched (see
+     * Container.useNodeLocalKeyForDownload).
+     */
+    forKey(cacheKey: string): NodeLocalCache {
+        return new NodeLocalCache(this.cacheDir, cacheKey, this.extension);
+    }
+
     /**
      * Whether node-local caching is enabled (non-empty cacheDir).
      */

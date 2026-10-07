@@ -90823,6 +90823,11 @@ function restoreCache(paths, primaryKey, restoreKeys, options, enableCrossOsArch
                 core.info("Lookup only - skipping download");
                 return cacheEntry.cacheKey;
             }
+            // A restore-key prefix hit returns another key's archive: populate,
+            // lock and commit it on the node under that key, never the requested one.
+            if (cacheEntry.cacheKey) {
+                cacheContainer.useNodeLocalKeyForDownload(cacheEntry.cacheKey);
+            }
             // When node-local is enabled, download directly to the HostPath dir
             // so we avoid a redundant copy. The temp file is committed atomically after download.
             let downloadPath = archivePath;
@@ -92454,7 +92459,7 @@ class Container {
             // Exact hit restores this instance's own key; a partial hit restores
             // whichever key the matched image belongs to (see restoredKey).
             let matchedKey = localExists
-                ? this.cacheKey
+                ? this.nodeLocal.key
                 : undefined;
             if (!localPath && restoreKeys && restoreKeys.length > 0) {
                 localPath = yield this.nodeLocal.findClosestMatch(restoreKeys);
@@ -92481,6 +92486,25 @@ class Container {
     }
     shouldSkipS3Upload() {
         return this.restoredFromNodeLocal;
+    }
+    /**
+     * Store the upcoming S3 download under the key S3 actually matched.
+     *
+     * On a restore-key prefix hit, S3 returns a different key's archive. The
+     * node-local cache was built for the requested key, so the download used to
+     * be committed as "<requested key><ext>": a later job on the node then took
+     * a foreign image as an exact hit for its key and skipped installing its own
+     * dependencies. Retargeting the populate lock, temp file and commit to the
+     * matched key stores the image under its real name (a later partial hit
+     * still finds it through the restore-key prefix) and coalesces with any
+     * other populator of that key, such as the prewarm DaemonSet.
+     */
+    useNodeLocalKeyForDownload(matchedKey) {
+        if (!this.nodeLocal.enabled || matchedKey === this.nodeLocal.key) {
+            return;
+        }
+        this.logInfo(`Node-local: storing S3 download under matched key ${matchedKey} (requested: ${this.cacheKey})`);
+        this.nodeLocal = this.nodeLocal.forKey(matchedKey);
     }
     getNodeLocalDownloadPath() {
         return __awaiter(this, void 0, void 0, function* () {
@@ -92998,8 +93022,9 @@ class LoopContainer extends Container_1.Container {
                         yield this.mountImageReadOnly(localPath);
                     }
                     this.restoredFromNodeLocal = true;
-                    // Exact hit — the mounted image is this key's own image.
-                    this.restoredKey = this.cacheKey;
+                    // Exact hit — the mounted image is the node-local key's own
+                    // image (the requested key unless retargeted to the S3 match).
+                    this.restoredKey = this.nodeLocal.key;
                     this.restoreSource = (yield this.nodeLocal.isPrewarmed(localPath))
                         ? "prewarmed"
                         : "node-local";
@@ -94690,6 +94715,18 @@ class NodeLocalCache {
         this.cacheDir = cacheDir;
         this.cacheKey = cacheKey;
         this.extension = extension;
+    }
+    /** The (unsanitized) cache key this instance stores images under. */
+    get key() {
+        return this.cacheKey;
+    }
+    /**
+     * Same node-local dir and extension, different key. Used to store an S3
+     * download under the key S3 actually matched (see
+     * Container.useNodeLocalKeyForDownload).
+     */
+    forKey(cacheKey) {
+        return new NodeLocalCache(this.cacheDir, cacheKey, this.extension);
     }
     /**
      * Whether node-local caching is enabled (non-empty cacheDir).

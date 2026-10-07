@@ -36,6 +36,32 @@ describe("NodeLocalCache", () => {
         });
     });
 
+    describe("forKey", () => {
+        it("keeps the dir and extension and switches the key", () => {
+            const nlc = new NodeLocalCache("/opt/cache", "requested", ".xfs");
+            const matched = nlc.forKey("matched");
+            expect(matched.key).toBe("matched");
+            expect(matched.localPath).toBe(
+                path.join("/opt/cache", "matched.xfs")
+            );
+            expect(nlc.key).toBe("requested");
+        });
+
+        it("commits a download under the new key, not the original one", async () => {
+            const nlc = new NodeLocalCache(tempDir, "requested", ".xfs");
+            const matched = nlc.forKey("matched");
+            const tempPath = await matched.getDownloadPath();
+            await fs.writeFile(tempPath!, "image");
+            expect(await matched.commitTempFile(tempPath!)).toBe(true);
+            await expect(
+                fs.access(path.join(tempDir, "matched.xfs"))
+            ).resolves.toBeUndefined();
+            await expect(
+                fs.access(path.join(tempDir, "requested.xfs"))
+            ).rejects.toThrow();
+        });
+    });
+
     describe("keyForImagePath / sanitizedCacheKey", () => {
         it("derives the owning key from an image path", () => {
             const nlc = new NodeLocalCache("/opt/cache", "key-a", ".xfs");
