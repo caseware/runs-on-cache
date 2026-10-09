@@ -167,8 +167,9 @@ describe("XfsContainer.onMountDiscovered (Problem 1: verify-raw-exists)", () => 
         ).onMountDiscovered("/dev/loop7");
 
         // The image (what verifyMountable stats) now resolves to the real file.
-        const image = (container as unknown as { xfsImage: { getImageFile(): string } })
-            .xfsImage;
+        const image = (
+            container as unknown as { xfsImage: { getImageFile(): string } }
+        ).xfsImage;
         expect(image.getImageFile()).toBe(realBackFile);
     });
 
@@ -190,15 +191,18 @@ describe("XfsContainer.onMountDiscovered (Problem 1: verify-raw-exists)", () => 
             }
         ).onMountDiscovered("/dev/loop7");
 
-        const image = (container as unknown as { xfsImage: { getImageFile(): string } })
-            .xfsImage;
+        const image = (
+            container as unknown as { xfsImage: { getImageFile(): string } }
+        ).xfsImage;
         expect(image.getImageFile()).toBe("/tmp/xfs-restoreProc/cache.xfs");
     });
 
     test("ignores non-loop sources (no losetup lookup)", async () => {
         const container = createXfsContainer();
         await (
-            container as unknown as { onMountDiscovered(s: string): Promise<void> }
+            container as unknown as {
+                onMountDiscovered(s: string): Promise<void>;
+            }
         ).onMountDiscovered("/dev/sda1");
         expect(mockedExec.getExecOutput).not.toHaveBeenCalled();
     });
@@ -239,14 +243,12 @@ describe("XfsImage RW headroom (warm-restore corruption fix)", () => {
             blocks: (100 * 1024 * 1024) / 512
         } as unknown as Awaited<ReturnType<typeof fsPromises.stat>>);
         // df --output=avail -B1 → 10000 MB free on host
-        mockedExec.exec.mockImplementationOnce(
-            async (_cmd, _args, opts) => {
-                opts?.listeners?.stdout?.(
-                    Buffer.from(`Avail\n${10000 * 1024 * 1024}\n`)
-                );
-                return 0;
-            }
-        );
+        mockedExec.exec.mockImplementationOnce(async (_cmd, _args, opts) => {
+            opts?.listeners?.stdout?.(
+                Buffer.from(`Avail\n${10000 * 1024 * 1024}\n`)
+            );
+            return 0;
+        });
 
         const targetMb = await image.computeHeadroomTargetMb();
         // budget*target = (100+10000)*0.8 = 8080; cap = 100 + 0.85*10000 = 8600
@@ -289,9 +291,7 @@ describe("XfsImage RW headroom (warm-restore corruption fix)", () => {
         const container = createXfsContainer();
         const callOrder: string[] = [];
 
-        const image = (
-            container as unknown as { xfsImage: XfsImage }
-        ).xfsImage;
+        const image = (container as unknown as { xfsImage: XfsImage }).xfsImage;
         const c = container as unknown as Record<
             string,
             (...args: unknown[]) => Promise<unknown>
@@ -391,5 +391,175 @@ describe("XfsContainer.useNodeLocalKeyForDownload (prefix-matched S3 restore)", 
         const c = createXfsContainer();
         c.useNodeLocalKeyForDownload("Linux-node-older");
         expect(c.getNodeLocalFinalPath()).toBeNull();
+    });
+});
+
+describe("XfsImage.verifyMountable (xfs_repair -n gate)", () => {
+    const image = () =>
+        new XfsImage("/tmp/x/cache.xfs", {
+            rwUtilizationTarget: 0.8,
+            safeCwd: "/tmp/x"
+        } as never);
+    beforeEach(() => {
+        mockedFs.stat.mockResolvedValue({ size: 26843545600 } as never);
+    });
+
+    test("passes when xfs_repair -n exits 0", async () => {
+        mockedExec.getExecOutput.mockResolvedValueOnce({
+            exitCode: 0,
+            stdout: "",
+            stderr: ""
+        });
+        await expect(image().verifyMountable()).resolves.toBe(true);
+        expect(mockedExec.getExecOutput).toHaveBeenCalledWith(
+            "sudo",
+            ["xfs_repair", "-n", "-f", "/tmp/x/cache.xfs"],
+            expect.anything()
+        );
+    });
+
+    test("refuses an image with a dirty log", async () => {
+        mockedExec.getExecOutput.mockResolvedValueOnce({
+            exitCode: 1,
+            stdout: "ALERT: The filesystem has valuable metadata changes in a log which is being\nignored because the -n option was used.",
+            stderr: ""
+        });
+        await expect(image().verifyMountable()).resolves.toBe(false);
+        expect(mockedCore.error).toHaveBeenCalledWith(
+            expect.stringContaining("xfs_repair -n FAILED")
+        );
+    });
+
+    test("falls back to the superblock check when xfs_repair is missing", async () => {
+        mockedExec.getExecOutput
+            .mockResolvedValueOnce({
+                exitCode: 127,
+                stdout: "",
+                stderr: "sudo: xfs_repair: command not found"
+            })
+            .mockResolvedValueOnce({
+                exitCode: 0,
+                stdout: "magicnum = 0x58465342",
+                stderr: ""
+            });
+        await expect(image().verifyMountable()).resolves.toBe(true);
+    });
+});
+
+describe("LoopImage.umountStrict (no lazy unmount on save)", () => {
+    const image = () =>
+        new XfsImage("/tmp/x/cache.xfs", {
+            rwUtilizationTarget: 0.8,
+            safeCwd: "/tmp/x"
+        } as never);
+    let timeoutSpy: jest.SpyInstance;
+    beforeEach(() => {
+        // Make the retry back-off immediate.
+        timeoutSpy = jest.spyOn(global, "setTimeout").mockImplementation(((
+            fn: () => void
+        ) => {
+            fn();
+            return 0 as unknown as NodeJS.Timeout;
+        }) as never);
+    });
+    afterEach(() => {
+        timeoutSpy.mockRestore();
+    });
+
+    test("retries a busy unmount and succeeds", async () => {
+        let umounts = 0;
+        mockedExec.exec.mockImplementation(
+            async (cmd: string, args?: string[]) => {
+                if (cmd === "mountpoint") return umounts >= 2 ? 1 : 0;
+                if (cmd === "sudo" && args?.[0] === "umount") {
+                    umounts++;
+                    if (umounts === 1) throw new Error("target is busy");
+                    return 0;
+                }
+                return 0;
+            }
+        );
+        await expect(image().umountStrict("/w")).resolves.toBeUndefined();
+        expect(mockedExec.exec).not.toHaveBeenCalledWith(
+            "sudo",
+            ["umount", "-l", "/w"],
+            expect.anything()
+        );
+    });
+
+    test("throws when the mount stays busy, never lazy-unmounts", async () => {
+        mockedExec.exec.mockImplementation(
+            async (cmd: string, args?: string[]) => {
+                if (cmd === "mountpoint") return 0;
+                if (cmd === "sudo" && args?.[0] === "umount")
+                    throw new Error("target is busy");
+                return 0;
+            }
+        );
+        await expect(image().umountStrict("/w", 3)).rejects.toThrow(
+            "still mounted (busy)"
+        );
+        expect(mockedExec.exec).not.toHaveBeenCalledWith(
+            "sudo",
+            ["umount", "-l", "/w"],
+            expect.anything()
+        );
+        expect(mockedExec.exec).toHaveBeenCalledWith(
+            "sudo",
+            ["fuser", "-vm", "/w"],
+            expect.anything()
+        );
+    });
+});
+
+describe("LoopContainer save leaves the cache mount before unmounting", () => {
+    test("chdirs out of the workspace bind target", () => {
+        const container = createXfsContainer();
+        const c = container as unknown as {
+            mountPoint: string;
+            safeCwd: string;
+            leaveMountPoint(): void;
+        };
+        c.mountPoint = "/tmp/xfs-abc/mount";
+        c.safeCwd = "/tmp/xfs-abc";
+        const chdirSpy = jest
+            .spyOn(process, "chdir")
+            .mockImplementation(() => undefined);
+        // Inside a cached path's bind target (TEST_PATHS = node_modules).
+        const cwdSpy = jest
+            .spyOn(process, "cwd")
+            .mockReturnValue(path.join(TEST_BASE_DIR, "node_modules", "x"));
+        c.leaveMountPoint();
+        expect(chdirSpy).toHaveBeenCalledWith("/tmp/xfs-abc");
+        // workspace-cache-setup caches path "." — the bind target is the
+        // workspace itself, which is where the action process starts.
+        (c as unknown as { pathsToCache: string[] }).pathsToCache = ["."];
+        cwdSpy.mockReturnValue(TEST_BASE_DIR);
+        chdirSpy.mockClear();
+        c.leaveMountPoint();
+        expect(chdirSpy).toHaveBeenCalledWith("/tmp/xfs-abc");
+        cwdSpy.mockRestore();
+        chdirSpy.mockRestore();
+    });
+
+    test("stays put when already outside the mounts", () => {
+        const container = createXfsContainer();
+        const c = container as unknown as {
+            mountPoint: string;
+            safeCwd: string;
+            leaveMountPoint(): void;
+        };
+        c.mountPoint = "/tmp/xfs-abc/mount";
+        c.safeCwd = "/tmp/xfs-abc";
+        const cwdSpy = jest
+            .spyOn(process, "cwd")
+            .mockReturnValue("/home/runner");
+        const chdirSpy = jest
+            .spyOn(process, "chdir")
+            .mockImplementation(() => undefined);
+        c.leaveMountPoint();
+        expect(chdirSpy).not.toHaveBeenCalled();
+        cwdSpy.mockRestore();
+        chdirSpy.mockRestore();
     });
 });

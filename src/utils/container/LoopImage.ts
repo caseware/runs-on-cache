@@ -306,6 +306,73 @@ export abstract class LoopImage {
         }
     }
 
+    /**
+     * Unmount for a SAVE: a real unmount or an error, never a lazy one.
+     *
+     * umountSafe falls back to `umount -l`, which detaches the mount point but
+     * keeps the filesystem live until its last reference closes. Reading the
+     * backing file right after that captures an image that was never cleanly
+     * unmounted: for XFS the log is not flushed, consumers mount it with
+     * `norecovery`, and they see pre-log metadata (files deleted just before
+     * the save come back pointing at reused blocks). Retries a busy unmount,
+     * logs the processes holding it, and throws if it never succeeds so the
+     * caller aborts the upload instead of shipping that image.
+     */
+    async umountStrict(target: string, attempts = 5): Promise<void> {
+        const isMounted = async (): Promise<boolean> =>
+            (await exec.exec("mountpoint", ["-q", target], {
+                cwd: this.safeCwd,
+                ignoreReturnCode: true,
+                silent: true
+            })) === 0;
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+            if (!(await isMounted())) return;
+            await exec.exec("sync", [], {
+                cwd: this.safeCwd,
+                silent: !core.isDebug()
+            });
+            try {
+                await sudoExec("umount", [target], this.safeCwd);
+                return;
+            } catch (error) {
+                core.warning(
+                    `${
+                        this.logPrefix
+                    } umount ${target} failed (attempt ${attempt}/${attempts}): ${
+                        error instanceof Error ? error.message : error
+                    }`
+                );
+                // Name the holders so a busy save is diagnosable from the log.
+                await exec.exec("sudo", ["fuser", "-vm", target], {
+                    cwd: this.safeCwd,
+                    ignoreReturnCode: true
+                });
+                if (attempt < attempts) {
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                }
+            }
+        }
+        if (await isMounted()) {
+            throw new Error(
+                `${target} is still mounted (busy) — refusing to save an image that was not cleanly unmounted`
+            );
+        }
+    }
+
+    /** Strict counterpart of unmount() for the save path (see umountStrict). */
+    async unmountForSave(mountPoint: string): Promise<void> {
+        await this.umountStrict(mountPoint);
+        if (this.activeLoopDevice) {
+            await this.detachLoopWithRetry(this.activeLoopDevice);
+            this.activeLoopDevice = undefined;
+        }
+        try {
+            await fs.rm(mountPoint, { recursive: true, force: true });
+        } catch (error) {
+            core.debug(`Cleanup mount point failed (non-critical): ${error}`);
+        }
+    }
+
     async umountSafe(target: string): Promise<void> {
         try {
             await sudoExec("umount", [target], this.safeCwd);
