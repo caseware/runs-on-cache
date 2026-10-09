@@ -93157,7 +93157,19 @@ class LoopContainer extends Container_1.Container {
             // (xfs_repair reports agi_freecount/sb_ifree mismatches and the kernel
             // hits finobt corruption → fs shutdown → EIO on restore), so unmount is
             // the ONLY save path.
-            yield this.unmountAll();
+            //
+            // This process itself starts with its cwd at $GITHUB_WORKSPACE, which
+            // is this mount point, and a cwd pins a mount: every save got EBUSY,
+            // fell back to a lazy unmount and uploaded an image whose XFS log was
+            // never flushed. Leave the mount first, then require a real unmount.
+            this.leaveMountPoint();
+            try {
+                yield this.unmountAllForSave();
+            }
+            catch (error) {
+                this.saveAborted = true;
+                throw new Error(`${this.fsDisplayName} save aborted to prevent cache poisoning: ${error instanceof Error ? error.message : error}`);
+            }
             // Verify image is mountable before upload
             const ok = yield this.image.verifyMountable();
             if (!ok) {
@@ -93600,6 +93612,38 @@ class LoopContainer extends Container_1.Container {
         });
     }
     // ── Unmount ──────────────────────────────────────────────────────
+    /**
+     * chdir out of the cache mounts if this process is inside one (see save()):
+     * the bind targets (the workspace, where the action process starts) and the
+     * main mount point.
+     */
+    leaveMountPoint() {
+        if (!this.mountPoint)
+            return;
+        const mounts = [
+            this.mountPoint,
+            ...this.pathsToCache.map(p => path.isAbsolute(p) ? p : path.join(this.baseDir, p))
+        ].map(m => path.resolve(m));
+        const cwd = path.resolve(process.cwd());
+        if (mounts.some(m => cwd === m || cwd.startsWith(m + path.sep))) {
+            const target = this.safeCwd || os.tmpdir();
+            process.chdir(target);
+            this.logInfo(`Left the cache mount before unmount (cwd ${cwd} → ${target})`);
+        }
+    }
+    /** unmountAll for the save path: real unmounts only, throws if busy. */
+    unmountAllForSave() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (!this.mountPoint) {
+                throw new Error("Mount point is not set");
+            }
+            for (const p of this.pathsToCache) {
+                const absPath = path.isAbsolute(p) ? p : path.join(this.baseDir, p);
+                yield this.image.umountStrict(absPath);
+            }
+            yield this.image.unmountForSave(this.mountPoint);
+        });
+    }
     unmountAll() {
         return __awaiter(this, void 0, void 0, function* () {
             if (!this.mountPoint) {
@@ -94217,6 +94261,71 @@ class LoopImage {
             }
             catch (error) {
                 core.debug(`Cleanup mount failed (non-critical): ${error}`);
+            }
+            try {
+                yield fs.rm(mountPoint, { recursive: true, force: true });
+            }
+            catch (error) {
+                core.debug(`Cleanup mount point failed (non-critical): ${error}`);
+            }
+        });
+    }
+    /**
+     * Unmount for a SAVE: a real unmount or an error, never a lazy one.
+     *
+     * umountSafe falls back to `umount -l`, which detaches the mount point but
+     * keeps the filesystem live until its last reference closes. Reading the
+     * backing file right after that captures an image that was never cleanly
+     * unmounted: for XFS the log is not flushed, consumers mount it with
+     * `norecovery`, and they see pre-log metadata (files deleted just before
+     * the save come back pointing at reused blocks). Retries a busy unmount,
+     * logs the processes holding it, and throws if it never succeeds so the
+     * caller aborts the upload instead of shipping that image.
+     */
+    umountStrict(target, attempts = 5) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const isMounted = () => __awaiter(this, void 0, void 0, function* () {
+                return (yield exec.exec("mountpoint", ["-q", target], {
+                    cwd: this.safeCwd,
+                    ignoreReturnCode: true,
+                    silent: true
+                })) === 0;
+            });
+            for (let attempt = 1; attempt <= attempts; attempt++) {
+                if (!(yield isMounted()))
+                    return;
+                yield exec.exec("sync", [], {
+                    cwd: this.safeCwd,
+                    silent: !core.isDebug()
+                });
+                try {
+                    yield sudoExec("umount", [target], this.safeCwd);
+                    return;
+                }
+                catch (error) {
+                    core.warning(`${this.logPrefix} umount ${target} failed (attempt ${attempt}/${attempts}): ${error instanceof Error ? error.message : error}`);
+                    // Name the holders so a busy save is diagnosable from the log.
+                    yield exec.exec("sudo", ["fuser", "-vm", target], {
+                        cwd: this.safeCwd,
+                        ignoreReturnCode: true
+                    });
+                    if (attempt < attempts) {
+                        yield new Promise(resolve => setTimeout(resolve, 2000));
+                    }
+                }
+            }
+            if (yield isMounted()) {
+                throw new Error(`${target} is still mounted (busy) — refusing to save an image that was not cleanly unmounted`);
+            }
+        });
+    }
+    /** Strict counterpart of unmount() for the save path (see umountStrict). */
+    unmountForSave(mountPoint) {
+        return __awaiter(this, void 0, void 0, function* () {
+            yield this.umountStrict(mountPoint);
+            if (this.activeLoopDevice) {
+                yield this.detachLoopWithRetry(this.activeLoopDevice);
+                this.activeLoopDevice = undefined;
             }
             try {
                 yield fs.rm(mountPoint, { recursive: true, force: true });
@@ -96578,8 +96687,36 @@ class XfsImage extends LoopImage_1.LoopImage {
                     return false;
                 }
                 this.info(`Image file size: ${Math.round(stat.size / 1024 / 1024)} MB`);
-                // 2. PRIMARY check: offline read-only superblock read (no loop, no
-                //    mount, no log replay) — immune to the lazy-unmount EBUSY race.
+                // 2. PRIMARY check: `xfs_repair -n` (no modify) on the backing file.
+                //    Exit 0 = clean log and consistent metadata. A non-zero exit
+                //    means the image was not cleanly unmounted ("valuable metadata
+                //    changes in a log") or is inconsistent; consumers mount it with
+                //    norecovery and would read stale metadata, so refuse it.
+                const repair = yield exec.getExecOutput("sudo", ["xfs_repair", "-n", "-f", imageFile], {
+                    cwd: this.safeCwd,
+                    silent: !core.isDebug(),
+                    ignoreReturnCode: true
+                });
+                const repairOut = `${repair.stdout}\n${repair.stderr}`;
+                const repairMissing = repair.exitCode === 127 ||
+                    /command not found|not found/i.test(repair.stderr);
+                if (repair.exitCode === 0) {
+                    this.info("xfs_repair -n passed (clean log, consistent metadata) — image is safe to upload");
+                    return true;
+                }
+                if (!repairMissing) {
+                    core.error(`${LOG_PREFIX} xfs_repair -n FAILED (exit ${repair.exitCode}) — the image is not ` +
+                        `cleanly unmounted or is inconsistent. Aborting S3 upload to avoid poisoning the cache. ` +
+                        `Output: ${repairOut
+                            .trim()
+                            .split("\n")
+                            .slice(0, 15)
+                            .join(" | ")}`);
+                    return false;
+                }
+                core.warning(`${LOG_PREFIX} xfs_repair is not available; falling back to the superblock check`);
+                // 3. FALLBACK: offline read-only superblock read (no loop, no
+                //    mount, no log replay).
                 const result = yield exec.getExecOutput("xfs_db", ["-r", "-c", "sb 0", "-c", "print", imageFile], {
                     cwd: this.safeCwd,
                     silent: !core.isDebug(),
@@ -96597,7 +96734,7 @@ class XfsImage extends LoopImage_1.LoopImage {
                         `Aborting S3 upload to avoid poisoning the cache. Output: ${out.trim()}`);
                     return false;
                 }
-                // 3. xfs_db could not run (not installed / unexpected error). Do
+                // 4. xfs_db could not run (not installed / unexpected error). Do
                 //    NOT hard-fail — the image was just mounted RW and written
                 //    successfully, and the size check above passed. WARN instead.
                 core.warning(`${LOG_PREFIX} Could not run offline xfs_db superblock check (exit ${result.exitCode}: ` +

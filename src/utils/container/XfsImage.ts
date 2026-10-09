@@ -186,8 +186,48 @@ export class XfsImage extends LoopImage {
                 `Image file size: ${Math.round(stat.size / 1024 / 1024)} MB`
             );
 
-            // 2. PRIMARY check: offline read-only superblock read (no loop, no
-            //    mount, no log replay) — immune to the lazy-unmount EBUSY race.
+            // 2. PRIMARY check: `xfs_repair -n` (no modify) on the backing file.
+            //    Exit 0 = clean log and consistent metadata. A non-zero exit
+            //    means the image was not cleanly unmounted ("valuable metadata
+            //    changes in a log") or is inconsistent; consumers mount it with
+            //    norecovery and would read stale metadata, so refuse it.
+            const repair = await exec.getExecOutput(
+                "sudo",
+                ["xfs_repair", "-n", "-f", imageFile],
+                {
+                    cwd: this.safeCwd,
+                    silent: !core.isDebug(),
+                    ignoreReturnCode: true
+                }
+            );
+            const repairOut = `${repair.stdout}\n${repair.stderr}`;
+            const repairMissing =
+                repair.exitCode === 127 ||
+                /command not found|not found/i.test(repair.stderr);
+            if (repair.exitCode === 0) {
+                this.info(
+                    "xfs_repair -n passed (clean log, consistent metadata) — image is safe to upload"
+                );
+                return true;
+            }
+            if (!repairMissing) {
+                core.error(
+                    `${LOG_PREFIX} xfs_repair -n FAILED (exit ${repair.exitCode}) — the image is not ` +
+                        `cleanly unmounted or is inconsistent. Aborting S3 upload to avoid poisoning the cache. ` +
+                        `Output: ${repairOut
+                            .trim()
+                            .split("\n")
+                            .slice(0, 15)
+                            .join(" | ")}`
+                );
+                return false;
+            }
+            core.warning(
+                `${LOG_PREFIX} xfs_repair is not available; falling back to the superblock check`
+            );
+
+            // 3. FALLBACK: offline read-only superblock read (no loop, no
+            //    mount, no log replay).
             const result = await exec.getExecOutput(
                 "xfs_db",
                 ["-r", "-c", "sb 0", "-c", "print", imageFile],
@@ -215,7 +255,7 @@ export class XfsImage extends LoopImage {
                 return false;
             }
 
-            // 3. xfs_db could not run (not installed / unexpected error). Do
+            // 4. xfs_db could not run (not installed / unexpected error). Do
             //    NOT hard-fail — the image was just mounted RW and written
             //    successfully, and the size check above passed. WARN instead.
             core.warning(

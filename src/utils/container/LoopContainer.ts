@@ -404,7 +404,24 @@ export abstract class LoopContainer extends Container {
         // (xfs_repair reports agi_freecount/sb_ifree mismatches and the kernel
         // hits finobt corruption → fs shutdown → EIO on restore), so unmount is
         // the ONLY save path.
-        await this.unmountAll();
+        //
+        // This process itself starts with its cwd at $GITHUB_WORKSPACE, which
+        // is this mount point, and a cwd pins a mount: every save got EBUSY,
+        // fell back to a lazy unmount and uploaded an image whose XFS log was
+        // never flushed. Leave the mount first, then require a real unmount.
+        this.leaveMountPoint();
+        try {
+            await this.unmountAllForSave();
+        } catch (error) {
+            this.saveAborted = true;
+            throw new Error(
+                `${
+                    this.fsDisplayName
+                } save aborted to prevent cache poisoning: ${
+                    error instanceof Error ? error.message : error
+                }`
+            );
+        }
 
         // Verify image is mountable before upload
         const ok = await this.image.verifyMountable();
@@ -934,6 +951,41 @@ export abstract class LoopContainer extends Container {
     }
 
     // ── Unmount ──────────────────────────────────────────────────────
+
+    /**
+     * chdir out of the cache mounts if this process is inside one (see save()):
+     * the bind targets (the workspace, where the action process starts) and the
+     * main mount point.
+     */
+    private leaveMountPoint(): void {
+        if (!this.mountPoint) return;
+        const mounts = [
+            this.mountPoint,
+            ...this.pathsToCache.map(p =>
+                path.isAbsolute(p) ? p : path.join(this.baseDir, p)
+            )
+        ].map(m => path.resolve(m));
+        const cwd = path.resolve(process.cwd());
+        if (mounts.some(m => cwd === m || cwd.startsWith(m + path.sep))) {
+            const target = this.safeCwd || os.tmpdir();
+            process.chdir(target);
+            this.logInfo(
+                `Left the cache mount before unmount (cwd ${cwd} → ${target})`
+            );
+        }
+    }
+
+    /** unmountAll for the save path: real unmounts only, throws if busy. */
+    protected async unmountAllForSave(): Promise<void> {
+        if (!this.mountPoint) {
+            throw new Error("Mount point is not set");
+        }
+        for (const p of this.pathsToCache) {
+            const absPath = path.isAbsolute(p) ? p : path.join(this.baseDir, p);
+            await this.image.umountStrict(absPath);
+        }
+        await this.image.unmountForSave(this.mountPoint);
+    }
 
     protected async unmountAll(): Promise<void> {
         if (!this.mountPoint) {
